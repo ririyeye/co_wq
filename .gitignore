@@ -1,0 +1,9 @@
+build
+.cache
+compile_commands.json
+.xmake
+install
+*.map
+.vscode/settings.json
+*.bin
+*.pyc
