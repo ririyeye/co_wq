@@ -1,8 +1,21 @@
+set_project(co_wq)
 
-set_symbols("debug")
-set_strip("all")
+target("co_wq")
+    set_kind("static")
 
-includes("task")
+    add_includedirs(
+        "task", {public=true}
+    )
+    add_includedirs(
+        "sync", {public=true}
+    )
+
+    add_files(
+        "task/workqueue.cpp"
+    )
+target_end()
 
 
-
+add_rules("plugin.compile_commands.autoupdate")
+set_languages("c++20")
+set_warnings("all", "extra", "pedantic")

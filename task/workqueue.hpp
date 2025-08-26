@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lock.h"
+#include "lock.hpp"
 #include "usrlist.hpp"
 
 namespace co_wq {
@@ -12,15 +12,15 @@ struct worknode {
 
     struct list_head ws_node;
     work_func_t      func;
-    SpinLock         lk;
 };
 
-struct workqueue {
+struct workqueue : public lockable {
+    explicit workqueue(lockable& lock) : lk(lock) { }
     typedef void (*wq_trig)(struct workqueue* work);
 
     struct list_head ws_head;
     wq_trig          trig;
-    SpinLock         lk;
+    lockable&        lk;
 #if USING_WQ_NAME
     char names[16];
 #endif

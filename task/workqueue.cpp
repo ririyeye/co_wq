@@ -1,5 +1,5 @@
 #include "workqueue.hpp"
-#include "lock.h"
+#include "lock.hpp"
 namespace co_wq {
 
 void workqueue::post(struct worknode& pnode)
