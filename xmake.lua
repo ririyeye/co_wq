@@ -10,9 +10,9 @@ target("co_wq")
         "sync", {public=true}
     )
 
-    add_files(
-        "task/workqueue.cpp"
-    )
+    -- add_files(
+    --     "task/workqueue.cpp"
+    -- )
 target_end()
 
 

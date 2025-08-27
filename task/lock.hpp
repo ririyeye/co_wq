@@ -1,31 +1,32 @@
 #pragma once
 
 #include <atomic>
-
+#include <concepts>
 namespace co_wq {
 
-struct lockable {
-    virtual void lock()   = 0;
-    virtual void unlock() = 0;
+template <typename T>
+concept lockable = requires(T a) {
+    { a.lock() } -> std::same_as<void>;
+    { a.unlock() } -> std::same_as<void>;
 };
 
-struct SpinLock : public lockable {
+struct SpinLock {
     std::atomic_flag locked = ATOMIC_FLAG_INIT;
 
 public:
-    void lock() final
+    void lock()
     {
         while (locked.test_and_set(std::memory_order_acquire)) {
             ;
         }
     }
-    void unlock() final { locked.clear(std::memory_order_release); }
+    void unlock() { locked.clear(std::memory_order_release); }
 };
 
-struct nolock : public lockable {
+struct nolock {
 
 public:
-    void lock() final { }
-    void unlock() final { }
+    void lock() { }
+    void unlock() { }
 };
 }

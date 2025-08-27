@@ -17,12 +17,12 @@ struct Sem_req : worknode {
     } req_sta;
 };
 
-struct Semaphore : worknode {
+template <lockable lock> struct Semaphore : worknode {
 private:
-    workqueue& _executor;
-    int        _cur_val;
-    int        _max_val;
-    list_head  acquire_list;
+    workqueue<lock>& _executor;
+    int              _cur_val;
+    int              _max_val;
+    list_head        acquire_list;
 
     void sem_chk_cb()
     {
@@ -54,7 +54,7 @@ private:
     }
 
 public:
-    explicit Semaphore(workqueue& executor, int init_val, int max_val)
+    explicit Semaphore(workqueue<lock>& executor, int init_val, int max_val)
         : _executor(executor), _cur_val(init_val), _max_val(max_val)
     {
         INIT_LIST_HEAD(&ws_node);
@@ -136,12 +136,13 @@ public:
     }
 };
 
+template <lockable lock>
 struct SemReqAwaiter : Sem_req {
 
-    explicit SemReqAwaiter(Semaphore& sem) : mSemaphore(sem) { INIT_LIST_HEAD(&ws_node); }
+    explicit SemReqAwaiter(Semaphore<lock>& sem) : mSemaphore(sem) { INIT_LIST_HEAD(&ws_node); }
 
     std::coroutine_handle<> mCoroutine;
-    Semaphore&              mSemaphore;
+    Semaphore<lock>&        mSemaphore;
 
     bool await_ready() const noexcept
     {
@@ -167,7 +168,7 @@ struct SemReqAwaiter : Sem_req {
     void await_resume() const noexcept { }
 };
 
-inline auto wait_sem(Semaphore& sem)
+template <lockable lock> inline auto wait_sem(Semaphore<lock>& sem)
 {
     return SemReqAwaiter(sem);
 }

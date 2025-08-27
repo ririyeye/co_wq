@@ -5,12 +5,12 @@
 #pragma once
 namespace co_wq {
 
-struct Work_promise_base : worknode {
+template <lockable lock> struct Work_promise_base : worknode {
     virtual ~Work_promise_base() = default;
 
-    struct workqueue* _excutor = nullptr;
+    workqueue<lock>* _excutor = nullptr;
 
-    void post(workqueue* wq)
+    void post(workqueue<lock>* wq)
     {
         _excutor = wq;
         func     = wk_cb;
@@ -38,29 +38,29 @@ struct Work_promise_base : worknode {
     Work_promise_base& operator=(Work_promise_base&&) = delete;
 };
 
-template <class T = void> struct Work_Promise : Promise<T>, Work_promise_base {
+template <lockable lock, class T = void> struct Work_Promise : Promise<T>, Work_promise_base<lock> {
     auto get_return_object() { return std::coroutine_handle<Work_Promise>::from_promise(*this); }
 
     void return_value(T&& ret)
     {
-        Work_promise_base::post();
+        Work_promise_base<lock>::post();
         Promise<T>::return_value(std::move(ret));
     }
 
     void return_value(T const& ret)
     {
-        Work_promise_base::post();
+        Work_promise_base<lock>::post();
         Promise<T>::return_value(ret);
     }
 };
 
-template <> struct Work_Promise<void> : Promise<void>, Work_promise_base {
+template <lockable lock> struct Work_Promise<void, lock> : Promise<void>, Work_promise_base<lock> {
     auto get_return_object() { return std::coroutine_handle<Work_Promise>::from_promise(*this); }
 
-    void return_void() noexcept { Work_promise_base::post(); }
+    void return_void() noexcept { Work_promise_base<lock>::post(); }
 };
 
-template <class T> static inline void post_to(Task<T, Work_Promise<T>>& tk, workqueue& executor)
+template <lockable lock, class T> static inline void post_to(Task<T, Work_Promise<T>>& tk, workqueue<lock>& executor)
 {
     auto& promise = tk.mCoroutine.promise();
     INIT_LIST_HEAD(&promise.ws_node);
