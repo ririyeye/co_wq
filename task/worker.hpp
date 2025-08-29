@@ -54,13 +54,14 @@ template <lockable lock, class T = void> struct Work_Promise : Promise<T>, Work_
     }
 };
 
-template <lockable lock> struct Work_Promise<void, lock> : Promise<void>, Work_promise_base<lock> {
+template <lockable lock> struct Work_Promise<lock, void> : Promise<void>, Work_promise_base<lock> {
     auto get_return_object() { return std::coroutine_handle<Work_Promise>::from_promise(*this); }
 
     void return_void() noexcept { Work_promise_base<lock>::post(); }
 };
 
-template <lockable lock, class T> static inline void post_to(Task<T, Work_Promise<T>>& tk, workqueue<lock>& executor)
+template <lockable lock, class T>
+static inline void post_to(Task<T, Work_Promise<lock, T>>& tk, workqueue<lock>& executor)
 {
     auto& promise = tk.mCoroutine.promise();
     INIT_LIST_HEAD(&promise.ws_node);

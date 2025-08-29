@@ -9,13 +9,12 @@ target("co_wq")
     add_includedirs(
         "sync", {public=true}
     )
-
-    -- add_files(
-    --     "task/workqueue.cpp"
-    -- )
 target_end()
 
 
 add_rules("plugin.compile_commands.autoupdate")
 set_languages("c++20")
 set_warnings("all", "extra", "pedantic")
+
+
+-- includes("test")

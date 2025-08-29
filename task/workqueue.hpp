@@ -14,13 +14,13 @@ struct worknode {
     work_func_t      func;
 };
 
-template <lockable lock> struct workqueue {
+template <lockable Lock> struct workqueue {
     explicit workqueue() { }
     typedef void (*wq_trig)(struct workqueue* work);
 
     struct list_head ws_head;
     wq_trig          trig;
-    lock             lk;
+    Lock             lk;
 #if USING_WQ_NAME
     char names[16];
 #endif
@@ -60,6 +60,11 @@ template <lockable lock> struct workqueue {
             trig(this);
         }
     }
+
+    // Expose the underlying lock so users can directly call workqueue.lock()/unlock().
+    // This simply forwards to the contained lock instance `lk`.
+    void lock() { lk.lock(); }
+    void unlock() { lk.unlock(); }
 
 private:
     struct worknode* get_work_node(struct workqueue& wq)

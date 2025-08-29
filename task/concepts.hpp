@@ -42,4 +42,4 @@ template <class First, class... Ts> struct TypeList<First, Ts...> {
     using LastType  = typename TypeList<Ts...>::LastType;
 };
 
-} // namespace co_async
+} // namespace co_wq
