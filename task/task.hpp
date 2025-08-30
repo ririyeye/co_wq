@@ -6,6 +6,13 @@
 #include <cstdlib>
 #include <utility>
 
+struct task_stat {
+    int malloc_cnt = 0;
+    int free_cnt   = 0;
+};
+
+inline task_stat sys_sta;
+
 namespace co_wq {
 
 #if USE_EXCEPTION
@@ -88,10 +95,22 @@ public:
 };
 
 template <class BasePromise, taskalloc Alloc> struct promise_with_alloc : BasePromise {
-    static void* operator new(std::size_t sz) { return Alloc {}.alloc(sz); }
-    static void  operator delete(void* p, std::size_t sz) noexcept { Alloc {}.dealloc(p, sz); }
-    static void  operator delete(void* p) noexcept { Alloc {}.dealloc(p, 0); }
-    auto         get_return_object() { return std::coroutine_handle<promise_with_alloc>::from_promise(*this); }
+    static void* operator new(std::size_t sz)
+    {
+        ++sys_sta.malloc_cnt;
+        return Alloc {}.alloc(sz);
+    }
+    static void operator delete(void* p, std::size_t sz) noexcept
+    {
+        ++sys_sta.free_cnt;
+        Alloc {}.dealloc(p, sz);
+    }
+    static void operator delete(void* p) noexcept
+    {
+        ++sys_sta.free_cnt;
+        Alloc {}.dealloc(p, 0);
+    }
+    auto get_return_object() { return std::coroutine_handle<promise_with_alloc>::from_promise(*this); }
 };
 
 template <class T = void, class P = Promise<T>, taskalloc Alloc = sys_taskalloc> struct [[nodiscard]] Task {
