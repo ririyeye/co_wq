@@ -20,10 +20,24 @@ namespace co_wq {
 #endif
 
 struct Promise_base {
+    using on_completed_t = void (*)(Promise_base&);
 
     auto initial_suspend() noexcept { return std::suspend_always(); }
 
-    auto final_suspend() noexcept { return PreviousAwaiter(mPrevious); }
+    struct FinalAwaiter {
+        Promise_base*           self;
+        bool                    await_ready() const noexcept { return false; }
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<>) const noexcept
+        {
+            if (self->mOnCompleted) {
+                self->mOnCompleted(*self);
+            }
+            return self->mPrevious ? self->mPrevious : std::noop_coroutine();
+        }
+        void await_resume() const noexcept { }
+    };
+
+    auto final_suspend() noexcept { return FinalAwaiter { this }; }
 
     void unhandled_exception() noexcept
     {
@@ -31,7 +45,9 @@ struct Promise_base {
         mException = std::current_exception();
 #endif
     }
-    std::coroutine_handle<> mPrevious;
+    std::coroutine_handle<> mPrevious {};
+    on_completed_t          mOnCompleted { nullptr };
+    void*                   mUserData { nullptr }; // for generic control blocks
 #if USE_EXCEPTION
     std::exception_ptr mException {};
 #endif
