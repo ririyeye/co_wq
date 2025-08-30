@@ -5,11 +5,22 @@
 
 namespace co_wq {
 
+// 为了禁止直接实例化 Sem_req（只能通过 SemReqAwaiter 使用）：
+// 1. 向前声明 SemReqAwaiter 模板。
+// 2. 把 Sem_req 的构造/析构函数放到 protected，并声明 SemReqAwaiter 为友元。
+// 这样 "Sem_req x;" 会编译失败；但 SemReqAwaiter 继承它仍可构造。
+template <lockable lock> struct SemReqAwaiter; // forward declaration
+
 struct Sem_req : worknode {
-    explicit Sem_req() { INIT_LIST_HEAD(&ws_node); }
+protected:
+    Sem_req()                          = default;
+    ~Sem_req()                         = default;
+    Sem_req(const Sem_req&)            = delete;
+    Sem_req& operator=(const Sem_req&) = delete;
 
-    ~Sem_req() { list_del(&ws_node); }
+    template <lockable lock> friend struct SemReqAwaiter; // 允许 awaiter 访问构造
 
+public:
     enum req_sta {
         REQ_OK = 0,
         REQ_FAIL,
@@ -136,10 +147,9 @@ public:
     }
 };
 
-template <lockable lock>
-struct SemReqAwaiter : Sem_req {
+template <lockable lock> struct SemReqAwaiter : Sem_req {
 
-    explicit SemReqAwaiter(Semaphore<lock>& sem) : mSemaphore(sem) { INIT_LIST_HEAD(&ws_node); }
+    explicit SemReqAwaiter(Semaphore<lock>& sem) : mSemaphore(sem) { }
 
     std::coroutine_handle<> mCoroutine;
     Semaphore<lock>&        mSemaphore;

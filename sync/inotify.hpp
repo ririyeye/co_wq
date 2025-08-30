@@ -1,8 +1,7 @@
 #pragma once
 #include "lock.hpp"
-#include "task.hpp"
-#include "worker.hpp"
 #include "workqueue.hpp"
+#include <coroutine>
 
 namespace co_wq {
 
@@ -12,21 +11,21 @@ struct notify_req_base {
 
 struct notify_req : worknode, notify_req_base { };
 
-struct Notify : worknode {
+template <lockable lock> struct Notify : worknode {
 private:
-    workqueue&      _executor;
-    list_head       acquire_list;
-    std::atomic_int mNotify_one = 0;
-    std::atomic_int mNotify_all = 0;
+    workqueue<lock>& _executor;
+    list_head        acquire_list;
+    std::atomic_int  mNotify_one = 0;
+    std::atomic_int  mNotify_all = 0;
 
     // -1表示不限
     int inotify_num(int req_cnt)
     {
         notify_req_base* pos;
         notify_req_base* n;
-        int              ret    = 0;
+        int              ret = 0;
         _executor.lock();
-        int              curcnt = req_cnt;
+        int curcnt = req_cnt;
         list_for_each_entry_safe (pos, n, &acquire_list, notify_node, notify_req_base) {
             if (req_cnt > 0) {
                 if (curcnt <= 0) {
@@ -68,7 +67,7 @@ private:
     }
 
 public:
-    explicit Notify(workqueue& executor) : _executor(executor)
+    explicit Notify(workqueue<lock>& executor) : _executor(executor)
     {
         INIT_LIST_HEAD(&ws_node);
         INIT_LIST_HEAD(&acquire_list);
@@ -104,14 +103,15 @@ public:
         _executor.unlock();
     }
 };
-struct NotifyReqAwaiter : notify_req {
 
-    explicit NotifyReqAwaiter(Notify& inotify) : mInotify(inotify) { }
+template <lockable lock> struct NotifyReqAwaiter : notify_req {
+
+    explicit NotifyReqAwaiter(Notify<lock>& inotify) : mInotify(inotify) { }
 
     ~NotifyReqAwaiter() { mInotify.unregist(*this); }
 
     std::coroutine_handle<> mCoroutine;
-    Notify&                 mInotify;
+    Notify<lock>&           mInotify;
 
     bool await_ready() const noexcept { return false; }
 
@@ -132,7 +132,9 @@ struct NotifyReqAwaiter : notify_req {
     void await_resume() const noexcept { }
 };
 
-inline auto wait_inotify(Notify& sem)
+template <lockable lock>
+
+inline auto wait_inotify(Notify<lock>& sem)
 {
     return NotifyReqAwaiter(sem);
 }
