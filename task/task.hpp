@@ -3,6 +3,7 @@
 #include "previous_awaiter.hpp"
 #include "uninitialized.hpp"
 #include <coroutine>
+#include <cstdlib>
 #include <utility>
 
 namespace co_wq {
@@ -69,14 +70,42 @@ template <> struct Promise<void> : Promise_base {
     Promise& operator=(Promise&&) = delete;
 };
 
-template <class T = void, class P = Promise<T>> struct [[nodiscard]] Task {
-    using promise_type = P;
+template <typename T>
+concept taskalloc = requires(T a, void* ptr, std::size_t size) {
+    { a.alloc(size) } -> std::same_as<void*>;
+    { a.dealloc(ptr, size) } -> std::same_as<void>;
+};
+
+struct sys_taskalloc {
+
+public:
+    void* alloc(std::size_t size) { return malloc(size); }
+    void  dealloc(void* ptr, std::size_t sz) noexcept
+    {
+        (void)sz;
+        free(ptr);
+    }
+};
+
+template <class BasePromise, taskalloc Alloc> struct promise_with_alloc : BasePromise {
+    static void* operator new(std::size_t sz) { return Alloc {}.alloc(sz); }
+    static void  operator delete(void* p, std::size_t sz) noexcept { Alloc {}.dealloc(p, sz); }
+    static void  operator delete(void* p) noexcept { Alloc {}.dealloc(p, 0); }
+    auto         get_return_object() { return std::coroutine_handle<promise_with_alloc>::from_promise(*this); }
+};
+
+template <class T = void, class P = Promise<T>, taskalloc Alloc = sys_taskalloc> struct [[nodiscard]] Task {
+    using promise_type = promise_with_alloc<P, Alloc>; // wrap original promise with allocator
 
     Task(std::coroutine_handle<promise_type> coroutine = nullptr) noexcept : mCoroutine(coroutine) { }
 
     Task(Task&& that) noexcept : mCoroutine(that.mCoroutine) { that.mCoroutine = nullptr; }
 
-    Task& operator=(Task&& that) noexcept { std::swap(mCoroutine, that.mCoroutine); }
+    Task& operator=(Task&& that) noexcept
+    {
+        std::swap(mCoroutine, that.mCoroutine);
+        return *this;
+    }
 
     ~Task()
     {
@@ -112,7 +141,7 @@ template <class T = void, class P = Promise<T>> struct [[nodiscard]] Task {
     // private:
     std::coroutine_handle<promise_type> mCoroutine;
 };
-
+#if 0
 template <class Loop, class T, class P> T run_task(Loop& loop, Task<T, P> const& t)
 {
     auto a = t.operator co_await();
@@ -127,5 +156,5 @@ template <class T, class P> void spawn_task(Task<T, P> const& t)
     auto a = t.operator co_await();
     a.await_suspend(std::noop_coroutine()).resume();
 }
-
+#endif
 } // namespace co_wq

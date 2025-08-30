@@ -60,8 +60,8 @@ template <lockable lock> struct Work_Promise<lock, void> : Promise<void>, Work_p
     void return_void() noexcept { Work_promise_base<lock>::post(); }
 };
 
-template <lockable lock, class T>
-static inline void post_to(Task<T, Work_Promise<lock, T>>& tk, workqueue<lock>& executor)
+template <lockable lock, class T, class Alloc>
+static inline void post_to(Task<T, Work_Promise<lock, T>, Alloc>& tk, workqueue<lock>& executor)
 {
     auto& promise = tk.mCoroutine.promise();
     INIT_LIST_HEAD(&promise.ws_node);
