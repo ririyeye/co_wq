@@ -11,10 +11,10 @@
 using namespace co_wq;
 
 // 简单 echo 客户端协程: 连接 127.0.0.1:12345 发送 "hello" 并读取回显
-static Task<void, Work_Promise<nolock, void>> echo_client()
+static Task<void, Work_Promise<SpinLock, void>> echo_client()
 {
     auto&                     wq = get_sys_workqueue();
-    net::fd_workqueue<nolock> fdwq(wq);
+        net::fd_workqueue<SpinLock> fdwq(wq);
     auto                      sock = fdwq.make_tcp_socket();
     int                       rc   = co_await sock.connect("127.0.0.1", 12345);
     if (rc != 0) {
@@ -44,7 +44,7 @@ int main()
 {
 #ifdef USING_NET
     auto&            wq      = get_sys_workqueue();
-    auto             tk      = echo_client(); // Task<void>
+        auto             tk      = echo_client(); // Task<void>
     auto             coro    = tk.get();
     auto&            promise = coro.promise();
     std::atomic_bool finished { false };

@@ -1,7 +1,7 @@
 #include "syswork.hpp"
 #include "workqueue.hpp"
 #include <atomic>
-struct executor_wq : co_wq::workqueue<co_wq::nolock> {
+struct executor_wq : co_wq::workqueue<co_wq::SpinLock> {
     std::atomic_int trig_cnt = 0;
 
     explicit executor_wq()
@@ -13,15 +13,15 @@ struct executor_wq : co_wq::workqueue<co_wq::nolock> {
     }
 };
 
-executor_wq                             executor;
-co_wq::Timer_check_queue<co_wq::nolock> timer(executor);
+executor_wq                                executor;
+co_wq::Timer_check_queue<co_wq::SpinLock> timer(executor);
 
-co_wq::workqueue<co_wq::nolock>& get_sys_workqueue(void)
+co_wq::workqueue<co_wq::SpinLock>& get_sys_workqueue(void)
 {
     return executor;
 }
 
-co_wq::Timer_check_queue<co_wq::nolock>& get_sys_timer(void)
+co_wq::Timer_check_queue<co_wq::SpinLock>& get_sys_timer(void)
 {
     return timer;
 }
