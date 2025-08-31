@@ -203,7 +203,7 @@ template <lockable lock> struct DelayAwaiter : Timer_worknode<lock> {
         wait_ms = ms;
     }
 
-    std::coroutine_handle<>  mCoroutine;
+    std::coroutine_handle<>  mCoroutine {};
     uint32_t                 wait_ms;
     Timer_check_queue<lock>& _delay_queue;
 
