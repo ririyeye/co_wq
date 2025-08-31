@@ -77,14 +77,10 @@ public:
     void add_fd(int fd)
     {
         std::scoped_lock lk(_mtx);
-        epoll_event      ev {};
-        ev.data.fd = fd;
-        ev.events  = EPOLLIN | EPOLLOUT | EPOLLET; // edge-trigger for both; we filter later
-        if (::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            if (errno == EEXIST) {
-                ::epoll_ctl(_epfd, EPOLL_CTL_MOD, fd, &ev);
-            }
+        if (_fds.find(fd) == _fds.end()) {
+            _fds.emplace(fd, fd_state {});
         }
+        // initially not interested in anything until waiter added
     }
 
     void add_waiter(int fd, uint32_t evmask, io_waiter_base* waiter)
@@ -92,13 +88,26 @@ public:
         std::scoped_lock lk(_mtx);
         waiter->func = &io_waiter_base::resume_cb;
         INIT_LIST_HEAD(&waiter->ws_node);
-        _waiters[fd].push_back({ evmask, waiter });
-        // ensure fd tracked by epoll
-        epoll_event ev {};
-        ev.data.fd = fd;
-        // always monitor both IN and OUT (edge trigger) to simplify
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLERR | EPOLLHUP;
-        ::epoll_ctl(_epfd, EPOLL_CTL_MOD, fd, &ev);
+        auto& st = _fds[fd];
+        st.waiters.push_back({ evmask, waiter });
+        update_fd_interest_unlocked(fd, st);
+    }
+
+    void remove_fd(int fd)
+    {
+        std::vector<waiter_item> to_resume;
+        {
+            std::scoped_lock lk(_mtx);
+            auto             it = _fds.find(fd);
+            if (it != _fds.end()) {
+                to_resume.swap(it->second.waiters);
+                _fds.erase(it);
+            }
+        }
+        ::epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
+        for (auto& wi : to_resume) {
+            _exec.post(*wi.waiter);
+        }
     }
 
     static epoll_reactor& instance(workqueue<lock>& exec)
@@ -120,6 +129,35 @@ private:
         io_waiter_base* waiter;
     };
 
+    struct fd_state {
+        std::vector<waiter_item> waiters;        // pending waiters
+        uint32_t                 interest { 0 }; // current epoll interest mask (IN|OUT subset)
+    };
+
+    void update_fd_interest_unlocked(int fd, fd_state& st)
+    {
+        uint32_t new_interest = 0;
+        for (auto& wi : st.waiters)
+            new_interest |= wi.mask;
+        if (new_interest == st.interest) {
+            return; // no change
+        }
+        st.interest = new_interest;
+        if (st.interest == 0) {
+            // no waiters left -> remove interest
+            ::epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
+            return;
+        }
+        epoll_event ev {};
+        ev.data.fd = fd;
+        ev.events  = st.interest | EPOLLERR | EPOLLHUP | EPOLLET;
+        if (::epoll_ctl(_epfd, EPOLL_CTL_MOD, fd, &ev) < 0) {
+            if (errno == ENOENT) {
+                ::epoll_ctl(_epfd, EPOLL_CTL_ADD, fd, &ev);
+            }
+        }
+    }
+
     void run_loop()
     {
         constexpr int            MAX_EVENTS = 32;
@@ -139,25 +177,23 @@ private:
                 std::vector<waiter_item> to_resume;
                 {
                     std::scoped_lock lk(_mtx);
-                    auto             it = _waiters.find(fd);
-                    if (it != _waiters.end()) {
-                        auto& vec = it->second;
-                        // collect those whose mask satisfied
-                        auto new_end = std::remove_if(vec.begin(), vec.end(), [&](waiter_item& wi) {
+                    auto             it = _fds.find(fd);
+                    if (it != _fds.end()) {
+                        auto& st      = it->second;
+                        auto& vec     = st.waiters;
+                        auto  new_end = std::remove_if(vec.begin(), vec.end(), [&](waiter_item& wi) {
                             if ((flags & wi.mask) || (flags & (EPOLLERR | EPOLLHUP))) {
                                 to_resume.push_back(wi);
-                                return true; // remove
+                                return true;
                             }
                             return false;
                         });
                         vec.erase(new_end, vec.end());
-                        if (vec.empty()) {
-                            _waiters.erase(it);
-                        }
+                        update_fd_interest_unlocked(fd, st); // may drop interest or modify
                     }
                 }
                 for (auto& wi : to_resume) {
-                    _exec.post(*wi.waiter); // will resume on workqueue loop
+                    _exec.post(*wi.waiter);
                 }
             }
         }
@@ -165,37 +201,67 @@ private:
 
     // resume_cb provided in io_waiter_base
 
-    int                                               _epfd { -1 };
-    std::atomic_bool                                  _running { false };
-    std::thread                                       _thr;
-    workqueue<lock>&                                  _exec;
-    std::mutex                                        _mtx;
-    std::unordered_map<int, std::vector<waiter_item>> _waiters; // fd -> waiters
+    int                               _epfd { -1 };
+    std::atomic_bool                  _running { false };
+    std::thread                       _thr;
+    workqueue<lock>&                  _exec;
+    std::mutex                        _mtx;
+    std::unordered_map<int, fd_state> _fds; // fd -> state (waiters + interest)
 };
 
 // tcp_socket: non-owning of reactor, owns fd.
+template <lockable lock> class fd_workqueue; // forward
+
 template <lockable lock> class tcp_socket {
 public:
-    explicit tcp_socket(workqueue<lock>& exec) : _exec(exec)
+    tcp_socket()                             = delete;
+    tcp_socket(const tcp_socket&)            = delete;
+    tcp_socket& operator=(const tcp_socket&) = delete;
+    tcp_socket(tcp_socket&& other) noexcept
+        : _exec(other._exec), _fd(other._fd), _rx_eof(other._rx_eof), _tx_shutdown(other._tx_shutdown)
     {
-        _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (_fd < 0)
-            throw std::runtime_error("socket failed");
-        set_non_block();
-        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+        other._fd          = -1;
+        other._rx_eof      = false;
+        other._tx_shutdown = false;
+    }
+    tcp_socket& operator=(tcp_socket&& other) noexcept
+    {
+        if (this != &other) {
+            close();
+            _exec              = other._exec;
+            _fd                = other._fd;
+            _rx_eof            = other._rx_eof;
+            _tx_shutdown       = other._tx_shutdown;
+            other._fd          = -1;
+            other._rx_eof      = false;
+            other._tx_shutdown = false;
+        }
+        return *this;
     }
 
-    tcp_socket(int existing_fd, workqueue<lock>& exec) : _exec(exec), _fd(existing_fd)
-    {
-        set_non_block();
-        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
-    }
+    ~tcp_socket() { close(); }
 
-    ~tcp_socket()
+    void close()
     {
-        if (_fd >= 0)
+        if (_fd >= 0) {
+            // notify reactor to drop and wake waiters
+            epoll_reactor<lock>::instance(_exec).remove_fd(_fd);
             ::close(_fd);
+            _fd = -1;
+        }
     }
+
+    // half-close (shutdown write side)
+    void shutdown_tx()
+    {
+        if (_fd >= 0 && !_tx_shutdown) {
+            ::shutdown(_fd, SHUT_WR);
+            _tx_shutdown = true;
+        }
+    }
+
+    bool tx_shutdown() const noexcept { return _tx_shutdown; }
+    bool rx_eof() const noexcept { return _rx_eof; }
 
     int native_handle() const { return _fd; }
 
@@ -275,9 +341,15 @@ public:
         ssize_t await_resume() noexcept
         {
             if (nread >= 0)
-                return nread;
+                if (nread == 0) {
+                    sock._rx_eof = true; // peer closed write
+                }
+            return nread;
             // try again after readiness
-            return ::recv(sock._fd, buf, len, MSG_DONTWAIT);
+            ssize_t r = ::recv(sock._fd, buf, len, MSG_DONTWAIT);
+            if (r == 0)
+                sock._rx_eof = true;
+            return r;
         }
     };
 
@@ -326,6 +398,9 @@ public:
                     // simplicity return bytes sent.
                     break;
                 }
+                if (n < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)) {
+                    sock._tx_shutdown = true; // peer closed or connection reset
+                }
                 return n; // error
             }
             return (ssize_t)sent;
@@ -343,9 +418,140 @@ private:
         }
     }
 
+    // only factory (fd_workqueue) can construct
+    friend class fd_workqueue<lock>;
+    explicit tcp_socket(workqueue<lock>& exec) : _exec(exec)
+    {
+        _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (_fd < 0)
+            throw std::runtime_error("socket failed");
+        set_non_block();
+        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+    }
+    tcp_socket(int existing_fd, workqueue<lock>& exec) : _exec(exec), _fd(existing_fd)
+    {
+        set_non_block();
+        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+    }
+
+    workqueue<lock>& _exec;
+    int              _fd { -1 };
+    bool             _rx_eof { false };
+    bool             _tx_shutdown { false };
+};
+
+// fd_workqueue: abstraction owning a base workqueue reference for fd-based IO
+template <lockable lock> class fd_workqueue {
+public:
+    explicit fd_workqueue(workqueue<lock>& base) : _base(base) { }
+
+    workqueue<lock>& base() { return _base; }
+
+    tcp_socket<lock> make_tcp_socket() { return tcp_socket<lock>(_base); }
+    tcp_socket<lock> adopt_tcp_socket(int fd) { return tcp_socket<lock>(fd, _base); }
+
+private:
+    workqueue<lock>& _base;
+};
+
+// tcp_listener: accept incoming connections
+template <lockable lock> class tcp_listener {
+public:
+    explicit tcp_listener(workqueue<lock>& exec) : _exec(exec)
+    {
+        _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (_fd < 0)
+            throw std::runtime_error("listener socket failed");
+        set_non_block();
+        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+    }
+    ~tcp_listener() { close(); }
+
+    void bind_listen(const std::string& host, uint16_t port, int backlog = 128)
+    {
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(port);
+        if (host.empty() || host == "0.0.0.0") {
+            addr.sin_addr.s_addr = INADDR_ANY;
+        } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+            throw std::runtime_error("inet_pton failed");
+        }
+        int opt = 1;
+        ::setsockopt(_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if (::bind(_fd, (sockaddr*)&addr, sizeof(addr)) < 0)
+            throw std::runtime_error("bind failed");
+        if (::listen(_fd, backlog) < 0)
+            throw std::runtime_error("listen failed");
+    }
+
+    void close()
+    {
+        if (_fd >= 0) {
+            epoll_reactor<lock>::instance(_exec).remove_fd(_fd);
+            ::close(_fd);
+            _fd = -1;
+        }
+    }
+
+    int native_handle() const { return _fd; }
+
+    struct accept_awaiter : io_waiter_base {
+        tcp_listener& lst;
+        int           newfd { -1 };
+        accept_awaiter(tcp_listener& l) : lst(l) { }
+        bool await_ready() noexcept
+        {
+            newfd = try_accept();
+            if (newfd >= 0 || newfd == -2) // -2 indicates fatal error
+                return true;
+            return false; // EAGAIN -> suspend
+        }
+        void await_suspend(std::coroutine_handle<> h)
+        {
+            this->h = h;
+            INIT_LIST_HEAD(&this->ws_node);
+            epoll_reactor<lock>::instance(lst._exec).add_waiter(lst._fd, EPOLLIN, this);
+        }
+        int await_resume() noexcept
+        {
+            if (newfd >= 0 || newfd == -2)
+                return newfd;
+            // try again
+            return try_accept();
+        }
+        int try_accept() noexcept
+        {
+            sockaddr_in addr;
+            socklen_t   alen = sizeof(addr);
+            int         fd   = ::accept4(lst._fd, (sockaddr*)&addr, &alen, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            if (fd >= 0)
+                return fd;
+            if (fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return -1; // need wait
+            return -2;     // fatal error indicator
+        }
+    };
+
+    accept_awaiter accept() { return accept_awaiter(*this); }
+
+private:
+    void set_non_block()
+    {
+        int flags = ::fcntl(_fd, F_GETFL, 0);
+        if (flags >= 0)
+            ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
     workqueue<lock>& _exec;
     int              _fd { -1 };
 };
+
+template <lockable lock> inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock>& lst)
+{
+    int fd = co_await lst.accept();
+    co_return fd;
+}
 
 // Convenience coroutine wrappers returning Task types (using Work_Promise so they execute on workqueue)
 template <lockable lock>

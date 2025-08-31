@@ -13,9 +13,10 @@ using namespace co_wq;
 // 简单 echo 客户端协程: 连接 127.0.0.1:12345 发送 "hello" 并读取回显
 static Task<void, Work_Promise<nolock, void>> echo_client()
 {
-    auto&                   wq = get_sys_workqueue();
-    net::tcp_socket<nolock> sock(wq);
-    int                     rc = co_await sock.connect("127.0.0.1", 12345);
+    auto&                     wq = get_sys_workqueue();
+    net::fd_workqueue<nolock> fdwq(wq);
+    auto                      sock = fdwq.make_tcp_socket();
+    int                       rc   = co_await sock.connect("127.0.0.1", 12345);
     if (rc != 0) {
         std::cout << "connect failed\n";
         co_return;
