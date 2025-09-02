@@ -142,11 +142,9 @@ private:
     std::atomic_bool                  _running { false };
     std::thread                       _thr;  // 绑定的 IO 线程
     workqueue<lock>&                  _exec; // 主 workqueue，用于恢复协程
-    lock                              _lk;   // 使用模板锁代替 std::mutex
+    lock                              _lk;   // 使用模板锁
     std::unordered_map<int, fd_state> _fds;
 };
-
-// 不再需要全局 singleton 的 init_reactor
 
 } // namespace co_wq::net
 #endif

@@ -3,6 +3,7 @@
 #ifdef __linux__
 #include "epoll_reactor.hpp" // default reactor
 #include "tcp_socket.hpp"    // for factory methods (now templated)
+#include "udp_socket.hpp"
 #include <fcntl.h>
 #include <stdexcept>
 #include <unistd.h>
@@ -31,7 +32,9 @@ public:
     void close()
     {
         if (_fd >= 0) {
-            Reactor<lock>::instance(_exec).remove_fd(_fd);
+            if (_reactor) {
+                _reactor->remove_fd(_fd);
+            }
             ::close(_fd);
             _fd = -1;
         }
@@ -59,7 +62,7 @@ protected:
 
 template <lockable lock, template <class> class Reactor = epoll_reactor> class fd_workqueue {
 public:
-    explicit fd_workqueue(workqueue<lock>& base) : _base(base), _reactor(std::make_unique<Reactor<lock>>(base)) { }
+    explicit fd_workqueue(workqueue<lock>& base) : _base(base), _reactor(base) { }
     workqueue<lock>& base() { return _base; }
     int              open_file(const char* path, int flags, mode_t mode = 0644)
     {
@@ -69,13 +72,14 @@ public:
         _reactor->add_fd(fd);
         return fd;
     }
-    Reactor<lock>&            reactor() { return *_reactor; }
-    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, *_reactor); }
-    tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, *_reactor); }
+    Reactor<lock>&            reactor() { return _reactor; }
+    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
+    tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
+    udp_socket<lock, Reactor> make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
 
 private:
-    workqueue<lock>&               _base;
-    std::unique_ptr<Reactor<lock>> _reactor; // 专属 reactor 与线程
+    workqueue<lock>& _base;
+    Reactor<lock>    _reactor; // 内嵌 reactor (无堆分配)
 };
 
 } // namespace co_wq::net

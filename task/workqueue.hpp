@@ -66,8 +66,8 @@ template <lockable Lock> struct workqueue {
     void lock() { lk.lock(); }
     void unlock() { lk.unlock(); }
 
-private:
-    struct worknode* get_work_node(struct workqueue& wq)
+protected:
+    virtual struct worknode* get_work_node(struct workqueue& wq)
     {
         struct worknode* pnod = NULL;
         if (list_empty(&wq.ws_head)) {
