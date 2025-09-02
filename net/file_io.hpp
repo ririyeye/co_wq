@@ -2,6 +2,7 @@
 #pragma once
 #ifdef __linux__
 #include "epoll_reactor.hpp"
+#include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include <errno.h>
 #include <fcntl.h>
@@ -39,7 +40,11 @@ public:
     ~file_handle() { close(); }
     int  native_handle() const { return _fd; }
     bool closed() const { return _closed || _fd < 0; }
-    void close()
+    // Accessors for serial_slot_awaiter
+    workqueue<lock>& exec() { return _exec; }
+    lock&            serial_lock() { return _io_serial_lock; }
+    Reactor<lock>*   reactor() { return _reactor; }
+    void             close()
     {
         if (_fd < 0)
             return;
@@ -49,20 +54,20 @@ public:
         std::vector<worknode*> pending;
         {
             std::scoped_lock lk(_io_serial_lock);
-            while (!list_empty(&_read_waiters)) {
-                auto* lh = _read_waiters.next;
+            while (!list_empty(&_read_q.waiters)) {
+                auto* lh = _read_q.waiters.next;
                 auto* wn = list_entry(lh, worknode, ws_node);
                 list_del(lh);
                 pending.push_back(wn);
             }
-            _read_locked = false;
-            while (!list_empty(&_write_waiters)) {
-                auto* lh = _write_waiters.next;
+            _read_q.locked = false;
+            while (!list_empty(&_write_q.waiters)) {
+                auto* lh = _write_q.waiters.next;
                 auto* wn = list_entry(lh, worknode, ws_node);
                 list_del(lh);
                 pending.push_back(wn);
             }
-            _write_locked = false;
+            _write_q.locked = false;
         }
         for (auto* wn : pending) {
             wn->func = &io_waiter_base::resume_cb;
@@ -72,61 +77,41 @@ public:
         _fd = -1;
     }
 
-    struct read_awaiter : io_waiter_base {
-        file_handle& fh;
-        void*        buf;
-        size_t       len;
-        ssize_t      nrd { -1 };
-        off_t*       pofs { nullptr };
-        bool         use_offset { false };
-        bool         have_lock { false };
-        read_awaiter(file_handle& f, void* b, size_t l) : fh(f), buf(b), len(l) { }
+    struct read_awaiter : two_phase_drain_awaiter<read_awaiter, file_handle> {
+        void*   buf;
+        size_t  len;
+        ssize_t nrd { -1 };
+        off_t*  pofs { nullptr };
+        bool    use_offset { false };
+        read_awaiter(file_handle& f, void* b, size_t l)
+            : two_phase_drain_awaiter<read_awaiter, file_handle>(f, f._read_q), buf(b), len(l)
+        {
+        }
         read_awaiter(file_handle& f, void* b, size_t l, off_t& ofs)
-            : fh(f), buf(b), len(l), pofs(&ofs), use_offset(true)
+            : two_phase_drain_awaiter<read_awaiter, file_handle>(f, f._read_q)
+            , buf(b)
+            , len(l)
+            , pofs(&ofs)
+            , use_offset(true)
         {
         }
-        static void lock_acquired_cb(worknode* w)
+        int attempt_once()
         {
-            auto* self      = static_cast<read_awaiter*>(w);
-            self->have_lock = true;
-            self->nrd       = self->try_read();
-            if (self->nrd >= 0 || (self->nrd < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                self->fh.release_read_slot();
-                self->func = &io_waiter_base::resume_cb;
-                if (self->h)
-                    self->h.resume();
-                return;
-            }
-            self->nrd  = -1;
-            self->func = &read_awaiter::drive_cb;
-            self->fh._reactor->add_waiter_custom(self->fh._fd, EPOLLIN, self);
+            nrd = try_read();
+            if (nrd >= 0)
+                return 0; // done (success or 0=EOF)
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -1; // would block
+            return 0;      // error -> done
         }
-        static void drive_cb(worknode* w)
+        static void arm(read_awaiter* self, bool /*first*/)
         {
-            auto* self = static_cast<read_awaiter*>(w);
-            self->nrd  = self->try_read();
-            self->fh.release_read_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h    = h;
-            this->func = &read_awaiter::lock_acquired_cb;
-            INIT_LIST_HEAD(&this->ws_node);
-            std::scoped_lock lk(fh._io_serial_lock);
-            if (!fh._read_locked && list_empty(&fh._read_waiters)) {
-                fh._read_locked = true;
-                fh._exec.post(*this);
-                return;
-            }
-            list_add_tail(&this->ws_node, &fh._read_waiters);
-        }
+        bool    await_ready() noexcept { return false; }
         ssize_t await_resume() noexcept
         {
-            if (nrd < 0 && fh._closed) {
+            if (nrd < 0 && this->owner.closed()) {
                 errno = ECANCELED;
                 return -1;
             }
@@ -134,77 +119,52 @@ public:
         }
         ssize_t try_read()
         {
-            if (fh._fd < 0)
+            if (this->owner.native_handle() < 0)
                 return -1;
             if (use_offset) {
-                ssize_t r = ::pread(fh._fd, buf, len, *pofs);
+                ssize_t r = ::pread(this->owner.native_handle(), buf, len, *pofs);
                 if (r > 0)
                     *pofs += r;
                 return r;
             }
-            return ::read(fh._fd, buf, len);
+            return ::read(this->owner.native_handle(), buf, len);
         }
     };
     read_awaiter read(void* buf, size_t len) { return read_awaiter(*this, buf, len); }
     read_awaiter pread(void* buf, size_t len, off_t& ofs) { return read_awaiter(*this, buf, len, ofs); }
 
-    struct write_awaiter : io_waiter_base {
-        file_handle& fh;
-        const void*  buf;
-        size_t       len;
-        size_t       done { 0 };
-        off_t*       pofs { nullptr };
-        bool         use_offset { false };
-        bool         have_lock { false };
-        write_awaiter(file_handle& f, const void* b, size_t l) : fh(f), buf(b), len(l) { }
+    struct write_awaiter : two_phase_drain_awaiter<write_awaiter, file_handle> {
+        const void* buf;
+        size_t      len;
+        size_t      done { 0 };
+        off_t*      pofs { nullptr };
+        bool        use_offset { false };
+        write_awaiter(file_handle& f, const void* b, size_t l)
+            : two_phase_drain_awaiter<write_awaiter, file_handle>(f, f._write_q), buf(b), len(l)
+        {
+        }
         write_awaiter(file_handle& f, const void* b, size_t l, off_t& ofs)
-            : fh(f), buf(b), len(l), pofs(&ofs), use_offset(true)
+            : two_phase_drain_awaiter<write_awaiter, file_handle>(f, f._write_q)
+            , buf(b)
+            , len(l)
+            , pofs(&ofs)
+            , use_offset(true)
         {
         }
-        static void lock_acquired_cb(worknode* w)
+        int attempt_once()
         {
-            auto* self      = static_cast<write_awaiter*>(w);
-            self->have_lock = true;
-            if (!self->try_write()) {
-                self->func = &write_awaiter::drive_cb;
-                self->fh._reactor->add_waiter_custom(self->fh._fd, EPOLLOUT, self);
-                return;
-            }
-            self->fh.release_write_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
+            if (try_write())
+                return 0; // done or error
+            return -1;    // would block
         }
-        static void drive_cb(worknode* w)
+        static void arm(write_awaiter* self, bool /*first*/)
         {
-            auto* self = static_cast<write_awaiter*>(w);
-            if (!self->try_write()) {
-                self->func = &write_awaiter::drive_cb;
-                self->fh._reactor->add_waiter_custom(self->fh._fd, EPOLLOUT, self);
-                return;
-            }
-            self->fh.release_write_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h    = h;
-            this->func = &write_awaiter::lock_acquired_cb;
-            INIT_LIST_HEAD(&this->ws_node);
-            std::scoped_lock lk(fh._io_serial_lock);
-            if (!fh._write_locked && list_empty(&fh._write_waiters)) {
-                fh._write_locked = true;
-                fh._exec.post(*this);
-                return;
-            }
-            list_add_tail(&this->ws_node, &fh._write_waiters);
-        }
+        bool    await_ready() noexcept { return false; }
         ssize_t await_resume() noexcept
         {
-            if (done == 0 && fh._closed) {
+            if (done == 0 && this->owner.closed()) {
                 errno = ECANCELED;
                 return -1;
             }
@@ -215,11 +175,11 @@ public:
             while (done < len) {
                 ssize_t n;
                 if (use_offset) {
-                    n = ::pwrite(fh._fd, (char*)buf + done, len - done, *pofs);
+                    n = ::pwrite(this->owner.native_handle(), (char*)buf + done, len - done, *pofs);
                     if (n > 0)
                         *pofs += n;
                 } else {
-                    n = ::write(fh._fd, (char*)buf + done, len - done);
+                    n = ::write(this->owner.native_handle(), (char*)buf + done, len - done);
                 }
                 if (n > 0) {
                     done += (size_t)n;
@@ -245,52 +205,17 @@ private:
         if (flags >= 0)
             ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
         _reactor->add_fd(_fd);
-        INIT_LIST_HEAD(&_read_waiters);
-        INIT_LIST_HEAD(&_write_waiters);
+        serial_queue_init(_read_q);
+        serial_queue_init(_write_q);
     }
     workqueue<lock>& _exec;
     Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
     lock             _io_serial_lock;
-    list_head        _read_waiters {};
-    bool             _read_locked { false };
-    list_head        _write_waiters {};
-    bool             _write_locked { false };
+    serial_queue     _read_q;
+    serial_queue     _write_q;
     bool             _closed { false };
-    void             release_read_slot()
-    {
-        worknode* next = nullptr;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            if (!list_empty(&_read_waiters)) {
-                auto* lh = _read_waiters.next;
-                auto* aw = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                next = aw;
-            } else {
-                _read_locked = false;
-            }
-        }
-        if (next)
-            _exec.post(*next);
-    }
-    void release_write_slot()
-    {
-        worknode* next = nullptr;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            if (!list_empty(&_write_waiters)) {
-                auto* lh = _write_waiters.next;
-                auto* aw = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                next = aw;
-            } else {
-                _write_locked = false;
-            }
-        }
-        if (next)
-            _exec.post(*next);
-    }
+    // release handled via serial_slot_awaiter
 };
 
 template <lockable lock, template <class> class Reactor = epoll_reactor>

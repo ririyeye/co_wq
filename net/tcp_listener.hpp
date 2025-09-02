@@ -1,7 +1,7 @@
-// tcp_listener.hpp - async accept for TCP
+// tcp_listener.hpp - TCP 异步 accept
 #pragma once
 #ifdef __linux__
-#include "epoll_reactor.hpp" // default reactor
+#include "epoll_reactor.hpp" // 默认 reactor
 #include "fd_base.hpp"
 #include "io_waiter.hpp"
 #include "tcp_socket.hpp"
@@ -65,7 +65,8 @@ public:
     }
     int native_handle() const { return _fd; }
     /**
-     * @brief 异步 accept awaiter；返回新连接 fd 或 -1(需等待) / -2(致命错误)。
+     * @brief 异步 accept awaiter。
+     * @return >=0 新连接 fd；-1 需等待（内部挂起）；-2 致命错误。
      */
     struct accept_awaiter : io_waiter_base {
         tcp_listener& lst;
@@ -88,7 +89,7 @@ public:
                 return newfd;
             return try_accept();
         }
-        int try_accept() noexcept
+        int try_accept() noexcept // 单次非阻塞 accept4
         {
             sockaddr_in addr;
             socklen_t   alen = sizeof(addr);
@@ -96,8 +97,8 @@ public:
             if (fd >= 0)
                 return fd;
             if (fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                return -1; // need wait
-            return -2;     // fatal
+                return -1; // 需等待
+            return -2;     // 致命错误
         }
     };
     /**
@@ -123,7 +124,7 @@ inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock, Reacto
     co_return fd;
 }
 
-// helper: return a ready tcp_socket if accept ok (fd>=0) else nullptr-like via optional pattern (simplified)
+// 辅助: 若成功返回已创建的 tcp_socket，否则返回一个已关闭的占位 socket
 template <lockable lock, template <class> class Reactor = epoll_reactor>
 inline Task<tcp_socket<lock, Reactor>, Work_Promise<lock, tcp_socket<lock, Reactor>>>
 async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor>& lst)

@@ -2,6 +2,7 @@
 #pragma once
 #ifdef __linux__
 #include "epoll_reactor.hpp"
+#include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "worker.hpp"
 #include <arpa/inet.h>
@@ -52,20 +53,20 @@ public:
             std::vector<worknode*> pending;
             {
                 std::scoped_lock lk(_io_serial_lock);
-                while (!list_empty(&_send_waiters)) {
-                    auto* lh = _send_waiters.next;
+                while (!list_empty(&_send_q.waiters)) {
+                    auto* lh = _send_q.waiters.next;
                     auto* wn = list_entry(lh, worknode, ws_node);
                     list_del(lh);
                     pending.push_back(wn);
                 }
-                _send_locked = false;
-                while (!list_empty(&_recv_waiters)) {
-                    auto* lh = _recv_waiters.next;
+                _send_q.locked = false;
+                while (!list_empty(&_recv_q.waiters)) {
+                    auto* lh = _recv_q.waiters.next;
                     auto* wn = list_entry(lh, worknode, ws_node);
                     list_del(lh);
                     pending.push_back(wn);
                 }
-                _recv_locked = false;
+                _recv_q.locked = false;
             }
             for (auto* wn : pending) {
                 wn->func = &io_waiter_base::resume_cb; // 直接恢复协程，它会在 await_resume 检查 _closed
@@ -76,6 +77,11 @@ public:
         }
     }
     int native_handle() const { return _fd; }
+    // Access for serial_slot_awaiter
+    workqueue<lock>& exec() { return _exec; }
+    lock&            serial_lock() { return _io_serial_lock; }
+    Reactor<lock>*   reactor() { return _reactor; }
+    bool             closed() const { return _closed; }
 
     // Optional connect to set default peer
     /**
@@ -130,81 +136,33 @@ public:
     /**
      * @brief 异步 recvfrom awaiter。
      */
-    struct recvfrom_awaiter : io_waiter_base {
-        udp_socket&  sock;
+    struct recvfrom_awaiter : two_phase_drain_awaiter<recvfrom_awaiter, udp_socket> {
         void*        buf;
         size_t       len;
         sockaddr_in* out_addr;
         socklen_t*   out_len;
         ssize_t      nread { -1 }; // -1 需等待
-        bool         have_lock { false };
         recvfrom_awaiter(udp_socket& s, void* b, size_t l, sockaddr_in* oa, socklen_t* ol)
-            : sock(s), buf(b), len(l), out_addr(oa), out_len(ol)
+            : serial_slot_awaiter<recvfrom_awaiter, udp_socket>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
         {
         }
-        static void lock_acquired_cb(worknode* w)
+        int attempt_once()
         {
-            auto* self      = static_cast<recvfrom_awaiter*>(w);
-            self->have_lock = true;
-            self->nread     = ::recvfrom(self->sock._fd,
-                                     self->buf,
-                                     self->len,
-                                     MSG_DONTWAIT,
-                                     (sockaddr*)self->out_addr,
-                                     self->out_len);
-            if (self->nread >= 0) {
-                self->sock.release_recv_slot();
-                self->func = &io_waiter_base::resume_cb;
-                if (self->h)
-                    self->h.resume();
-                return;
-            }
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                // error
-                self->sock.release_recv_slot();
-                self->func = &io_waiter_base::resume_cb;
-                if (self->h)
-                    self->h.resume();
-                return;
-            }
-            // 需要等待可读
-            self->nread = -1;
-            self->func  = &recvfrom_awaiter::drive_cb;
-            self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLIN, self);
+            nread = ::recvfrom(this->owner.native_handle(), buf, len, MSG_DONTWAIT, (sockaddr*)out_addr, out_len);
+            if (nread >= 0)
+                return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -1;
+            return 0; // error
         }
-        static void drive_cb(worknode* w)
+        static void arm(recvfrom_awaiter* self, bool /*first*/)
         {
-            auto* self  = static_cast<recvfrom_awaiter*>(w);
-            self->nread = ::recvfrom(self->sock._fd,
-                                     self->buf,
-                                     self->len,
-                                     MSG_DONTWAIT,
-                                     (sockaddr*)self->out_addr,
-                                     self->out_len);
-            self->sock.release_recv_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h    = h;
-            this->func = &recvfrom_awaiter::lock_acquired_cb;
-            INIT_LIST_HEAD(&this->ws_node);
-            {
-                std::scoped_lock lk(sock._io_serial_lock);
-                if (!sock._recv_locked && list_empty(&sock._recv_waiters)) {
-                    sock._recv_locked = true;
-                    sock._exec.post(*this);
-                    return;
-                }
-                list_add_tail(&this->ws_node, &sock._recv_waiters);
-            }
-        }
+        bool    await_ready() noexcept { return false; }
         ssize_t await_resume() noexcept
         {
-            if (nread < 0 && sock._closed) {
+            if (nread < 0 && this->owner.closed()) {
                 errno = ECANCELED;
                 return -1;
             }
@@ -222,92 +180,42 @@ public:
     /**
      * @brief 异步 sendto awaiter，内部循环直到 EAGAIN。
      */
-    struct sendto_awaiter : io_waiter_base {
-        udp_socket&        sock;
+    struct sendto_awaiter : two_phase_drain_awaiter<sendto_awaiter, udp_socket> {
         const void*        buf;
         size_t             len;
         const sockaddr_in* dest;
         size_t             sent { 0 };
-        bool               have_lock { false };
-        sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d) : sock(s), buf(b), len(l), dest(d)
+        sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d)
+            : serial_slot_awaiter<sendto_awaiter, udp_socket>(s, s._send_q), buf(b), len(l), dest(d)
         {
         }
-        static void lock_acquired_cb(worknode* w)
+        int attempt_once()
         {
-            auto* self      = static_cast<sendto_awaiter*>(w);
-            self->have_lock = true;
-            // drain attempt
-            while (self->sent < self->len) {
-                ssize_t n = ::sendto(self->sock._fd,
-                                     (const char*)self->buf + self->sent,
-                                     self->len - self->sent,
+            while (sent < len) {
+                ssize_t n = ::sendto(this->owner.native_handle(),
+                                     (const char*)buf + sent,
+                                     len - sent,
                                      MSG_DONTWAIT | MSG_NOSIGNAL,
-                                     (const sockaddr*)self->dest,
-                                     sizeof(*self->dest));
+                                     (const sockaddr*)dest,
+                                     sizeof(*dest));
                 if (n > 0) {
-                    self->sent += (size_t)n;
+                    sent += (size_t)n;
                     continue;
                 }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    // need wait
-                    self->func = &sendto_awaiter::drive_cb;
-                    self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLOUT, self);
-                    return;
-                }
-                // error or n==0
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    return -1;
                 break;
             }
-            self->sock.release_send_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
+            return 0; // done or error
         }
-        static void drive_cb(worknode* w)
+        static void arm(sendto_awaiter* self, bool /*first*/)
         {
-            auto* self = static_cast<sendto_awaiter*>(w);
-            while (self->sent < self->len) {
-                ssize_t n = ::sendto(self->sock._fd,
-                                     (const char*)self->buf + self->sent,
-                                     self->len - self->sent,
-                                     MSG_DONTWAIT | MSG_NOSIGNAL,
-                                     (const sockaddr*)self->dest,
-                                     sizeof(*self->dest));
-                if (n > 0) {
-                    self->sent += (size_t)n;
-                    continue;
-                }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    // still pending
-                    self->func = &sendto_awaiter::drive_cb;
-                    self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLOUT, self);
-                    return;
-                }
-                break; // error or n==0
-            }
-            self->sock.release_send_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h    = h;
-            this->func = &sendto_awaiter::lock_acquired_cb;
-            INIT_LIST_HEAD(&this->ws_node);
-            {
-                std::scoped_lock lk(sock._io_serial_lock);
-                if (!sock._send_locked && list_empty(&sock._send_waiters)) {
-                    sock._send_locked = true;
-                    sock._exec.post(*this);
-                    return;
-                }
-                list_add_tail(&this->ws_node, &sock._send_waiters);
-            }
-        }
+        bool    await_ready() noexcept { return false; }
         ssize_t await_resume() noexcept
         {
-            if (sent == 0 && sock._closed) {
+            if (sent == 0 && this->owner.closed()) {
                 errno = ECANCELED;
                 return -1;
             }
@@ -342,46 +250,11 @@ private:
     Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
     // IO 串行锁与队列
-    lock      _io_serial_lock;
-    list_head _send_waiters;
-    bool      _send_locked { false };
-    list_head _recv_waiters;
-    bool      _recv_locked { false };
-    bool      _closed { false }; // 是否已关闭，用于取消待定操作
-    void      release_send_slot()
-    {
-        worknode* next = nullptr;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            if (!list_empty(&_send_waiters)) {
-                auto* lh = _send_waiters.next;
-                auto* aw = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                next = aw;
-            } else {
-                _send_locked = false;
-            }
-        }
-        if (next)
-            _exec.post(*next);
-    }
-    void release_recv_slot()
-    {
-        worknode* next = nullptr;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            if (!list_empty(&_recv_waiters)) {
-                auto* lh = _recv_waiters.next;
-                auto* aw = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                next = aw;
-            } else {
-                _recv_locked = false;
-            }
-        }
-        if (next)
-            _exec.post(*next);
-    }
+    lock         _io_serial_lock;
+    serial_queue _send_q;
+    serial_queue _recv_q;
+    bool         _closed { false }; // 是否已关闭，用于取消待定操作
+    // release handled via serial_slot_awaiter
 };
 
 // Convenience async wrappers

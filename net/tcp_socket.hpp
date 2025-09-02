@@ -1,7 +1,8 @@
-// tcp_socket.hpp - TCP socket coroutine primitives
+// tcp_socket.hpp - TCP socket 协程原语
 #pragma once
 #ifdef __linux__
-#include "epoll_reactor.hpp" // default Reactor
+#include "epoll_reactor.hpp" // 默认 Reactor
+#include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "worker.hpp"
 #include <arpa/inet.h>
@@ -17,11 +18,10 @@
 
 namespace co_wq::net {
 
-// Forward decl for fd_workqueue with reactor parameter
+// 前置声明: 带 Reactor 模板参数的 fd_workqueue
 template <lockable lock, template <class> class Reactor> class fd_workqueue;
 
-// tcp_socket now parameterized by Reactor backend (must provide static instance(exec) returning reactor with
-// add_fd/remove_fd/add_waiter)
+// Reactor 后端需提供: static instance(exec) / add_fd / remove_fd / add_waiter 接口
 /**
  * @brief 基于非阻塞 + epoll (边缘触发) 的 TCP socket 协程封装。
  *
@@ -88,6 +88,12 @@ public:
     bool tx_shutdown() const noexcept { return _tx_shutdown; }
     bool rx_eof() const noexcept { return _rx_eof; }
     int  native_handle() const { return _fd; }
+    // 提供给串行 / two_phase awaiter 的访问器
+    workqueue<lock>& exec() { return _exec; }
+    lock&            serial_lock() { return _io_serial_lock; }
+    Reactor<lock>*   reactor() { return _reactor; }
+    void             mark_rx_eof() { _rx_eof = true; }
+    void             mark_tx_shutdown() { _tx_shutdown = true; }
     struct connect_awaiter : io_waiter_base {
         tcp_socket& sock;
         std::string host;
@@ -139,62 +145,41 @@ public:
      * @return await 后返回 0 表示成功，-1 失败 (SO_ERROR 非 0)。
      */
     connect_awaiter connect(const std::string& host, uint16_t port) { return connect_awaiter(*this, host, port); }
-    struct recv_awaiter : io_waiter_base {
-        tcp_socket& sock;
-        void*       buf;
-        size_t      len;
-        ssize_t     nread { -1 }; // -1 表示需读取
-        bool        have_lock { false };
-        recv_awaiter(tcp_socket& s, void* b, size_t l) : sock(s), buf(b), len(l) { }
-        static void lock_acquired_cb(worknode* w)
+    /**
+     * @brief 单次接收 awaiter（使用 two_phase_drain_awaiter 模式）。
+     *
+     * 语义保持为“执行一次 recv”：不会在同一 await 中循环读取到 EAGAIN，只做一次系统调用；
+     * 这样上层可以更明确地控制协议分帧或字节流节奏。
+     */
+    struct recv_awaiter : two_phase_drain_awaiter<recv_awaiter, tcp_socket> {
+        void*   buf;
+        size_t  len;
+        ssize_t nread { -1 };
+        recv_awaiter(tcp_socket& s, void* b, size_t l)
+            : two_phase_drain_awaiter<recv_awaiter, tcp_socket>(s, s._recv_q), buf(b), len(l)
         {
-            auto* self      = static_cast<recv_awaiter*>(w);
-            self->have_lock = true;
-            // 尝试立即读一次
-            self->nread = ::recv(self->sock._fd, self->buf, self->len, MSG_DONTWAIT);
-            if (self->nread >= 0 || (self->nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                // 完成或错误立即恢复
-                if (self->nread == 0)
-                    self->sock._rx_eof = true;
-                self->sock.release_recv_slot();
-                self->func = &io_waiter_base::resume_cb;
-                if (self->h)
-                    self->h.resume();
-                return;
-            }
-            // 需要等待 EPOLLIN
-            self->nread = -1; // 标记需在唤醒后再读
-            self->func  = &recv_awaiter::drive_cb;
-            self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLIN, self);
         }
-        static void drive_cb(worknode* w)
+        // attempt_once: >0 继续；0 完成；-1 需等待。这里一次 recv 完成后直接返回 0。
+        int attempt_once()
         {
-            auto* self = static_cast<recv_awaiter*>(w);
-            // 被 EPOLLIN 唤醒，最终读取
-            self->nread = ::recv(self->sock._fd, self->buf, self->len, MSG_DONTWAIT);
-            if (self->nread == 0)
-                self->sock._rx_eof = true;
-            self->sock.release_recv_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
-        }
-        bool await_ready() noexcept { return false; } // 总是走锁流程
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h    = h;
-            this->func = &recv_awaiter::lock_acquired_cb;
-            INIT_LIST_HEAD(&this->ws_node);
-            // 获取接收互斥
-            {
-                std::scoped_lock lk(sock._io_serial_lock);
-                if (!sock._recv_locked && list_empty(&sock._recv_waiters)) {
-                    sock._recv_locked = true;
-                    sock._exec.post(*this);
-                    return;
-                }
-                list_add_tail(&this->ws_node, &sock._recv_waiters);
+            nread = ::recv(this->owner.native_handle(), buf, len, MSG_DONTWAIT);
+            if (nread > 0)
+                return 0; // 读到数据 => 完成
+            if (nread == 0) {
+                this->owner.mark_rx_eof();
+                return 0;
             }
+            // nread < 0
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                nread = -1;
+                return -1;
+            }
+            // 其他错误：nread 保存 -1，errno 供调用方使用
+            return 0;
+        }
+        static void arm(recv_awaiter* self, bool /*first*/)
+        {
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
         ssize_t await_resume() noexcept { return nread; }
     };
@@ -206,30 +191,71 @@ public:
      * @note 单次 recv，不保证读满；上层可循环/协议分帧。
      */
     recv_awaiter recv(void* buf, size_t len) { return recv_awaiter(*this, buf, len); }
+    /**
+     * @brief 读取直到缓冲区填满 / EOF / 错误 的 awaiter。
+     * 返回值:
+     *  - ==len 读取成功填满；
+     *  - 0..len-1 读取到 EOF 或 错误前的部分（若出现错误且读取了部分数据，优先返回已读字节数）；
+     *  - <0 在首个系统调用就出错且未读取任何数据（返回 -1，errno 保留）。
+     */
+    struct recv_all_awaiter : two_phase_drain_awaiter<recv_all_awaiter, tcp_socket> {
+        char*   buf;
+        size_t  len;
+        size_t  recvd { 0 };
+        ssize_t err { 0 }; // 仅在 recvd == 0 且系统调用返回 <0 (非 EAGAIN) 时保存
+        recv_all_awaiter(tcp_socket& s, void* b, size_t l)
+            : two_phase_drain_awaiter<recv_all_awaiter, tcp_socket>(s, s._recv_q), buf(static_cast<char*>(b)), len(l)
+        {
+        }
+        int attempt_once()
+        {
+            if (recvd >= len)
+                return 0;
+            ssize_t n = ::recv(this->owner.native_handle(), buf + recvd, len - recvd, MSG_DONTWAIT);
+            if (n > 0) {
+                recvd += (size_t)n;
+                return recvd == len ? 0 : 1; // 继续 or 完成
+            }
+            if (n == 0) {
+                this->owner.mark_rx_eof();
+                return 0;
+            }
+            // n < 0
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -1; // 等待可读
+            if (recvd == 0)
+                err = n; // 记录首个错误
+            return 0;
+        }
+        static void arm(recv_all_awaiter* self, bool /*first*/)
+        {
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
+        }
+        ssize_t await_resume() noexcept { return (err < 0 && recvd == 0) ? err : (ssize_t)recvd; }
+    };
+    recv_all_awaiter recv_all(void* buf, size_t len) { return recv_all_awaiter(*this, buf, len); }
     struct send_awaiter : io_waiter_base {
         tcp_socket& sock;
         const void* buf;
         size_t      len;
         size_t      sent { 0 };
         send_awaiter(tcp_socket& s, const void* b, size_t l) : sock(s), buf(b), len(l) { }
-        // Drain as much as possible before deciding to suspend. This is required for EPOLLET (edge-triggered)
-        // correctness: we must consume the writable edge fully (until EAGAIN) otherwise we may never get
-        // another EPOLLOUT event and could hang with pending data.
+        // 尽可能写到 EAGAIN 再决定挂起：EPOLLET 下必须耗尽当前可写边沿，否则可能失去后续事件导致挂起。
         bool await_ready() noexcept
         {
             while (sent < len) {
                 ssize_t n = ::send(sock._fd, (char*)buf + sent, len - sent, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if (n > 0) {
                     sent += (size_t)n;
-                    continue; // try write remaining immediately
+                    continue; // 继续写剩余数据
                 }
                 if (n == 0) {
-                    // Treat as progress impossible now; return to caller (will likely loop or error out)
+                    // 视为无进展；返回调用方（可能重试或处理错误）
                     return true;
                 }
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // Need to wait for next writable edge unless already finished
+                        // 需要等待下一个可写事件（除非已经正好写完）
                         return sent == len; // if exactly finished (rare) treat as ready
                     }
                     if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
@@ -248,26 +274,26 @@ public:
         ssize_t await_resume() noexcept
         {
             if (sent == len)
-                return (ssize_t)sent; // already complete
+                return (ssize_t)sent; // 已完成
             while (sent < len) {
                 ssize_t n = ::send(sock._fd, (char*)buf + sent, len - sent, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if (n > 0) {
                     sent += (size_t)n;
-                    continue; // keep draining until EAGAIN or done
+                    continue; // 持续写直到 EAGAIN 或完成
                 }
                 if (n == 0) {
-                    // Unusual for send; treat as no more progress possible now
+                    // 罕见：视为暂不可进展
                     break;
                 }
                 if (n < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK)
-                        break; // partial send; caller may re-await
+                        break; // 部分发送；调用方可再次 await
                     if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
                         sock._tx_shutdown = true;
                     return n; // propagate error
                 }
             }
-            return (ssize_t)sent; // partial or complete
+            return (ssize_t)sent; // 部分或全部完成
         }
     };
     /**
@@ -278,12 +304,12 @@ public:
      * @note EPOLLET 下 awaiter 内部会在挂起前尽量写满，防止丢事件。
      */
     send_awaiter send(const void* buf, size_t len) { return send_awaiter(*this, buf, len); }
-    // Vectored send awaiter (gather write using writev)
+    // 向量化发送 awaiter（writev 聚合写）
     struct sendv_awaiter : io_waiter_base {
         tcp_socket&        sock;
-        std::vector<iovec> vec;         // mutable copy we can adjust
-        size_t             total { 0 }; // total bytes to send
-        size_t             sent { 0 };  // bytes already sent
+        std::vector<iovec> vec;         // 可变副本
+        size_t             total { 0 }; // 总字节数
+        size_t             sent { 0 };  // 已发送字节
         sendv_awaiter(tcp_socket& s, const struct iovec* iov, int iovcnt) : sock(s)
         {
             vec.reserve((size_t)iovcnt);
@@ -292,7 +318,7 @@ public:
                 total += iov[i].iov_len;
             }
         }
-        bool drain_once()
+        bool drain_once() // 单次写尝试；返回 true 表示完成或错误
         {
             if (vec.empty())
                 return true;
@@ -300,7 +326,7 @@ public:
             if (n > 0) {
                 sent += (size_t)n;
                 size_t remain = (size_t)n;
-                // Adjust iovec list
+                // 调整 iovec 列表裁掉已发送部分
                 while (remain > 0 && !vec.empty()) {
                     if (remain >= vec.front().iov_len) {
                         remain -= vec.front().iov_len;
@@ -315,22 +341,22 @@ public:
             }
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    return false; // need to wait
+                    return false; // 需等待
                 if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
                     sock._tx_shutdown = true;
-                sent = (ssize_t)n; // propagate error code (negative)
-                return true;       // treat as complete with error
+                sent = (ssize_t)n; // 记录错误（负值）
+                return true;       // 视为终止
             }
-            return true; // n == 0 unlikely; treat as done
+            return true; // n==0 罕见；视为结束
         }
         bool await_ready() noexcept
         {
-            // drain until would block or complete
+            // 循环写直至完成或将阻塞
             while (true) {
                 bool done = drain_once();
                 if (done)
-                    return true; // finished or error
-                // not done but would block
+                    return true; // 完成或错误
+                // 未完成但会阻塞
                 return false;
             }
         }
@@ -343,16 +369,16 @@ public:
         ssize_t await_resume() noexcept
         {
             if (!vec.empty() && sent >= 0) {
-                // attempt more writes after wake
+                // 唤醒后再次写
                 while (true) {
                     bool done = drain_once();
                     if (done)
                         break;
-                    // would block again
+                    // 再次将阻塞
                     break;
                 }
             }
-            return (ssize_t)sent; // if error, sent holds negative errno return value
+            return (ssize_t)sent; // 若 sent<0 表示错误
         }
     };
     /**
@@ -363,74 +389,17 @@ public:
      * @note 内部复制一份 iovec 以便原位调整指针与长度，不修改调用者提供的数组。
      */
     sendv_awaiter sendv(const struct iovec* iov, int iovcnt) { return sendv_awaiter(*this, iov, iovcnt); }
-    // ---- 全量发送 Awaiter 代码复用基类 (多次 epoll 等待直到完成/错误) ----
-    template <typename Derived> struct send_full_base : io_waiter_base {
-        tcp_socket& sock;
-        size_t      sent { 0 }; // 已发送字节
-        ssize_t     err { 0 };  // <0 表示错误（第一次出错时记录）
-        bool        have_lock { false };
-        send_full_base(tcp_socket& s) : sock(s) { }
-        enum class step { progress, would_block, done }; // progress=继续循环, would_block=需等待, done=完成或错误
-        bool drain()
+    // ---- 全量发送 Awaiter 基类 (多次等待直至完成或错误) ----
+    template <typename Derived> struct send_full_base : two_phase_drain_awaiter<Derived, tcp_socket> {
+        size_t  sent { 0 };
+        ssize_t err { 0 }; // <0 记录错误
+        send_full_base(tcp_socket& s) : two_phase_drain_awaiter<Derived, tcp_socket>(s, s._send_q) { }
+        // attempt_once: >0 有进展继续；0 完成；-1 需等待
+        ssize_t     finish_result() const noexcept { return (err < 0 && sent == 0) ? err : (ssize_t)sent; }
+        static void arm(send_full_base* self, bool /*first*/)
         {
-            while (true) {
-                auto st = static_cast<Derived*>(this)->attempt();
-                if (st == step::progress)
-                    continue;
-                if (st == step::would_block)
-                    return false;
-                return true; // done
-            }
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }
-        static void lock_acquired_cb(worknode* w)
-        {
-            auto* self      = static_cast<Derived*>(w);
-            self->have_lock = true;
-            // 开始真正的发送逻辑
-            if (!self->drain()) {
-                self->func = &Derived::drive_cb;
-                self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLOUT, self);
-                return;
-            }
-            // 已完成，直接 resume
-            self->sock.release_send_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
-        }
-        static void drive_cb(worknode* w)
-        {
-            auto* self = static_cast<Derived*>(w);
-            if (!self->drain()) {
-                self->sock._reactor->add_waiter(self->sock._fd, EPOLLOUT, self);
-                self->func = &Derived::drive_cb;
-                return;
-            }
-            self->sock.release_send_slot();
-            self->func = &io_waiter_base::resume_cb;
-            if (self->h)
-                self->h.resume();
-        }
-        bool await_ready() noexcept
-        {
-            return false; // 始终通过锁路径
-        }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h = h;
-            INIT_LIST_HEAD(&this->ws_node);
-            this->func = &Derived::lock_acquired_cb;
-            {
-                std::scoped_lock lk(sock._io_serial_lock);
-                if (!sock._send_locked && list_empty(&sock._send_waiters)) {
-                    sock._send_locked = true;
-                    sock._exec.post(*this);
-                    return;
-                }
-                list_add_tail(&this->ws_node, &sock._send_waiters);
-            }
-        }
-        ssize_t finish_result() const noexcept { return (err < 0 && sent == 0) ? err : (ssize_t)sent; }
     };
     /**
      * @brief 单缓冲区全量发送 awaiter (内部自动多次等待直到完成/错误)。
@@ -442,27 +411,28 @@ public:
             : send_full_base<send_all_awaiter>(s), buf(static_cast<const char*>(b)), len(l)
         {
         }
-        using step = typename send_full_base<send_all_awaiter>::step;
-        step attempt()
+        int attempt_once()
         {
             if (this->sent >= len)
-                return step::done;
-            ssize_t n = ::send(this->sock._fd, buf + this->sent, len - this->sent, MSG_DONTWAIT | MSG_NOSIGNAL);
+                return 0;
+            ssize_t n = ::send(this->owner.native_handle(),
+                               buf + this->sent,
+                               len - this->sent,
+                               MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n > 0) {
                 this->sent += (size_t)n;
-                return this->sent == len ? step::done : step::progress;
+                return this->sent == len ? 0 : 1;
             }
             if (n == 0)
-                return step::done; // 对端关闭
+                return 0; // treat as done
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return step::would_block;
+                return -1;
             if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
-                this->sock._tx_shutdown = true;
+                this->owner.mark_tx_shutdown();
             this->err = n;
-            return step::done;
+            return 0;
         }
-        ssize_t     await_resume() noexcept { return this->finish_result(); }
-        static void drive_cb(worknode* w) { send_full_base<send_all_awaiter>::drive_cb(w); }
+        ssize_t await_resume() noexcept { return this->finish_result(); }
     };
     send_all_awaiter send_all(const void* buf, size_t len) { return send_all_awaiter(*this, buf, len); }
     /**
@@ -486,12 +456,11 @@ public:
                 total += iov[i].iov_len;
             }
         }
-        using step = typename send_full_base<sendv_all_awaiter>::step;
-        step attempt()
+        int attempt_once()
         {
             if (vec.empty())
-                return step::done;
-            ssize_t n = ::writev(this->sock._fd, vec.data(), (int)vec.size());
+                return 0;
+            ssize_t n = ::writev(this->owner.native_handle(), vec.data(), (int)vec.size());
             if (n > 0) {
                 this->sent += (size_t)n;
                 size_t remain = (size_t)n;
@@ -505,57 +474,22 @@ public:
                         remain = 0;
                     }
                 }
-                return vec.empty() ? step::done : step::progress;
+                return vec.empty() ? 0 : 1;
             }
             if (n == 0)
-                return step::done;
+                return 0;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return step::would_block;
+                return -1;
             if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
-                this->sock._tx_shutdown = true;
+                this->owner.mark_tx_shutdown();
             this->err = n;
-            return step::done;
+            return 0;
         }
-        ssize_t     await_resume() noexcept { return this->finish_result(); }
-        static void drive_cb(worknode* w) { send_full_base<sendv_all_awaiter>::drive_cb(w); }
+        ssize_t await_resume() noexcept { return this->finish_result(); }
     };
     sendv_all_awaiter send_all(const struct iovec* iov, int iovcnt) { return sendv_all_awaiter(*this, iov, iovcnt); }
 
-    // 内部串行发送队列：send_all / sendv_all 默认使用
-    void release_send_slot()
-    {
-        worknode* next = nullptr;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            if (!list_empty(&_send_waiters)) {
-                auto* lh = _send_waiters.next;
-                auto* aw = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                next = aw;
-            } else {
-                _send_locked = false;
-            }
-        }
-        if (next)
-            _exec.post(*next);
-    }
-    void release_recv_slot()
-    {
-        worknode* next = nullptr;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            if (!list_empty(&_recv_waiters)) {
-                auto* lh = _recv_waiters.next;
-                auto* aw = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                next = aw;
-            } else {
-                _recv_locked = false;
-            }
-        }
-        if (next)
-            _exec.post(*next);
-    }
+    // release_* handled via serial_slot_awaiter
 
 private:
     friend class fd_workqueue<lock, Reactor>;
@@ -566,15 +500,15 @@ private:
             throw std::runtime_error("socket failed");
         set_non_block();
         _reactor->add_fd(_fd);
-        INIT_LIST_HEAD(&_send_waiters);
-        INIT_LIST_HEAD(&_recv_waiters);
+        serial_queue_init(_send_q);
+        serial_queue_init(_recv_q);
     }
     tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor), _fd(fd)
     {
         set_non_block();
         _reactor->add_fd(_fd);
-        INIT_LIST_HEAD(&_send_waiters);
-        INIT_LIST_HEAD(&_recv_waiters);
+        serial_queue_init(_send_q);
+        serial_queue_init(_recv_q);
     }
     void set_non_block()
     {
@@ -588,11 +522,9 @@ private:
     bool             _rx_eof { false };
     bool             _tx_shutdown { false };
     // IO 串行锁与等待队列（发送 / 接收分别串行）
-    lock      _io_serial_lock;
-    list_head _send_waiters;
-    bool      _send_locked { false };
-    list_head _recv_waiters;
-    bool      _recv_locked { false };
+    lock         _io_serial_lock;
+    serial_queue _send_q;
+    serial_queue _recv_q;
 };
 
 // wrappers
@@ -629,6 +561,15 @@ inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_recv_some(tcp_socket<loc
 {
     ssize_t n = co_await s.recv(buf, len);
     co_return n;
+}
+template <lockable lock>
+/**
+ * @brief 读取直到缓冲区填满 / EOF / 错误。
+ * @return ==len 成功填满；0..len-1 提前结束(EOF/错误)；<0 初次调用即错误。
+ */
+inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_recv_all(tcp_socket<lock>& s, void* buf, size_t len)
+{
+    co_return co_await s.recv_all(buf, len);
 }
 
 } // namespace co_wq::net
