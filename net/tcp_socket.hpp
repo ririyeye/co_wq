@@ -1,6 +1,9 @@
 // tcp_socket.hpp - TCP socket coroutine primitives
 #pragma once
 #ifdef __linux__
+#include "epoll_reactor.hpp" // default Reactor
+#include "io_waiter.hpp"
+#include "worker.hpp"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,15 +13,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "epoll_reactor.hpp"
-#include "io_waiter.hpp"
-#include "worker.hpp"
-
 namespace co_wq::net {
 
-template <lockable lock> class fd_workqueue; // fwd
+// Forward decl for fd_workqueue with reactor parameter
+template <lockable lock, template <class> class Reactor> class fd_workqueue;
 
-template <lockable lock> class tcp_socket {
+// tcp_socket now parameterized by Reactor backend (must provide static instance(exec) returning reactor with
+// add_fd/remove_fd/add_waiter)
+template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_socket {
 public:
     tcp_socket()                             = delete;
     tcp_socket(const tcp_socket&)            = delete;
@@ -47,7 +49,8 @@ public:
     void close()
     {
         if (_fd >= 0) {
-            epoll_reactor<lock>::instance(_exec).remove_fd(_fd);
+            if (_reactor)
+                _reactor->remove_fd(_fd);
             ::close(_fd);
             _fd = -1;
         }
@@ -92,7 +95,7 @@ public:
                 sock._exec.post(*this);
                 return;
             }
-            epoll_reactor<lock>::instance(sock._exec).add_waiter(sock._fd, EPOLLOUT, this);
+            sock._reactor->add_waiter(sock._fd, EPOLLOUT, this);
         }
         int await_resume() noexcept
         {
@@ -128,7 +131,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
-            epoll_reactor<lock>::instance(sock._exec).add_waiter(sock._fd, EPOLLIN, this);
+            sock._reactor->add_waiter(sock._fd, EPOLLIN, this);
         }
         ssize_t await_resume() noexcept
         {
@@ -167,7 +170,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
-            epoll_reactor<lock>::instance(sock._exec).add_waiter(sock._fd, EPOLLOUT, this);
+            sock._reactor->add_waiter(sock._fd, EPOLLOUT, this);
         }
         ssize_t await_resume() noexcept
         {
@@ -191,19 +194,19 @@ public:
     send_awaiter send(const void* buf, size_t len) { return send_awaiter(*this, buf, len); }
 
 private:
-    friend class fd_workqueue<lock>;
-    explicit tcp_socket(workqueue<lock>& exec) : _exec(exec)
+    friend class fd_workqueue<lock, Reactor>;
+    explicit tcp_socket(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor)
     {
         _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (_fd < 0)
             throw std::runtime_error("socket failed");
         set_non_block();
-        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+        _reactor->add_fd(_fd);
     }
-    tcp_socket(int fd, workqueue<lock>& exec) : _exec(exec), _fd(fd)
+    tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor), _fd(fd)
     {
         set_non_block();
-        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+        _reactor->add_fd(_fd);
     }
     void set_non_block()
     {
@@ -212,6 +215,7 @@ private:
             ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
     }
     workqueue<lock>& _exec;
+    Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
     bool             _rx_eof { false };
     bool             _tx_shutdown { false };

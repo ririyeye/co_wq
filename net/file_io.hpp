@@ -1,7 +1,7 @@
 // file_io.hpp - async file read/write using epoll (O_NONBLOCK) + coroutine
 #pragma once
 #ifdef __linux__
-#include "epoll_reactor.hpp"
+#include "epoll_reactor.hpp" // default reactor
 #include "io_waiter.hpp"
 #include <errno.h>
 #include <fcntl.h>
@@ -10,9 +10,9 @@
 
 namespace co_wq::net {
 
-template <lockable lock> class fd_workqueue; // fwd
+template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
-template <lockable lock> class file_handle {
+template <lockable lock, template <class> class Reactor = epoll_reactor> class file_handle {
 public:
     file_handle()                              = delete;
     file_handle(const file_handle&)            = delete;
@@ -33,7 +33,7 @@ public:
     void close()
     {
         if (_fd >= 0) {
-            epoll_reactor<lock>::instance(_exec).remove_fd(_fd);
+            Reactor<lock>::instance(_exec).remove_fd(_fd);
             ::close(_fd);
             _fd = -1;
         }
@@ -65,7 +65,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
-            epoll_reactor<lock>::instance(fh._exec).add_waiter(fh._fd, EPOLLIN, this);
+            Reactor<lock>::instance(fh._exec).add_waiter(fh._fd, EPOLLIN, this);
         }
         ssize_t await_resume() noexcept
         {
@@ -106,7 +106,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
-            epoll_reactor<lock>::instance(fh._exec).add_waiter(fh._fd, EPOLLOUT, this);
+            Reactor<lock>::instance(fh._exec).add_waiter(fh._fd, EPOLLOUT, this);
         }
         ssize_t await_resume() noexcept
         {
@@ -141,7 +141,7 @@ public:
     write_awaiter pwrite(const void* buf, size_t len, off_t& ofs) { return write_awaiter(*this, buf, len, ofs); }
 
 private:
-    friend class fd_workqueue<lock>;
+    friend class fd_workqueue<lock, Reactor>;
     file_handle(workqueue<lock>& e, int fd) : _exec(e), _fd(fd)
     {
         if (_fd < 0)
@@ -149,15 +149,16 @@ private:
         int flags = ::fcntl(_fd, F_GETFL, 0);
         if (flags >= 0)
             ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
-        epoll_reactor<lock>::instance(_exec).add_fd(_fd);
+        Reactor<lock>::instance(_exec).add_fd(_fd);
     }
     workqueue<lock>& _exec;
     int              _fd { -1 };
 };
 
-template <lockable lock> inline file_handle<lock> adopt_file(workqueue<lock>& exec, int fd)
+template <lockable lock, template <class> class Reactor = epoll_reactor>
+inline file_handle<lock, Reactor> adopt_file(workqueue<lock>& exec, int fd)
 {
-    return file_handle<lock>(exec, fd);
+    return file_handle<lock, Reactor>(exec, fd);
 }
 
 } // namespace co_wq::net

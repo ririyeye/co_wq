@@ -1,6 +1,8 @@
 // epoll_reactor.hpp - epoll based reactor managing fd waiters
 #pragma once
 #ifdef __linux__
+#include "io_waiter.hpp"
+#include "workqueue.hpp"
 #include <algorithm>
 #include <atomic>
 #include <errno.h>
@@ -10,9 +12,6 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
-
-#include "io_waiter.hpp"
-#include "workqueue.hpp"
 
 namespace co_wq::net {
 
@@ -26,6 +25,8 @@ public:
         _running.store(true, std::memory_order_relaxed);
         _thr = std::thread([this] { this->run_loop(); });
     }
+    epoll_reactor(const epoll_reactor&)            = delete;
+    epoll_reactor& operator=(const epoll_reactor&) = delete;
     ~epoll_reactor()
     {
         _running.store(false, std::memory_order_relaxed);
@@ -39,13 +40,13 @@ public:
     }
     void add_fd(int fd)
     {
-        std::scoped_lock lk(_mtx);
+        std::scoped_lock<lock> lk(_lk);
         if (_fds.find(fd) == _fds.end())
             _fds.emplace(fd, fd_state {});
     }
     void add_waiter(int fd, uint32_t evmask, io_waiter_base* waiter)
     {
-        std::scoped_lock lk(_mtx);
+        std::scoped_lock<lock> lk(_lk);
         waiter->func = &io_waiter_base::resume_cb;
         INIT_LIST_HEAD(&waiter->ws_node);
         auto& st = _fds[fd];
@@ -56,8 +57,8 @@ public:
     {
         std::vector<waiter_item> to_resume;
         {
-            std::scoped_lock lk(_mtx);
-            auto             it = _fds.find(fd);
+            std::scoped_lock<lock> lk(_lk);
+            auto                   it = _fds.find(fd);
             if (it != _fds.end()) {
                 to_resume.swap(it->second.waiters);
                 _fds.erase(it);
@@ -65,19 +66,8 @@ public:
         }
         ::epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
         for (auto& wi : to_resume) {
-            _exec.post(*wi.waiter);
+            _exec.post(*wi.waiter); // 把 waiter 投递回主 workqueue
         }
-    }
-    static epoll_reactor& instance(workqueue<lock>& exec)
-    {
-        static epoll_reactor* inst = nullptr;
-        static std::mutex     imtx;
-        if (!inst) {
-            std::scoped_lock lk(imtx);
-            if (!inst)
-                inst = new epoll_reactor(exec);
-        }
-        return *inst;
     }
 
 private:
@@ -127,8 +117,8 @@ private:
                 uint32_t                 flags = evs[i].events;
                 std::vector<waiter_item> to_resume;
                 {
-                    std::scoped_lock lk(_mtx);
-                    auto             it = _fds.find(fd);
+                    std::scoped_lock<lock> lk(_lk);
+                    auto                   it = _fds.find(fd);
                     if (it != _fds.end()) {
                         auto& st      = it->second;
                         auto& vec     = st.waiters;
@@ -150,16 +140,13 @@ private:
     }
     int                               _epfd { -1 };
     std::atomic_bool                  _running { false };
-    std::thread                       _thr;
-    workqueue<lock>&                  _exec;
-    std::mutex                        _mtx;
+    std::thread                       _thr;  // 绑定的 IO 线程
+    workqueue<lock>&                  _exec; // 主 workqueue，用于恢复协程
+    lock                              _lk;   // 使用模板锁代替 std::mutex
     std::unordered_map<int, fd_state> _fds;
 };
 
-template <lockable lock> inline void init_reactor(workqueue<lock>& exec)
-{
-    (void)epoll_reactor<lock>::instance(exec);
-}
+// 不再需要全局 singleton 的 init_reactor
 
 } // namespace co_wq::net
 #endif

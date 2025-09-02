@@ -1,5 +1,6 @@
 set_project(co_wq)
 add_rules("plugin.compile_commands.autoupdate")
+add_rules("mode.release", "mode.debug", "mode.releasedbg", "mode.minsizerel")
 set_languages("c++20")
 set_warnings("all", "extra", "pedantic")
 
