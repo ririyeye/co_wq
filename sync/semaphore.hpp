@@ -65,8 +65,9 @@ private:
     }
 
 public:
-    explicit Semaphore(workqueue<lock>& executor, int init_val, int max_val)
-        : _executor(executor), _cur_val(init_val), _max_val(max_val)
+    // Parameter name adjusted to avoid potential name hiding warnings (C4459)
+    explicit Semaphore(workqueue<lock>& exec, int init_val, int max_val)
+        : _executor(exec), _cur_val(init_val), _max_val(max_val)
     {
         INIT_LIST_HEAD(&ws_node);
         INIT_LIST_HEAD(&acquire_list);

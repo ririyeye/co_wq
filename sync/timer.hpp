@@ -112,7 +112,8 @@ private:
     }
 
 public:
-    explicit Timer_check_queue(workqueue<lock>& executor) : _executor(executor)
+    // Renamed parameter from 'executor' to 'exec' to avoid hiding any global symbol named 'executor'
+    explicit Timer_check_queue(workqueue<lock>& exec) : _executor(exec)
     {
         INIT_LIST_HEAD(&ws_node);
         heap_root = nullptr;

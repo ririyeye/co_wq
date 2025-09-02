@@ -198,11 +198,12 @@ inline file_handle<lock, Reactor> make_file_handle(workqueue<lock>& exec, Reacto
 
 } // namespace co_wq::net
 #elif defined(_WIN32)
-#include "iocp_reactor.hpp"
 #include "io_waiter.hpp"
-#include <windows.h>
-#include <stdexcept>
+#include "iocp_reactor.hpp"
 #include <basetsd.h>
+#include <stdexcept>
+#include <windows.h>
+
 #ifndef _SSIZE_T_DEFINED
 using ssize_t = SSIZE_T;
 #define _SSIZE_T_DEFINED
@@ -214,23 +215,129 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
 
 template <lockable lock, template <class> class Reactor = epoll_reactor> class file_handle {
 public:
-    file_handle() = delete; file_handle(const file_handle&) = delete; file_handle& operator=(const file_handle&) = delete;
-    file_handle(file_handle&& o) noexcept : _exec(o._exec), _reactor(o._reactor), _h(o._h) { o._h=INVALID_HANDLE_VALUE; }
-    file_handle& operator=(file_handle&& o) noexcept { if(this!=&o){ close(); _exec=o._exec; _reactor=o._reactor; _h=o._h; o._h=INVALID_HANDLE_VALUE;} return *this; }
-    ~file_handle(){ close(); }
-    void close(){ if(_h!=INVALID_HANDLE_VALUE){ _reactor->remove_fd((int)(intptr_t)_h); ::CloseHandle(_h); _h=INVALID_HANDLE_VALUE; }}
-    bool closed() const { return _h==INVALID_HANDLE_VALUE; }
-    int  native_handle() const { return (int)(intptr_t)_h; }
-    workqueue<lock>& exec(){ return _exec; }
-    Reactor<lock>* reactor(){ return _reactor; }
-    struct read_awaiter : io_waiter_base { file_handle& fh; void* buf; size_t len; ssize_t nrd{-1}; iocp_ovl ovl; read_awaiter(file_handle& f, void* b,size_t l):fh(f),buf(b),len(l){ ZeroMemory(&ovl,sizeof(ovl)); ovl.waiter=this;} bool await_ready() const noexcept { return false; } void await_suspend(std::coroutine_handle<> h){ this->h=h; this->func=&io_waiter_base::resume_cb; INIT_LIST_HEAD(&this->ws_node); DWORD tr=0; BOOL ok=ReadFile(fh._h,buf,(DWORD)len,&tr,&ovl); if(ok){ nrd=(ssize_t)tr; fh._reactor->post_completion(this); return;} if(GetLastError()!=ERROR_IO_PENDING){ nrd=-1; fh._reactor->post_completion(this);} } ssize_t await_resume() noexcept { if(nrd==-1){ DWORD tr=0; if(GetOverlappedResult(fh._h,&ovl,&tr,FALSE)) nrd=(ssize_t)tr; } return nrd; } };
-    read_awaiter read(void* buf,size_t len){ return read_awaiter(*this,buf,len); }
-    struct write_awaiter : io_waiter_base { file_handle& fh; const void* buf; size_t len; ssize_t nwr{-1}; iocp_ovl ovl; write_awaiter(file_handle& f,const void* b,size_t l):fh(f),buf(b),len(l){ ZeroMemory(&ovl,sizeof(ovl)); ovl.waiter=this;} bool await_ready() const noexcept { return false; } void await_suspend(std::coroutine_handle<> h){ this->h=h; this->func=&io_waiter_base::resume_cb; INIT_LIST_HEAD(&this->ws_node); DWORD tr=0; BOOL ok=WriteFile(fh._h,buf,(DWORD)len,&tr,&ovl); if(ok){ nwr=(ssize_t)tr; fh._reactor->post_completion(this); return;} if(GetLastError()!=ERROR_IO_PENDING){ nwr=-1; fh._reactor->post_completion(this);} } ssize_t await_resume() noexcept { if(nwr==-1){ DWORD tr=0; if(GetOverlappedResult(fh._h,&ovl,&tr,FALSE)) nwr=(ssize_t)tr; } return nwr; } };
-    write_awaiter write(const void* buf,size_t len){ return write_awaiter(*this,buf,len); }
+    file_handle()                              = delete;
+    file_handle(const file_handle&)            = delete;
+    file_handle& operator=(const file_handle&) = delete;
+    file_handle(file_handle&& o) noexcept : _exec(o._exec), _reactor(o._reactor), _h(o._h)
+    {
+        o._h = INVALID_HANDLE_VALUE;
+    }
+    file_handle& operator=(file_handle&& o) noexcept
+    {
+        if (this != &o) {
+            close();
+            _exec    = o._exec;
+            _reactor = o._reactor;
+            _h       = o._h;
+            o._h     = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+    ~file_handle() { close(); }
+    void close()
+    {
+        if (_h != INVALID_HANDLE_VALUE) {
+            _reactor->remove_fd((int)(intptr_t)_h);
+            ::CloseHandle(_h);
+            _h = INVALID_HANDLE_VALUE;
+        }
+    }
+    bool             closed() const { return _h == INVALID_HANDLE_VALUE; }
+    int              native_handle() const { return (int)(intptr_t)_h; }
+    workqueue<lock>& exec() { return _exec; }
+    Reactor<lock>*   reactor() { return _reactor; }
+    struct read_awaiter : io_waiter_base {
+        file_handle& fh;
+        void*        buf;
+        size_t       len;
+        ssize_t      nrd { -1 };
+        iocp_ovl     ovl;
+        read_awaiter(file_handle& f, void* b, size_t l) : fh(f), buf(b), len(l)
+        {
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter = this;
+        }
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> coro)
+        {
+            this->h    = coro;
+            this->func = &io_waiter_base::resume_cb;
+            INIT_LIST_HEAD(&this->ws_node);
+            DWORD tr = 0;
+            BOOL  ok = ReadFile(fh._h, buf, (DWORD)len, &tr, &ovl);
+            if (ok) {
+                nrd = (ssize_t)tr;
+                fh._reactor->post_completion(this);
+                return;
+            }
+            if (GetLastError() != ERROR_IO_PENDING) {
+                nrd = -1;
+                fh._reactor->post_completion(this);
+            }
+        }
+        ssize_t await_resume() noexcept
+        {
+            if (nrd == -1) {
+                DWORD tr = 0;
+                if (GetOverlappedResult(fh._h, &ovl, &tr, FALSE))
+                    nrd = (ssize_t)tr;
+            }
+            return nrd;
+        }
+    };
+    read_awaiter read(void* buf, size_t len) { return read_awaiter(*this, buf, len); }
+    struct write_awaiter : io_waiter_base {
+        file_handle& fh;
+        const void*  buf;
+        size_t       len;
+        ssize_t      nwr { -1 };
+        iocp_ovl     ovl;
+        write_awaiter(file_handle& f, const void* b, size_t l) : fh(f), buf(b), len(l)
+        {
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter = this;
+        }
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> coro)
+        {
+            this->h    = coro;
+            this->func = &io_waiter_base::resume_cb;
+            INIT_LIST_HEAD(&this->ws_node);
+            DWORD tr = 0;
+            BOOL  ok = WriteFile(fh._h, buf, (DWORD)len, &tr, &ovl);
+            if (ok) {
+                nwr = (ssize_t)tr;
+                fh._reactor->post_completion(this);
+                return;
+            }
+            if (GetLastError() != ERROR_IO_PENDING) {
+                nwr = -1;
+                fh._reactor->post_completion(this);
+            }
+        }
+        ssize_t await_resume() noexcept
+        {
+            if (nwr == -1) {
+                DWORD tr = 0;
+                if (GetOverlappedResult(fh._h, &ovl, &tr, FALSE))
+                    nwr = (ssize_t)tr;
+            }
+            return nwr;
+        }
+    };
+    write_awaiter write(const void* buf, size_t len) { return write_awaiter(*this, buf, len); }
+
 private:
     friend class fd_workqueue<lock, Reactor>;
-    file_handle(workqueue<lock>& e, Reactor<lock>& r, HANDLE h):_exec(e),_reactor(&r),_h(h){ if(h==INVALID_HANDLE_VALUE) throw std::runtime_error("invalid file handle"); _reactor->add_fd((int)(intptr_t)_h); }
-    workqueue<lock>& _exec; Reactor<lock>* _reactor{nullptr}; HANDLE _h{INVALID_HANDLE_VALUE};
+    file_handle(workqueue<lock>& e, Reactor<lock>& r, HANDLE handle) : _exec(e), _reactor(&r), _h(handle)
+    {
+        if (handle == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("invalid file handle");
+        _reactor->add_fd((int)(intptr_t)_h);
+    }
+    workqueue<lock>& _exec;
+    Reactor<lock>*   _reactor { nullptr };
+    HANDLE           _h { INVALID_HANDLE_VALUE };
 };
 
 } // namespace co_wq::net

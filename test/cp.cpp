@@ -1,38 +1,35 @@
-#include "syswork.hpp"
-#include "file_io.hpp"
 #include "fd_base.hpp"
+#include "file_io.hpp"
+#include "file_open.hpp"
+#include "syswork.hpp"
 #include <atomic>
 #include <cstring>
 #include <iostream>
-#include <vector>
 #include <sys/stat.h>
+#include <vector>
+
 
 using namespace co_wq;
 
 #ifdef USING_NET
 // 简单文件复制协程：使用 file_handle read/write awaiter 串行非阻塞复制
-static Task<size_t, Work_Promise<SpinLock, size_t>> file_copy_task(net::fd_workqueue<SpinLock>& fdwq, const char* src, const char* dst)
+static Task<size_t, Work_Promise<SpinLock, size_t>>
+file_copy_task(net::fd_workqueue<SpinLock>& fdwq, const char* src, const char* dst)
 {
-    // 打开源/目标文件 (源 O_RDONLY, 目标 O_WRONLY|O_CREAT|O_TRUNC)
-    int sfd = ::open(src, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    if (sfd < 0) {
-        co_return (size_t)0;
+    auto s_opt = net::open_file_handle(fdwq, src, net::open_mode::read_only);
+    if (!s_opt.has_value()) {
+        co_return (size_t) 0;
     }
-    int dfd = ::open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NONBLOCK, 0644);
-    if (dfd < 0) {
-        ::close(sfd);
-        co_return (size_t)0;
+    auto d_opt = net::open_file_handle(fdwq, dst, net::open_mode::write_trunc);
+    if (!d_opt.has_value()) {
+        co_return (size_t) 0;
     }
-    // 将 fd 注册到 reactor 并采用 file_handle（不可直接调用私有构造函数，使用辅助 adopt 方法）
-    auto& reactor = fdwq.reactor();
-    reactor.add_fd(sfd);
-    reactor.add_fd(dfd);
-    auto sf = fdwq.make_file(sfd);
-    auto df = fdwq.make_file(dfd);
+    auto sf = std::move(*s_opt);
+    auto df = std::move(*d_opt);
 
-    constexpr size_t BUF_SZ = 64 * 1024;
+    constexpr size_t  BUF_SZ = 64 * 1024;
     std::vector<char> buf(BUF_SZ);
-    size_t total = 0;
+    size_t            total = 0;
     for (;;) {
         ssize_t n = co_await sf.read(buf.data(), BUF_SZ);
         if (n <= 0) {
@@ -63,20 +60,20 @@ int main(int argc, char** argv)
         std::cout << "usage: co_cp <src> <dst>\n";
         return 0;
     }
-    auto& wq = get_sys_workqueue();
+    auto&                       wq = get_sys_workqueue();
     net::fd_workqueue<SpinLock> fdwq(wq);
-    auto tk = file_copy_task(fdwq, argv[1], argv[2]);
-    auto coro = tk.get();
-    auto& promise = coro.promise();
-    std::atomic_bool finished{false};
-    promise.mUserData = &finished;
-    promise.mOnCompleted = [](Promise_base& pb){
+    auto                        tk      = file_copy_task(fdwq, argv[1], argv[2]);
+    auto                        coro    = tk.get();
+    auto&                       promise = coro.promise();
+    std::atomic_bool            finished { false };
+    promise.mUserData    = &finished;
+    promise.mOnCompleted = [](Promise_base& pb) {
         auto* f = static_cast<std::atomic_bool*>(pb.mUserData);
         f->store(true, std::memory_order_release);
     };
     post_to(tk, wq);
-    while(!finished.load(std::memory_order_acquire)) {
-        while (wq.work_once()) {}
+    while (!finished.load(std::memory_order_acquire)) {
+        while (wq.work_once()) { }
     }
     size_t copied = coro.promise().result();
     std::cout << "copied bytes: " << copied << "\n";

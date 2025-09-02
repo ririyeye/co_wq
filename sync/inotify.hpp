@@ -67,7 +67,8 @@ private:
     }
 
 public:
-    explicit Notify(workqueue<lock>& executor) : _executor(executor)
+    // Parameter name adjusted to avoid potential name hiding warnings (C4459)
+    explicit Notify(workqueue<lock>& exec) : _executor(exec)
     {
         INIT_LIST_HEAD(&ws_node);
         INIT_LIST_HEAD(&acquire_list);
