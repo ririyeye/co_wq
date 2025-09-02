@@ -78,6 +78,7 @@ public:
     Reactor<lock>&             reactor() { return _reactor; }
     tcp_socket<lock, Reactor>  make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
     tcp_socket<lock, Reactor>  adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
+    udp_socket<lock, Reactor>  make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
     file_handle<lock, Reactor> make_file(HANDLE h) { return file_handle<lock, Reactor>(_base, _reactor, h); }
 
 private:

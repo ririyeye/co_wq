@@ -85,9 +85,10 @@ public:
         int         ret { 0 };
         connect_awaiter(udp_socket& s, std::string h, uint16_t p) : us(s), host(std::move(h)), port(p) { }
         bool await_ready() const noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h)
+        // 注意: 参数名避免与基类 io_waiter_base::h 成员同名引发 MSVC C4458 警告
+        void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h = h;
+            this->h = coro;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_in addr {};
             addr.sin_family = AF_INET;
