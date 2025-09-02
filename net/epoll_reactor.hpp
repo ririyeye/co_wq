@@ -66,12 +66,14 @@ public:
      */
     void add_waiter(int fd, uint32_t evmask, io_waiter_base* waiter)
     {
-        std::scoped_lock<lock> lk(_lk);
-        waiter->func = &io_waiter_base::resume_cb;
-        INIT_LIST_HEAD(&waiter->ws_node);
-        auto& st = _fds[fd];
-        st.waiters.push_back({ evmask, waiter });
-        update_fd_interest_unlocked(fd, st);
+        register_waiter(fd, evmask, waiter, /*preserve_func=*/false);
+    }
+    /**
+     * @brief 自定义回调版本：不强制重置 waiter->func，允许调用者提前设置 (例如内部多次驱动状态机)。
+     */
+    void add_waiter_custom(int fd, uint32_t evmask, io_waiter_base* waiter)
+    {
+        register_waiter(fd, evmask, waiter, /*preserve_func=*/true);
     }
     /**
      * @brief 移除 fd，并唤醒所有挂起 waiter（以便协程得到取消/错误处理机会）。
@@ -102,6 +104,16 @@ private:
         std::vector<waiter_item> waiters;
         uint32_t                 interest { 0 };
     };
+    void register_waiter(int fd, uint32_t evmask, io_waiter_base* waiter, bool preserve_func)
+    {
+        std::scoped_lock<lock> lk(_lk);
+        if (!preserve_func)
+            waiter->func = &io_waiter_base::resume_cb;
+        INIT_LIST_HEAD(&waiter->ws_node);
+        auto& st = _fds[fd];
+        st.waiters.push_back({ evmask, waiter });
+        update_fd_interest_unlocked(fd, st);
+    }
     /**
      * @brief 重新计算 fd 的事件关注并更新 epoll，若 mask 为 0 则 DEL。
      * @note 调用者需已持锁。

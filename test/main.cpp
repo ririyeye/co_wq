@@ -5,10 +5,8 @@
 #include "file_io.hpp"
 #include "tcp_socket.hpp"
 #include <atomic>
-#include <chrono>
 #include <cstring>
 #include <iostream>
-#include <thread>
 
 using namespace co_wq;
 
@@ -64,7 +62,6 @@ int main()
         while (wq.work_once()) {
             // drain queue fully each tick
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 #endif
     return 0;

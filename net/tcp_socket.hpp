@@ -340,67 +340,134 @@ public:
      * @note 内部复制一份 iovec 以便原位调整指针与长度，不修改调用者提供的数组。
      */
     sendv_awaiter sendv(const struct iovec* iov, int iovcnt) { return sendv_awaiter(*this, iov, iovcnt); }
-    // Aggregated full-buffer send: keeps awaiting until entire buffer sent or error.
-    Task<ssize_t, Work_Promise<lock, ssize_t>> send_all(const void* buf, size_t len)
-    {
-        size_t sent = 0;
-        while (sent < len) {
-            ssize_t n = co_await send((const char*)buf + sent, len - sent);
-            if (n <= 0) {
-                co_return (sent > 0) ? (ssize_t)sent : n; // propagate error or partial
+    // ---- 全量发送 Awaiter 代码复用基类 (多次 epoll 等待直到完成/错误) ----
+    template <typename Derived> struct send_full_base : io_waiter_base {
+        tcp_socket& sock;
+        size_t      sent { 0 }; // 已发送字节
+        ssize_t     err { 0 };  // <0 表示错误（第一次出错时记录）
+        send_full_base(tcp_socket& s) : sock(s) { }
+        enum class step { progress, would_block, done }; // progress=继续循环, would_block=需等待, done=完成或错误
+        bool drain()
+        {
+            while (true) {
+                auto st = static_cast<Derived*>(this)->attempt();
+                if (st == step::progress)
+                    continue;
+                if (st == step::would_block)
+                    return false;
+                return true; // done
             }
-            sent += (size_t)n;
         }
-        co_return (ssize_t) sent;
-    }
+        static void drive_cb(worknode* w)
+        {
+            auto* self = static_cast<Derived*>(w);
+            if (!self->drain()) {
+                self->sock._reactor->add_waiter(self->sock._fd, EPOLLOUT, self);
+                self->func = &Derived::drive_cb;
+                return;
+            }
+            self->func = &io_waiter_base::resume_cb;
+            if (self->h)
+                self->h.resume();
+        }
+        bool await_ready() noexcept { return drain(); }
+        void await_suspend(std::coroutine_handle<> h)
+        {
+            this->h = h;
+            INIT_LIST_HEAD(&this->ws_node);
+            this->func = &Derived::drive_cb; // 直接使用 custom 版本避免被覆盖
+            sock._reactor->add_waiter_custom(sock._fd, EPOLLOUT, this);
+        }
+        ssize_t finish_result() const noexcept { return (err < 0 && sent == 0) ? err : (ssize_t)sent; }
+    };
+    /**
+     * @brief 单缓冲区全量发送 awaiter (内部自动多次等待直到完成/错误)。
+     */
+    struct send_all_awaiter : send_full_base<send_all_awaiter> {
+        const char* buf;
+        size_t      len;
+        send_all_awaiter(tcp_socket& s, const void* b, size_t l)
+            : send_full_base<send_all_awaiter>(s), buf(static_cast<const char*>(b)), len(l)
+        {
+        }
+        using step = typename send_full_base<send_all_awaiter>::step;
+        step attempt()
+        {
+            if (this->sent >= len)
+                return step::done;
+            ssize_t n = ::send(this->sock._fd, buf + this->sent, len - this->sent, MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (n > 0) {
+                this->sent += (size_t)n;
+                return this->sent == len ? step::done : step::progress;
+            }
+            if (n == 0)
+                return step::done; // 对端关闭
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return step::would_block;
+            if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
+                this->sock._tx_shutdown = true;
+            this->err = n;
+            return step::done;
+        }
+        ssize_t     await_resume() noexcept { return this->finish_result(); }
+        static void drive_cb(worknode* w) { send_full_base<send_all_awaiter>::drive_cb(w); }
+    };
+    send_all_awaiter send_all(const void* buf, size_t len) { return send_all_awaiter(*this, buf, len); }
     /**
      * @brief 聚合发送（保证尽力写完整缓冲区）。
      * @param buf 数据指针。
      * @param len 字节数。
      * @return ==len 成功；>0<len 发生错误/对端关闭前已写部分；<0 错误。
      */
-    // Aggregated vectored full send: send all iov buffers sequentially
-    Task<ssize_t, Work_Promise<lock, ssize_t>> send_all(const struct iovec* iov, int iovcnt)
-    {
-        size_t total = 0;
-        for (int i = 0; i < iovcnt; ++i)
-            total += iov[i].iov_len;
-        size_t sent = 0;
-        // Reuse sendv awaiter repeatedly until all done or error
-        // Each await returns cumulative bytes progressed since start of that awaiter; we return total progress overall.
-        // Simpler: use one sendv awaiter that internally drains; just co_await once.
-        ssize_t n = co_await sendv(iov, iovcnt);
-        if (n < 0)
-            co_return n;
-        sent = (size_t)n;
-        if (sent == total)
-            co_return (ssize_t) sent;
-        // If partial (should only happen on error/EAGAIN cycles), loop until done or error
-        while (sent < total) {
-            // Build adjusted iov pointing into remaining region
-            std::vector<iovec> rem;
-            size_t             skip = sent;
+    /**
+     * @brief 向量聚合发送 awaiter（完整发送 iovec 列表或在错误/对端关闭时提前返回）。
+     * 返回值语义同 send_all：完成 => 总字节；部分 => 已发送；错误且未发送任何数据 => 负错误码。
+     */
+    struct sendv_all_awaiter : send_full_base<sendv_all_awaiter> {
+        std::vector<iovec> vec;
+        size_t             total { 0 };
+        sendv_all_awaiter(tcp_socket& s, const struct iovec* iov, int iovcnt) : send_full_base<sendv_all_awaiter>(s)
+        {
+            vec.reserve((size_t)iovcnt);
             for (int i = 0; i < iovcnt; ++i) {
-                if (skip >= iov[i].iov_len) {
-                    skip -= iov[i].iov_len;
-                    continue;
-                }
-                iovec v { (char*)iov[i].iov_base + skip, iov[i].iov_len - skip };
-                rem.push_back(v);
-                skip = 0;
+                vec.push_back(iov[i]);
+                total += iov[i].iov_len;
             }
-            n = co_await sendv(rem.data(), (int)rem.size());
-            if (n <= 0) {
-                if (n < 0 && sent == 0)
-                    co_return n; // error early
-                if (n > 0)
-                    sent += (size_t)n;
-                break;
-            }
-            sent += (size_t)n;
         }
-        co_return (ssize_t) sent;
-    }
+        using step = typename send_full_base<sendv_all_awaiter>::step;
+        step attempt()
+        {
+            if (vec.empty())
+                return step::done;
+            ssize_t n = ::writev(this->sock._fd, vec.data(), (int)vec.size());
+            if (n > 0) {
+                this->sent += (size_t)n;
+                size_t remain = (size_t)n;
+                while (remain > 0 && !vec.empty()) {
+                    if (remain >= vec.front().iov_len) {
+                        remain -= vec.front().iov_len;
+                        vec.erase(vec.begin());
+                    } else {
+                        vec.front().iov_base = (char*)vec.front().iov_base + remain;
+                        vec.front().iov_len -= remain;
+                        remain = 0;
+                    }
+                }
+                return vec.empty() ? step::done : step::progress;
+            }
+            if (n == 0)
+                return step::done;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return step::would_block;
+            if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)
+                this->sock._tx_shutdown = true;
+            this->err = n;
+            return step::done;
+        }
+        ssize_t     await_resume() noexcept { return this->finish_result(); }
+        static void drive_cb(worknode* w) { send_full_base<sendv_all_awaiter>::drive_cb(w); }
+    };
+    sendv_all_awaiter send_all(const struct iovec* iov, int iovcnt) { return sendv_all_awaiter(*this, iov, iovcnt); }
 
 private:
     friend class fd_workqueue<lock, Reactor>;
@@ -445,7 +512,7 @@ template <lockable lock>
  */
 inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_send_all(tcp_socket<lock>& s, const void* buf, size_t len)
 {
-    co_return co_await s.send_all(buf, len);
+    co_return co_await s.send_all(buf, len); // 使用 awaiter 版本
 }
 template <lockable lock>
 /**
@@ -454,7 +521,7 @@ template <lockable lock>
 inline Task<ssize_t, Work_Promise<lock, ssize_t>>
 async_sendv_all(tcp_socket<lock>& s, const struct iovec* iov, int iovcnt)
 {
-    co_return co_await s.send_all(iov, iovcnt);
+    co_return co_await s.send_all(iov, iovcnt); // 使用向量 awaiter 版本
 }
 template <lockable lock>
 /**

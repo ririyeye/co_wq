@@ -10,13 +10,13 @@ struct executor_wq : co_wq::workqueue<co_wq::SpinLock> {
     // 阻塞版本获取，由用户循环调用
     co_wq::worknode* wait_and_get(struct workqueue& wq)
     {
-        lk.lock();
+        // 注意：此函数由基类 work_once() 在已持有 lk 情况下调用，不能再次加锁，否则死锁。
         for (;;) {
-            co_wq::worknode* n = co_wq::workqueue<co_wq::SpinLock>::get_work_node(wq); // 调用覆写版本
+            co_wq::worknode* n = co_wq::workqueue<co_wq::SpinLock>::get_work_node(wq); // 使用基类非阻塞获取逻辑
             if (n) {
-                lk.unlock();
-                return n;
+                return n; // 解锁由 work_once() 负责
             }
+            // 无任务则阻塞等待新任务到来；wait 内部会临时释放 lk 并在唤醒后重新加锁
             cv.wait(lk);
         }
     }
