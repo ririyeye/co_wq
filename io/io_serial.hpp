@@ -121,9 +121,9 @@ template <class Derived, serial_owner Owner> struct serial_slot_awaiter : io_wai
     bool          have_lock { false }; // optional flag (set by derived when lock acquired)
     serial_slot_awaiter(Owner& o, serial_queue& queue) : owner(o), q(queue) { }
     bool await_ready() noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> h)
+    void await_suspend(std::coroutine_handle<> awaiting)
     {
-        this->h    = h;
+        this->h    = awaiting;
         this->func = &Derived::lock_acquired_cb;
         INIT_LIST_HEAD(&this->ws_node);
         serial_acquire_or_enqueue(q, owner.serial_lock(), owner.exec(), *this);

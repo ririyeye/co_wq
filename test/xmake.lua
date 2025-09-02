@@ -8,12 +8,14 @@ target("co_echo")
 
 target_end()
 
-target("co_cp")
-    set_kind("binary")
-    add_deps("co_wq")
-
-    add_files("syswork.cpp")
-    add_files("cp.cpp")
-target_end()
+-- cp example relies on POSIX file APIs currently (open/close/O_* flags).
+if not is_plat("windows") then
+    target("co_cp")
+        set_kind("binary")
+        add_deps("co_wq")
+        add_files("syswork.cpp")
+        add_files("cp.cpp")
+    target_end()
+end
 
 

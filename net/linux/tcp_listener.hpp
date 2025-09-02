@@ -1,6 +1,6 @@
 // tcp_listener.hpp - TCP 异步 accept
 #pragma once
-#ifdef __linux__
+
 #include "epoll_reactor.hpp" // 默认 reactor
 #include "fd_base.hpp"
 #include "io_waiter.hpp"
@@ -140,4 +140,3 @@ async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor
 }
 
 } // namespace co_wq::net
-#endif

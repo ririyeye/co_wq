@@ -1,6 +1,6 @@
 // tcp_socket.hpp - TCP socket 协程原语
 #pragma once
-#ifdef __linux__
+
 #include "epoll_reactor.hpp" // 默认 Reactor
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
@@ -15,7 +15,6 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <vector>
-
 namespace co_wq::net {
 
 // 前置声明: 带 Reactor 模板参数的 fd_workqueue
@@ -577,4 +576,3 @@ inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_recv_all(tcp_socket<lock
 }
 
 } // namespace co_wq::net
-#endif

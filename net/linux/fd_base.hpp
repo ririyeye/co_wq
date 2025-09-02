@@ -1,6 +1,5 @@
 // fd_base.hpp - generic fd abstraction and factory (fd_workqueue)
 #pragma once
-#ifdef __linux__
 #include "epoll_reactor.hpp" // default reactor
 #include "tcp_socket.hpp"    // for factory methods (now templated)
 #include "udp_socket.hpp"
@@ -8,7 +7,6 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <unistd.h>
-
 namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
@@ -103,4 +101,3 @@ private:
 };
 
 } // namespace co_wq::net
-#endif

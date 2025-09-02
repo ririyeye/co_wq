@@ -1,6 +1,6 @@
 // udp_socket.hpp - UDP socket coroutine primitives
 #pragma once
-#ifdef __linux__
+
 #include "epoll_reactor.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
@@ -258,4 +258,4 @@ async_udp_send_to(udp_socket<lock, Reactor>& s, const void* buf, size_t len, con
 }
 
 } // namespace co_wq::net
-#endif
+
