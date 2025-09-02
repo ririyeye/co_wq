@@ -31,6 +31,20 @@ using ssize_t = SSIZE_T;
 #include <string>
 #include <vector>
 
+// Fallback: 若因包含顺序导致未引入 iocp_reactor.hpp 中的 EPOLL* 定义，则在此兜底定义。
+#ifndef EPOLLIN
+#define EPOLLIN 0x01
+#endif
+#ifndef EPOLLOUT
+#define EPOLLOUT 0x02
+#endif
+#ifndef EPOLLERR
+#define EPOLLERR 0x04
+#endif
+#ifndef EPOLLHUP
+#define EPOLLHUP 0x08
+#endif
+
 // Provide POSIX-like iovec for Windows sendv support if not already defined
 #ifndef IOVEC_DEFINED_CO_WQ
 struct iovec {
@@ -50,7 +64,7 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
  * @tparam Reactor 反应器模板（在 Windows 下实际为 iocp_reactor，默认模板参数与 linux 保持形式统一）
  * @brief TCP 套接字封装，提供协程 await 接口。
  */
-template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_socket {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class tcp_socket {
 public:
     template <class D> using tp_base         = two_phase_drain_awaiter<D, tcp_socket>;
     tcp_socket()                             = delete;
@@ -101,21 +115,21 @@ public:
         }
     }
     /** @return 是否已经执行过发送方向关闭 */
-    bool             tx_shutdown() const noexcept { return _tx_shutdown; }
+    bool tx_shutdown() const noexcept { return _tx_shutdown; }
     /** @return 是否已经读到 EOF（对端关闭或 0 字节读取）*/
-    bool             rx_eof() const noexcept { return _rx_eof; }
+    bool rx_eof() const noexcept { return _rx_eof; }
     /** @return 原始 socket 句柄 */
-    int              native_handle() const { return _fd; }
+    int native_handle() const { return _fd; }
     /** @return 关联的执行队列 */
     workqueue<lock>& exec() { return _exec; }
     /** @return 串行化用互斥锁 */
-    lock&            serial_lock() { return _io_serial_lock; }
+    lock& serial_lock() { return _io_serial_lock; }
     /** @return 关联的 Reactor */
-    Reactor<lock>*   reactor() { return _reactor; }
+    Reactor<lock>* reactor() { return _reactor; }
     /** 标记收到 EOF（内部使用）*/
-    void             mark_rx_eof() { _rx_eof = true; }
+    void mark_rx_eof() { _rx_eof = true; }
     /** 标记发送方向关闭（内部使用）*/
-    void             mark_tx_shutdown() { _tx_shutdown = true; }
+    void mark_tx_shutdown() { _tx_shutdown = true; }
     struct connect_awaiter : io_waiter_base {
         /**
          * @brief 异步连接 awaiter（简化实现：依赖非阻塞 connect + 写事件）

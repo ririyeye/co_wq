@@ -17,7 +17,7 @@ namespace co_wq::net {
 // 统一 accept 语义常量（与 Linux 对齐）
 inline constexpr int k_accept_fatal = -2;
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_listener {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class tcp_listener {
 public:
     explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(reactor)
     {
@@ -66,31 +66,23 @@ public:
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter = this;
         }
-        // Windows 模型: 不尝试 fast path 的 await_ready，统一走 await_suspend。
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> awaiting)
+        // fast path: 在 await_ready 里直接发起 AcceptEx，若立即完成则不挂起。
+        bool await_ready() noexcept
         {
-            this->h    = awaiting;
-            this->func = &io_waiter_base::resume_cb;
+            // 准备异步结构
             INIT_LIST_HEAD(&this->ws_node);
-            issue();
-        }
-        void issue()
-        {
+            if (!lst._acceptex) {
+                newfd = k_accept_fatal;
+                return true;
+            }
             SOCKET as = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (as == INVALID_SOCKET) {
                 newfd = k_accept_fatal;
-                lst._exec.post(*this);
-                return;
+                return true;
             }
             u_long m = 1;
             ioctlsocket(as, FIONBIO, &m);
-            if (!lst._acceptex) {
-                newfd = k_accept_fatal;
-                ::closesocket(as);
-                lst._exec.post(*this);
-                return;
-            }
+            // 发起 AcceptEx
             BOOL ok = lst._acceptex(lst._sock,
                                     as,
                                     buffer,
@@ -99,29 +91,37 @@ public:
                                     sizeof(sockaddr_in) + 16,
                                     &bytes,
                                     &ovl);
-            if (ok) { // immediate completion
-                newfd = (int)as;
-                lst._reactor.post_completion(this);
-                return;
+            if (ok) { // 立即完成 fast path
+                newfd      = (int)as;
+                _accepted  = newfd;
+                update_context(newfd);
+                return true; // 不挂起
             }
             int err = WSAGetLastError();
             if (err != ERROR_IO_PENDING) {
                 ::closesocket(as);
                 newfd = k_accept_fatal;
-                lst._exec.post(*this);
-                return;
+                return true; // 同样不挂起，直接返回错误
             }
-            _accepted = (int)as; // pending, completion via IOCP
+            _accepted = (int)as; // pending, 将在 await_suspend 后由 IOCP 完成
+            return false;        // 挂起等待完成
+        }
+        void await_suspend(std::coroutine_handle<> awaiting)
+        {
+            // 仅在 pending 情况下来到这里
+            this->h    = awaiting;
+            this->func = &io_waiter_base::resume_cb;
+            // ws_node 已在 await_ready 初始化
         }
         int await_resume() noexcept
         {
             if (newfd == k_accept_fatal)
                 return k_accept_fatal;
-            if (newfd == -1) {
-                // completion path: need to get result
+            if (newfd == -1) { // pending 完成路径
                 DWORD transferred = 0;
                 if (GetOverlappedResult((HANDLE)lst._reactor.iocp_handle(), &ovl, &transferred, FALSE)) {
                     newfd = _accepted;
+                    update_context(newfd);
                 } else {
                     newfd = k_accept_fatal;
                 }
@@ -130,7 +130,19 @@ public:
         }
 
     private:
-        int _accepted { -1 };
+        int  _accepted { -1 };
+        bool _context_updated { false };
+        void update_context(int fd)
+        {
+            if (_context_updated || fd < 0)
+                return;
+            setsockopt((SOCKET)fd,
+                       SOL_SOCKET,
+                       SO_UPDATE_ACCEPT_CONTEXT,
+                       (char*)&lst._sock,
+                       sizeof(lst._sock));
+            _context_updated = true;
+        }
     };
     accept_awaiter accept() { return accept_awaiter(*this); }
 
@@ -160,14 +172,14 @@ private:
     LPFN_ACCEPTEX    _acceptex { nullptr };
 };
 
-template <lockable lock, template <class> class Reactor = epoll_reactor>
+template <lockable lock, template <class> class Reactor = iocp_reactor>
 inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock, Reactor>& lst)
 {
     int fd = co_await lst.accept();
     co_return fd;
 }
 
-template <lockable lock, template <class> class Reactor = epoll_reactor>
+template <lockable lock, template <class> class Reactor = iocp_reactor>
 inline Task<tcp_socket<lock, Reactor>, Work_Promise<lock, tcp_socket<lock, Reactor>>>
 async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor>& lst)
 {
