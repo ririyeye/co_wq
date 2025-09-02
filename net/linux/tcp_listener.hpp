@@ -16,6 +16,9 @@
 
 namespace co_wq::net {
 
+// 统一 accept 语义常量：致命错误返回值（跨平台一致）。
+inline constexpr int k_accept_fatal = -2; // fatal error permanent for this try
+
 /**
  * @brief TCP 监听器，提供 bind+listen 及异步 accept 能力。
  */
@@ -67,7 +70,11 @@ public:
     int native_handle() const { return _fd; }
     /**
      * @brief 异步 accept awaiter。
-     * @return >=0 新连接 fd；-1 需等待（内部挂起）；-2 致命错误。
+     * 返回值语义（await 后）：
+     *  >=0 : 成功返回新连接 fd。
+     *  k_accept_fatal(-2): 致命错误（例如系统调用出错）。
+     *  -1 : (仅 Linux 内部使用) 暂无连接，需等待；调用方最终不会在 await_resume 中看到 -1，除非直接检查 try_accept()
+     * 结果。 Windows 版本不返回 -1，只会返回 >=0 或 k_accept_fatal。
      */
     struct accept_awaiter : io_waiter_base {
         tcp_listener& lst;
@@ -76,7 +83,7 @@ public:
         bool await_ready() noexcept
         {
             newfd = try_accept();
-            return newfd >= 0 || newfd == -2;
+            return newfd >= 0 || newfd == k_accept_fatal;
         }
         void await_suspend(std::coroutine_handle<> h)
         {
@@ -87,7 +94,7 @@ public:
         }
         int await_resume() noexcept
         {
-            if (newfd >= 0 || newfd == -2)
+            if (newfd >= 0 || newfd == k_accept_fatal)
                 return newfd;
             return try_accept();
         }
@@ -99,8 +106,8 @@ public:
             if (fd >= 0)
                 return fd;
             if (fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                return -1; // 需等待
-            return -2;     // 致命错误
+                return -1;         // 需等待
+            return k_accept_fatal; // 致命错误
         }
     };
     /**
@@ -133,9 +140,8 @@ inline Task<tcp_socket<lock, Reactor>, Work_Promise<lock, tcp_socket<lock, React
 async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor>& lst)
 {
     int fd = co_await lst.accept();
-    if (fd < 0) {
-        // return an empty moved-from socket: construct then close
-        tcp_socket<lock, Reactor> tmp = fwq.make_tcp_socket();
+    if (fd < 0) { // -2 fatal => 返回一个已关闭 socket 占位
+        auto tmp = fwq.make_tcp_socket();
         tmp.close();
         co_return std::move(tmp);
     }

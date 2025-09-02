@@ -1,5 +1,7 @@
-// tcp_listener.hpp - TCP 异步 accept
+// tcp_listener.hpp - TCP 异步 accept (Windows IOCP)
 #pragma once
+
+#ifdef _WIN32
 
 #include "fd_base.hpp"
 #include "io_waiter.hpp"
@@ -10,8 +12,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-
 namespace co_wq::net {
+
+// 统一 accept 语义常量（与 Linux 对齐）
+inline constexpr int k_accept_fatal = -2;
 
 template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_listener {
 public:
@@ -62,22 +66,28 @@ public:
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter = this;
         }
+        // Windows 模型: 不尝试 fast path 的 await_ready，统一走 await_suspend。
         bool await_ready() noexcept { return false; }
         void await_suspend(std::coroutine_handle<> awaiting)
         {
             this->h    = awaiting;
             this->func = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
+            issue();
+        }
+        void issue()
+        {
             SOCKET as = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (as == INVALID_SOCKET) {
-                newfd = -2;
+                newfd = k_accept_fatal;
                 lst._exec.post(*this);
                 return;
             }
             u_long m = 1;
             ioctlsocket(as, FIONBIO, &m);
             if (!lst._acceptex) {
-                newfd = -2;
+                newfd = k_accept_fatal;
+                ::closesocket(as);
                 lst._exec.post(*this);
                 return;
             }
@@ -89,7 +99,7 @@ public:
                                     sizeof(sockaddr_in) + 16,
                                     &bytes,
                                     &ovl);
-            if (ok) {
+            if (ok) { // immediate completion
                 newfd = (int)as;
                 lst._reactor.post_completion(this);
                 return;
@@ -97,24 +107,23 @@ public:
             int err = WSAGetLastError();
             if (err != ERROR_IO_PENDING) {
                 ::closesocket(as);
-                newfd = -2;
+                newfd = k_accept_fatal;
                 lst._exec.post(*this);
                 return;
             }
-            // completion will arrive via IOCP loop
-            _accepted = (int)as;
+            _accepted = (int)as; // pending, completion via IOCP
         }
         int await_resume() noexcept
         {
-            if (newfd == -2)
-                return -2;
+            if (newfd == k_accept_fatal)
+                return k_accept_fatal;
             if (newfd == -1) {
                 // completion path: need to get result
                 DWORD transferred = 0;
                 if (GetOverlappedResult((HANDLE)lst._reactor.iocp_handle(), &ovl, &transferred, FALSE)) {
                     newfd = _accepted;
                 } else {
-                    newfd = -2;
+                    newfd = k_accept_fatal;
                 }
             }
             return newfd;
@@ -172,3 +181,5 @@ async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor
 }
 
 } // namespace co_wq::net
+
+#endif // _WIN32
