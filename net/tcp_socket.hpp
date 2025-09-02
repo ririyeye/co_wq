@@ -69,7 +69,12 @@ public:
     {
         if (_fd >= 0) {
             if (_reactor)
-                _reactor->remove_fd(_fd);
+                _reactor->remove_fd(_fd); // 这会投递所有尚在 reactor 上等待的 waiter
+            // 额外: 释放仍在串行发送/接收队列中尚未获取槽位的 awaiter
+            list_head pending;
+            INIT_LIST_HEAD(&pending);
+            serial_collect_waiters(_io_serial_lock, { &_send_q, &_recv_q }, pending);
+            serial_post_pending(_exec, pending); // awaiters 在 await_resume 中检测关闭状态
             ::close(_fd);
             _fd = -1;
         }

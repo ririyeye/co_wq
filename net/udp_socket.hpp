@@ -49,29 +49,11 @@ public:
             // 先取消 reactor 事件（唤醒 epoll 中的 waiters）
             if (_reactor)
                 _reactor->remove_fd(_fd);
-            // 取出内部尚未获取锁的发送/接收等待者并唤醒（返回取消）
-            std::vector<worknode*> pending;
-            {
-                std::scoped_lock lk(_io_serial_lock);
-                while (!list_empty(&_send_q.waiters)) {
-                    auto* lh = _send_q.waiters.next;
-                    auto* wn = list_entry(lh, worknode, ws_node);
-                    list_del(lh);
-                    pending.push_back(wn);
-                }
-                _send_q.locked = false;
-                while (!list_empty(&_recv_q.waiters)) {
-                    auto* lh = _recv_q.waiters.next;
-                    auto* wn = list_entry(lh, worknode, ws_node);
-                    list_del(lh);
-                    pending.push_back(wn);
-                }
-                _recv_q.locked = false;
-            }
-            for (auto* wn : pending) {
-                wn->func = &io_waiter_base::resume_cb; // 直接恢复协程，它会在 await_resume 检查 _closed
-                _exec.post(*wn);
-            }
+            // 取出内部尚未获取锁的发送/接收等待者并批量唤醒（返回取消）
+            list_head pending;
+            INIT_LIST_HEAD(&pending);
+            serial_collect_waiters(_io_serial_lock, { &_send_q, &_recv_q }, pending);
+            serial_post_pending(_exec, pending); // 在 await_resume 中检测 _closed
             ::close(_fd);
             _fd = -1;
         }

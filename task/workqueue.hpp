@@ -49,6 +49,28 @@ template <lockable Lock> struct workqueue {
             trig(this);
         }
     }
+    // 批量投递：batch_head 为一个临时链表头，里面挂着若干 worknode.ws_node。
+    // 所有节点整体串到队列尾部，只触发一次 trig。
+    void post(struct list_head& batch_head)
+    {
+        if (list_empty(&batch_head))
+            return; // nothing to do
+        lk.lock();
+        // splice tail: insert [first..last] before ws_head
+        list_head* first = batch_head.next;
+        list_head* last  = batch_head.prev;
+        // 连接到现有队列尾部
+        first->prev        = ws_head.prev;
+        ws_head.prev->next = first;
+        last->next         = &ws_head;
+        ws_head.prev       = last;
+        // 重新初始化 batch 头（清空）
+        INIT_LIST_HEAD(&batch_head);
+        lk.unlock();
+        if (trig) {
+            trig(this);
+        }
+    }
     void add_new_nolock(struct worknode& pnode)
     {
         list_del(&pnode.ws_node);

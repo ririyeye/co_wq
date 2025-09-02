@@ -8,7 +8,6 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <unistd.h>
-#include <vector>
 
 namespace co_wq::net {
 
@@ -51,28 +50,11 @@ public:
         _closed = true;
         if (_reactor)
             _reactor->remove_fd(_fd);
-        std::vector<worknode*> pending;
-        {
-            std::scoped_lock lk(_io_serial_lock);
-            while (!list_empty(&_read_q.waiters)) {
-                auto* lh = _read_q.waiters.next;
-                auto* wn = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                pending.push_back(wn);
-            }
-            _read_q.locked = false;
-            while (!list_empty(&_write_q.waiters)) {
-                auto* lh = _write_q.waiters.next;
-                auto* wn = list_entry(lh, worknode, ws_node);
-                list_del(lh);
-                pending.push_back(wn);
-            }
-            _write_q.locked = false;
-        }
-        for (auto* wn : pending) {
-            wn->func = &io_waiter_base::resume_cb;
-            _exec.post(*wn);
-        }
+        // 批量收集并一次性投递串行等待节点
+        list_head pending;
+        INIT_LIST_HEAD(&pending);
+        serial_collect_waiters(_io_serial_lock, { &_read_q, &_write_q }, pending);
+        serial_post_pending(_exec, pending);
         ::close(_fd);
         _fd = -1;
     }

@@ -14,8 +14,31 @@
  */
 #include "io_waiter.hpp"
 #include "workqueue.hpp"
+#include <concepts>
+#include <initializer_list>
+#include <mutex>
+#include <type_traits>
 
 namespace co_wq::net {
+
+// --- Concepts 限制: 执行器与串行 Owner 接口 ---
+using co_wq::lockable; // 引入 lockable 概念名称
+
+template <class Exec>
+concept exec_like = requires(Exec e, worknode& n) {
+    { e.post(n) } -> std::same_as<void>;
+};
+
+template <class Owner>
+concept serial_owner = requires(Owner o, worknode& n) {
+    // 需要提供 serial_lock() & exec() 接口
+    { o.serial_lock() };
+    { o.exec().post(n) } -> std::same_as<void>;
+    // serial_lock() 返回类型需满足 lockable
+    requires co_wq::lockable<std::remove_reference_t<decltype(o.serial_lock())>>;
+};
+
+// (不对 Derived 直接加 concept，因 CRTP 派生类型在定义时不完整，概念检查会失败)
 
 /**
  * @brief 串行化等待队列（与单一逻辑槽位绑定）。
@@ -47,7 +70,7 @@ inline void serial_queue_init(serial_queue& q)
  * @param node 待加入的工作节点（其 func 需已设置为 lock_acquired 回调）。
  * @return true 表示已立即获得槽位并已 post；false 已加入等待队列。
  */
-template <class Lock, class Exec>
+template <co_wq::lockable Lock, exec_like Exec>
 inline bool serial_acquire_or_enqueue(serial_queue& q, Lock& lock, Exec& exec, worknode& node)
 {
     std::lock_guard<Lock> lk(lock);
@@ -65,7 +88,7 @@ inline bool serial_acquire_or_enqueue(serial_queue& q, Lock& lock, Exec& exec, w
  * @tparam Lock 锁类型（满足 lockable）。
  * @tparam Exec 执行队列类型。
  */
-template <class Lock, class Exec> inline void serial_release(serial_queue& q, Lock& lock, Exec& exec)
+template <co_wq::lockable Lock, exec_like Exec> inline void serial_release(serial_queue& q, Lock& lock, Exec& exec)
 {
     worknode* next = nullptr;
     {
@@ -92,7 +115,7 @@ template <class Lock, class Exec> inline void serial_release(serial_queue& q, Lo
  *
  * Derived 需提供 static void lock_acquired_cb(worknode*).
  */
-template <class Derived, class Owner> struct serial_slot_awaiter : io_waiter_base {
+template <class Derived, serial_owner Owner> struct serial_slot_awaiter : io_waiter_base {
     Owner&        owner;
     serial_queue& q;                   // queue we serialize on
     bool          have_lock { false }; // optional flag (set by derived when lock acquired)
@@ -116,12 +139,14 @@ template <class Derived, class Owner> struct serial_slot_awaiter : io_waiter_bas
  *  int attempt_once();  语义: >0 取得进展继续循环；=0 完成/终止；-1 需等待事件。
  *  static void arm(Derived* self, bool first); 在需等待时注册事件；first 表示是否首轮。
  */
-template <class Derived, class Owner> struct two_phase_drain_awaiter : serial_slot_awaiter<Derived, Owner> {
+template <class Derived, serial_owner Owner> struct two_phase_drain_awaiter : serial_slot_awaiter<Derived, Owner> {
     using base = serial_slot_awaiter<Derived, Owner>;
     using base::base;
     // attempt_once contract described above
     static void lock_acquired_cb(worknode* w)
     {
+        static_assert(std::is_base_of_v<two_phase_drain_awaiter, Derived> || true,
+                      "CRTP pattern: Derived should inherit two_phase_drain_awaiter<Derived, Owner>");
         auto* self      = static_cast<Derived*>(w);
         self->have_lock = true;
         while (true) {
@@ -163,4 +188,31 @@ template <class Derived, class Owner> struct two_phase_drain_awaiter : serial_sl
     }
 };
 
+// ---- 通用辅助：批量收集 & 投递串行队列中的等待者 ----
+// 收集：在持锁情况下，将多个 serial_queue 的 waiters 节点搬运到 out_pending，并重置 locked 标志。
+template <co_wq::lockable Lock>
+inline void serial_collect_waiters(Lock& lk, std::initializer_list<serial_queue*> queues, list_head& out_pending)
+{
+    std::scoped_lock guard(lk);
+    for (auto* q : queues) {
+        while (!list_empty(&q->waiters)) {
+            auto* lh = q->waiters.next;
+            list_del(lh);
+            list_add_tail(lh, &out_pending);
+        }
+        q->locked = false;
+    }
+}
+// 批量投递：统一设置 resume_cb，然后一次性 splice 进执行队列（trig 一次）。
+template <class Exec> inline void serial_post_pending(Exec& exec, list_head& pending)
+{
+    if (list_empty(&pending))
+        return;
+    list_head* pos;
+    list_for_each (pos, &pending) {
+        auto* wn = list_entry(pos, worknode, ws_node);
+        wn->func = &io_waiter_base::resume_cb;
+    }
+    exec.post(pending);
+}
 } // namespace co_wq::net
