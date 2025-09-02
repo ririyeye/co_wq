@@ -21,13 +21,13 @@ namespace co_wq::net {
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_listener {
 public:
-    explicit tcp_listener(workqueue<lock>& exec) : _exec(exec)
+    explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor)
     {
         _fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (_fd < 0)
             throw std::runtime_error("listener socket failed");
         set_non_block();
-        Reactor<lock>::instance(_exec).add_fd(_fd);
+        _reactor->add_fd(_fd);
     }
     ~tcp_listener() { close(); }
     /**
@@ -58,7 +58,8 @@ public:
     void close()
     {
         if (_fd >= 0) {
-            Reactor<lock>::instance(_exec).remove_fd(_fd);
+            if (_reactor)
+                _reactor->remove_fd(_fd);
             ::close(_fd);
             _fd = -1;
         }
@@ -81,7 +82,8 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
-            Reactor<lock>::instance(lst._exec).add_waiter(lst._fd, EPOLLIN, this);
+            if (lst._reactor)
+                lst._reactor->add_waiter(lst._fd, EPOLLIN, this);
         }
         int await_resume() noexcept
         {
@@ -114,6 +116,7 @@ private:
             ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
     }
     workqueue<lock>& _exec;
+    Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
 };
 

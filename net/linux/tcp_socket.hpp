@@ -20,7 +20,7 @@ namespace co_wq::net {
 // 前置声明: 带 Reactor 模板参数的 fd_workqueue
 template <lockable lock, template <class> class Reactor> class fd_workqueue;
 
-// Reactor 后端需提供: static instance(exec) / add_fd / remove_fd / add_waiter 接口
+// Reactor 后端需提供: add_fd / remove_fd / add_waiter 接口
 /**
  * @brief 基于非阻塞 + epoll (边缘触发) 的 TCP socket 协程封装。
  *

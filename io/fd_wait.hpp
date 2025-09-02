@@ -15,29 +15,30 @@ inline wait_event operator|(wait_event a, wait_event b)
 
 template <lockable lock, template <class> class Reactor = epoll_reactor> struct fd_wait_awaiter : io_waiter_base {
     workqueue<lock>& exec;
+    Reactor<lock>&   reactor;
     int              fd;
     uint32_t         mask;
     bool             ready_immediate { false };
-    fd_wait_awaiter(workqueue<lock>& e, int f, uint32_t m) : exec(e), fd(f), mask(m) { }
+    fd_wait_awaiter(workqueue<lock>& e, Reactor<lock>& r, int f, uint32_t m) : exec(e), reactor(r), fd(f), mask(m) { }
     bool await_ready() noexcept { return ready_immediate; }
     void await_suspend(std::coroutine_handle<> h)
     {
         this->h = h;
         INIT_LIST_HEAD(&this->ws_node);
-        Reactor<lock>::instance(exec).add_waiter(fd, mask, this);
+        reactor.add_waiter(fd, mask, this);
     }
     uint32_t await_resume() const noexcept { return mask; }
 };
 
 template <lockable lock, template <class> class Reactor = epoll_reactor>
-inline fd_wait_awaiter<lock, Reactor> fd_wait_read(workqueue<lock>& exec, int fd)
+inline fd_wait_awaiter<lock, Reactor> fd_wait_read(workqueue<lock>& exec, Reactor<lock>& r, int fd)
 {
-    return fd_wait_awaiter<lock, Reactor>(exec, fd, EPOLLIN);
+    return fd_wait_awaiter<lock, Reactor>(exec, r, fd, EPOLLIN);
 }
 template <lockable lock, template <class> class Reactor = epoll_reactor>
-inline fd_wait_awaiter<lock, Reactor> fd_wait_write(workqueue<lock>& exec, int fd)
+inline fd_wait_awaiter<lock, Reactor> fd_wait_write(workqueue<lock>& exec, Reactor<lock>& r, int fd)
 {
-    return fd_wait_awaiter<lock, Reactor>(exec, fd, EPOLLOUT);
+    return fd_wait_awaiter<lock, Reactor>(exec, r, fd, EPOLLOUT);
 }
 
 } // namespace co_wq::net

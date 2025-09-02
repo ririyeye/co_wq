@@ -13,7 +13,6 @@
 #include <cstring>
 #include <string>
 
-
 #ifdef _WIN32
 #include <basetsd.h>
 using ssize_t = SSIZE_T;
@@ -73,14 +72,7 @@ static Task<void, Work_Promise<SpinLock, void>> echo_conn(net::tcp_socket<SpinLo
 static Task<void, Work_Promise<SpinLock, void>>
 echo_server(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port, int max_conn)
 {
-    net::tcp_listener<SpinLock> lst(
-#ifdef _WIN32
-        fdwq.base(),
-        fdwq.reactor()
-#else
-        fdwq.base()
-#endif
-    );
+    net::tcp_listener<SpinLock> lst(fdwq.base(), fdwq.reactor());
     lst.bind_listen(host, port, 16);
     g_server_start = std::chrono::steady_clock::now();
     g_listener_fd.store(lst.native_handle(), std::memory_order_release);
