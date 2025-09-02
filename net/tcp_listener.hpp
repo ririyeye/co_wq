@@ -16,6 +16,9 @@
 
 namespace co_wq::net {
 
+/**
+ * @brief TCP 监听器，提供 bind+listen 及异步 accept 能力。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_listener {
 public:
     explicit tcp_listener(workqueue<lock>& exec) : _exec(exec)
@@ -27,6 +30,12 @@ public:
         Reactor<lock>::instance(_exec).add_fd(_fd);
     }
     ~tcp_listener() { close(); }
+    /**
+     * @brief 绑定并监听。
+     * @param host 监听地址("0.0.0.0" 或 空 字符串 表示 INADDR_ANY)。
+     * @param port 端口。
+     * @param backlog listen backlog。
+     */
     void bind_listen(const std::string& host, uint16_t port, int backlog = 128)
     {
         sockaddr_in addr {};
@@ -43,6 +52,9 @@ public:
         if (::listen(_fd, backlog) < 0)
             throw std::runtime_error("listen failed");
     }
+    /**
+     * @brief 关闭监听 socket 并注销 reactor。
+     */
     void close()
     {
         if (_fd >= 0) {
@@ -52,6 +64,9 @@ public:
         }
     }
     int native_handle() const { return _fd; }
+    /**
+     * @brief 异步 accept awaiter；返回新连接 fd 或 -1(需等待) / -2(致命错误)。
+     */
     struct accept_awaiter : io_waiter_base {
         tcp_listener& lst;
         int           newfd { -1 };
@@ -85,6 +100,9 @@ public:
             return -2;     // fatal
         }
     };
+    /**
+     * @brief 获取 accept awaiter。
+     */
     accept_awaiter accept() { return accept_awaiter(*this); }
 
 private:

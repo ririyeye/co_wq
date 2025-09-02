@@ -17,6 +17,9 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
+/**
+ * @brief UDP socket 协程封装，支持 connect（可选设定默认对端）、recv_from、send_to。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class udp_socket {
 public:
     udp_socket()                             = delete;
@@ -35,6 +38,9 @@ public:
         return *this;
     }
     ~udp_socket() { close(); }
+    /**
+     * @brief 关闭 socket 并注销 reactor。
+     */
     void close()
     {
         if (_fd >= 0) {
@@ -47,6 +53,9 @@ public:
     int native_handle() const { return _fd; }
 
     // Optional connect to set default peer
+    /**
+     * @brief 可选 connect awaiter，用于设定默认发送/接收对端。
+     */
     struct connect_awaiter : io_waiter_base {
         udp_socket& sock;
         std::string host;
@@ -93,6 +102,9 @@ public:
     };
     connect_awaiter connect(const std::string& host, uint16_t port) { return connect_awaiter(*this, host, port); }
 
+    /**
+     * @brief 异步 recvfrom awaiter。
+     */
     struct recvfrom_awaiter : io_waiter_base {
         udp_socket&  sock;
         void*        buf;
@@ -128,11 +140,17 @@ public:
             return ::recvfrom(sock._fd, buf, len, MSG_DONTWAIT, (sockaddr*)out_addr, out_len);
         }
     };
+    /**
+     * @brief 获取 recvfrom awaiter。
+     */
     recvfrom_awaiter recv_from(void* buf, size_t len, sockaddr_in* addr, socklen_t* addrlen)
     {
         return recvfrom_awaiter(*this, buf, len, addr, addrlen);
     }
 
+    /**
+     * @brief 异步 sendto awaiter，内部循环直到 EAGAIN。
+     */
     struct sendto_awaiter : io_waiter_base {
         udp_socket&        sock;
         const void*        buf;
@@ -186,6 +204,9 @@ public:
             return (ssize_t)sent;
         }
     };
+    /**
+     * @brief 获取 sendto awaiter。
+     */
     sendto_awaiter send_to(const void* buf, size_t len, const sockaddr_in& dest)
     {
         return sendto_awaiter(*this, buf, len, &dest);

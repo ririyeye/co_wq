@@ -12,6 +12,9 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
+/**
+ * @brief 异步文件句柄 (非阻塞 + epoll)；支持 read/pread 与 write/pwrite 协程等待。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class file_handle {
 public:
     file_handle()                              = delete;
@@ -29,7 +32,10 @@ public:
         return *this;
     }
     ~file_handle() { close(); }
-    int  native_handle() const { return _fd; }
+    int native_handle() const { return _fd; }
+    /**
+     * @brief 关闭文件并从 reactor 注销。
+     */
     void close()
     {
         if (_fd >= 0) {
@@ -38,6 +44,9 @@ public:
             _fd = -1;
         }
     }
+    /**
+     * @brief 读取 awaiter；支持顺序 read 和带偏移的 pread（自动维护 ofs）。
+     */
     struct read_awaiter : io_waiter_base {
         file_handle& fh;
         void*        buf;
@@ -87,6 +96,9 @@ public:
     };
     read_awaiter read(void* buf, size_t len) { return read_awaiter(*this, buf, len); }
     read_awaiter pread(void* buf, size_t len, off_t& ofs) { return read_awaiter(*this, buf, len, ofs); }
+    /**
+     * @brief 写入 awaiter；支持顺序 write 和带偏移 pwrite，内部自旋写到 EAGAIN。
+     */
     struct write_awaiter : io_waiter_base {
         file_handle& fh;
         const void*  buf;

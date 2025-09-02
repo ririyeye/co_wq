@@ -12,6 +12,9 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
+/**
+ * @brief 通用 fd 封装基类，负责: 非阻塞设置 + 注册到 reactor + RAII 关闭。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class fd_object {
 public:
     fd_object(const fd_object&)            = delete;
@@ -28,7 +31,10 @@ public:
         return *this;
     }
     ~fd_object() { close(); }
-    int  native_handle() const { return _fd; }
+    int native_handle() const { return _fd; }
+    /**
+     * @brief 关闭 fd 并从 reactor 注销（可安全多次调用）。
+     */
     void close()
     {
         if (_fd >= 0) {
@@ -60,11 +66,20 @@ protected:
     friend class fd_workqueue<lock, Reactor>;
 };
 
+/**
+ * @brief 封装一个基础 workqueue + 内嵌 Reactor，用于创建/接管各种 fd 对象 (TCP / UDP / 文件)。
+ * @note Reactor 作为成员，生命周期与 fd_workqueue 绑定；避免单独堆分配。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class fd_workqueue {
 public:
     explicit fd_workqueue(workqueue<lock>& base) : _base(base), _reactor(base) { }
     workqueue<lock>& base() { return _base; }
-    int              open_file(const char* path, int flags, mode_t mode = 0644)
+    /**
+     * @brief 打开文件 (O_NONBLOCK | O_CLOEXEC) 并纳入 reactor 管理。
+     * @throws runtime_error 打开失败。
+     * @return 文件描述符。
+     */
+    int open_file(const char* path, int flags, mode_t mode = 0644)
     {
         int fd = ::open(path, flags | O_CLOEXEC | O_NONBLOCK, mode);
         if (fd < 0)
@@ -72,10 +87,13 @@ public:
         _reactor->add_fd(fd);
         return fd;
     }
-    Reactor<lock>&            reactor() { return _reactor; }
-    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
-    tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
-    udp_socket<lock, Reactor> make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
+    Reactor<lock>&            reactor() { return _reactor; } ///< 访问内部 reactor
+    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); } ///< 创建新 TCP
+    tcp_socket<lock, Reactor> adopt_tcp_socket(int fd)
+    {
+        return tcp_socket<lock, Reactor>(fd, _base, _reactor);
+    }                                                                                                  ///< 接管现有 fd
+    udp_socket<lock, Reactor> make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); } ///< 创建新 UDP
 
 private:
     workqueue<lock>& _base;
