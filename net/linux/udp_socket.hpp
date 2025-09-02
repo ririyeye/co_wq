@@ -140,6 +140,42 @@ public:
                 return -1;
             return 0; // error
         }
+        // 串行槽位获取成功后驱动一次 attempt_once；若需等待则注册事件。
+        static void lock_acquired_cb(worknode* w)
+        {
+            auto* self = static_cast<recvfrom_awaiter*>(w);
+            while (true) {
+                int r = self->attempt_once();
+                if (r == 0) { // 完成或错误
+                    slot_base<recvfrom_awaiter>::release(self);
+                    self->func = &io_waiter_base::resume_cb;
+                    if (self->h)
+                        self->h.resume();
+                    return;
+                }
+                // would block
+                self->func = &recvfrom_awaiter::drive_cb;
+                register_wait(self, true);
+                return;
+            }
+        }
+        static void drive_cb(worknode* w)
+        {
+            auto* self = static_cast<recvfrom_awaiter*>(w);
+            while (true) {
+                int r = self->attempt_once();
+                if (r == 0) { // done
+                    slot_base<recvfrom_awaiter>::release(self);
+                    self->func = &io_waiter_base::resume_cb;
+                    if (self->h)
+                        self->h.resume();
+                    return;
+                }
+                self->func = &recvfrom_awaiter::drive_cb;
+                register_wait(self, false);
+                return;
+            }
+        }
         static void register_wait(recvfrom_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
@@ -193,6 +229,41 @@ public:
             }
             return 0; // done or error
         }
+        static void lock_acquired_cb(worknode* w)
+        {
+            auto* self = static_cast<sendto_awaiter*>(w);
+            while (true) {
+                int r = self->attempt_once();
+                if (r == -1) { // would block
+                    self->func = &sendto_awaiter::drive_cb;
+                    register_wait(self, true);
+                    return;
+                }
+                // 完成 或 错误
+                slot_base<sendto_awaiter>::release(self);
+                self->func = &io_waiter_base::resume_cb;
+                if (self->h)
+                    self->h.resume();
+                return;
+            }
+        }
+        static void drive_cb(worknode* w)
+        {
+            auto* self = static_cast<sendto_awaiter*>(w);
+            while (true) {
+                int r = self->attempt_once();
+                if (r == -1) { // still waiting
+                    self->func = &sendto_awaiter::drive_cb;
+                    register_wait(self, false);
+                    return;
+                }
+                slot_base<sendto_awaiter>::release(self);
+                self->func = &io_waiter_base::resume_cb;
+                if (self->h)
+                    self->h.resume();
+                return;
+            }
+        }
         static void register_wait(sendto_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
@@ -224,6 +295,8 @@ private:
             throw std::runtime_error("udp socket failed");
         set_non_block();
         _reactor->add_fd(_fd);
+        serial_queue_init(_send_q);
+        serial_queue_init(_recv_q);
     }
     void set_non_block()
     {
@@ -258,4 +331,3 @@ async_udp_send_to(udp_socket<lock, Reactor>& s, const void* buf, size_t len, con
 }
 
 } // namespace co_wq::net
-
