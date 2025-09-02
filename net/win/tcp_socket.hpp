@@ -132,51 +132,114 @@ public:
     void mark_tx_shutdown() { _tx_shutdown = true; }
     struct connect_awaiter : io_waiter_base {
         /**
-         * @brief 异步连接 awaiter（简化实现：依赖非阻塞 connect + 写事件）
-         * @note 未使用 ConnectEx；若需要高性能并发连接，可后续扩展。
+         * @brief 基于 ConnectEx 的真正异步连接 awaiter。
          * 成功返回 0，失败返回 -1。
+         * 流程：
+         *  1. 创建临时套接字（或复用现有未连接 fd），绑定 INADDR_ANY:0 (ConnectEx 需求)；
+         *  2. 发起 ConnectEx(Overlapped)；
+         *  3. 若立即成功 -> fast path；否则等待 IOCP 完成；
+         *  4. 完成后执行 setsockopt(SO_UPDATE_CONNECT_CONTEXT)；
          */
-        tcp_socket& sock;
-        std::string host;
-        uint16_t    port;
-        int         ret { 0 };
-        connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p) { }
-        bool await_ready() const noexcept { return false; }
+        tcp_socket&    sock;
+        std::string    host;
+        uint16_t       port;
+        int            ret { -1 }; // 0 成功 -1 失败
+        iocp_ovl       ovl;
+        LPFN_CONNECTEX _connectex { nullptr };
+        sockaddr_in    _addr {};
+        bool           issued { false };
+        connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p)
+        {
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter = this;
+        }
+        bool load_connectex()
+        {
+            if (_connectex)
+                return true;
+            GUID  guid  = WSAID_CONNECTEX;
+            DWORD bytes = 0;
+            if (WSAIoctl((SOCKET)sock._fd,
+                         SIO_GET_EXTENSION_FUNCTION_POINTER,
+                         &guid,
+                         sizeof(guid),
+                         &_connectex,
+                         sizeof(_connectex),
+                         &bytes,
+                         NULL,
+                         NULL)
+                == SOCKET_ERROR) {
+                _connectex = nullptr;
+                return false;
+            }
+            return true;
+        }
+        bool await_ready() noexcept
+        {
+            // 不尝试 fast path 预创建，统一在这里发起；若立即完成返回 true。
+            INIT_LIST_HEAD(&this->ws_node);
+            if (sock._fd == -1) { // 若还未创建底层 socket
+                SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (s == INVALID_SOCKET) {
+                    ret = -1;
+                    return true;
+                }
+                sock._fd = (int)s;
+                sock.set_non_block();
+                sock._reactor->add_fd(sock._fd);
+            }
+            if (!load_connectex()) {
+                ret = -1;
+                return true;
+            }
+            // 解析目标地址
+            _addr.sin_family = AF_INET;
+            _addr.sin_port   = htons(port);
+            if (InetPtonA(AF_INET, host.c_str(), &_addr.sin_addr) <= 0) {
+                ret = -1;
+                return true;
+            }
+            // ConnectEx 要求先 bind 本地地址
+            sockaddr_in local {};
+            local.sin_family      = AF_INET;
+            local.sin_addr.s_addr = INADDR_ANY;
+            local.sin_port        = 0;
+            ::bind((SOCKET)sock._fd, (sockaddr*)&local, sizeof(local)); // 失败可忽略, 若失败 ConnectEx 会报错
+            this->func = &io_waiter_base::resume_cb;
+            BOOL ok    = _connectex((SOCKET)sock._fd, (sockaddr*)&_addr, sizeof(_addr), nullptr, 0, nullptr, &ovl);
+            issued     = true;
+            if (ok) { // 立即完成
+                ret = 0;
+                // 更新上下文
+                setsockopt((SOCKET)sock._fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+                return true;
+            }
+            int err = WSAGetLastError();
+            if (err != ERROR_IO_PENDING) {
+                ret = -1;
+                return true;
+            }
+            // pending -> await_suspend
+            return false;
+        }
         void await_suspend(std::coroutine_handle<> awaiting)
         {
             this->h = awaiting;
-            INIT_LIST_HEAD(&this->ws_node);
-            sockaddr_in addr {};
-            addr.sin_family = AF_INET;
-            addr.sin_port   = htons(port);
-            if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-                ret = -1;
-                sock._exec.post(*this);
-                return;
-            }
-            int r = ::connect((SOCKET)sock._fd, (sockaddr*)&addr, sizeof(addr));
-            if (r == 0) {
-                ret = 0;
-                sock._exec.post(*this);
-                return;
-            }
-            int err = WSAGetLastError();
-            if (r == SOCKET_ERROR && (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS)) {
-                // emulate async: use reactor immediate post after short delay (no real write readiness tracking yet)
-                sock._reactor->add_waiter(sock._fd, EPOLLOUT, this);
-                return;
-            }
-            ret = -1;
-            sock._exec.post(*this);
+            // IOCP 完成线程会 post_completion -> 恢复
         }
         int await_resume() noexcept
         {
-            if (ret == 0) {
-                int err = 0;
-                int len = sizeof(err);
-                if (getsockopt((SOCKET)sock._fd, SOL_SOCKET, SO_ERROR, (char*)&err, &len) == 0 && err == 0)
-                    return 0;
-                return -1;
+            if (ret == 0)
+                return 0;
+            if (issued && ret != 0) {
+                // 检查是否已完成
+                DWORD transferred = 0;
+                if (GetOverlappedResult((HANDLE)sock._reactor->iocp_handle(), &ovl, &transferred, FALSE)) {
+                    setsockopt((SOCKET)sock._fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+                    ret = 0;
+                } else {
+                    ret = -1;
+                }
             }
             return ret;
         }
