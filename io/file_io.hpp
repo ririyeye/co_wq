@@ -15,6 +15,8 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
 
 template <lockable lock, template <class> class Reactor = epoll_reactor> class file_handle {
 public:
+    // Helper alias to simplify two-phase awaiter declarations
+    template <class D> using tp_base           = two_phase_drain_awaiter<D, file_handle>;
     file_handle()                              = delete;
     file_handle(const file_handle&)            = delete;
     file_handle& operator=(const file_handle&) = delete;
@@ -59,22 +61,15 @@ public:
         _fd = -1;
     }
 
-    struct read_awaiter : two_phase_drain_awaiter<read_awaiter, file_handle> {
+    struct read_awaiter : tp_base<read_awaiter> {
         void*   buf;
         size_t  len;
         ssize_t nrd { -1 };
         off_t*  pofs { nullptr };
         bool    use_offset { false };
-        read_awaiter(file_handle& f, void* b, size_t l)
-            : two_phase_drain_awaiter<read_awaiter, file_handle>(f, f._read_q), buf(b), len(l)
-        {
-        }
+        read_awaiter(file_handle& f, void* b, size_t l) : tp_base<read_awaiter>(f, f._read_q), buf(b), len(l) { }
         read_awaiter(file_handle& f, void* b, size_t l, off_t& ofs)
-            : two_phase_drain_awaiter<read_awaiter, file_handle>(f, f._read_q)
-            , buf(b)
-            , len(l)
-            , pofs(&ofs)
-            , use_offset(true)
+            : tp_base<read_awaiter>(f, f._read_q), buf(b), len(l), pofs(&ofs), use_offset(true)
         {
         }
         int attempt_once()
@@ -86,7 +81,7 @@ public:
                 return -1; // would block
             return 0;      // error -> done
         }
-        static void arm(read_awaiter* self, bool /*first*/)
+        static void register_wait(read_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
@@ -115,22 +110,17 @@ public:
     read_awaiter read(void* buf, size_t len) { return read_awaiter(*this, buf, len); }
     read_awaiter pread(void* buf, size_t len, off_t& ofs) { return read_awaiter(*this, buf, len, ofs); }
 
-    struct write_awaiter : two_phase_drain_awaiter<write_awaiter, file_handle> {
+    struct write_awaiter : tp_base<write_awaiter> {
         const void* buf;
         size_t      len;
         size_t      done { 0 };
         off_t*      pofs { nullptr };
         bool        use_offset { false };
-        write_awaiter(file_handle& f, const void* b, size_t l)
-            : two_phase_drain_awaiter<write_awaiter, file_handle>(f, f._write_q), buf(b), len(l)
+        write_awaiter(file_handle& f, const void* b, size_t l) : tp_base<write_awaiter>(f, f._write_q), buf(b), len(l)
         {
         }
         write_awaiter(file_handle& f, const void* b, size_t l, off_t& ofs)
-            : two_phase_drain_awaiter<write_awaiter, file_handle>(f, f._write_q)
-            , buf(b)
-            , len(l)
-            , pofs(&ofs)
-            , use_offset(true)
+            : tp_base<write_awaiter>(f, f._write_q), buf(b), len(l), pofs(&ofs), use_offset(true)
         {
         }
         int attempt_once()
@@ -139,7 +129,7 @@ public:
                 return 0; // done or error
             return -1;    // would block
         }
-        static void arm(write_awaiter* self, bool /*first*/)
+        static void register_wait(write_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }

@@ -37,6 +37,8 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue;
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_socket {
 public:
+    // Helper alias to reduce template noise when declaring awaiters
+    template <class D> using tp_base         = two_phase_drain_awaiter<D, tcp_socket>;
     tcp_socket()                             = delete;
     tcp_socket(const tcp_socket&)            = delete;
     tcp_socket& operator=(const tcp_socket&) = delete;
@@ -156,14 +158,11 @@ public:
      * 语义保持为“执行一次 recv”：不会在同一 await 中循环读取到 EAGAIN，只做一次系统调用；
      * 这样上层可以更明确地控制协议分帧或字节流节奏。
      */
-    struct recv_awaiter : two_phase_drain_awaiter<recv_awaiter, tcp_socket> {
+    struct recv_awaiter : tp_base<recv_awaiter> {
         void*   buf;
         size_t  len;
         ssize_t nread { -1 };
-        recv_awaiter(tcp_socket& s, void* b, size_t l)
-            : two_phase_drain_awaiter<recv_awaiter, tcp_socket>(s, s._recv_q), buf(b), len(l)
-        {
-        }
+        recv_awaiter(tcp_socket& s, void* b, size_t l) : tp_base<recv_awaiter>(s, s._recv_q), buf(b), len(l) { }
         // attempt_once: >0 继续；0 完成；-1 需等待。这里一次 recv 完成后直接返回 0。
         int attempt_once()
         {
@@ -182,7 +181,7 @@ public:
             // 其他错误：nread 保存 -1，errno 供调用方使用
             return 0;
         }
-        static void arm(recv_awaiter* self, bool /*first*/)
+        static void register_wait(recv_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
@@ -203,13 +202,13 @@ public:
      *  - 0..len-1 读取到 EOF 或 错误前的部分（若出现错误且读取了部分数据，优先返回已读字节数）；
      *  - <0 在首个系统调用就出错且未读取任何数据（返回 -1，errno 保留）。
      */
-    struct recv_all_awaiter : two_phase_drain_awaiter<recv_all_awaiter, tcp_socket> {
+    struct recv_all_awaiter : tp_base<recv_all_awaiter> {
         char*   buf;
         size_t  len;
         size_t  recvd { 0 };
         ssize_t err { 0 }; // 仅在 recvd == 0 且系统调用返回 <0 (非 EAGAIN) 时保存
         recv_all_awaiter(tcp_socket& s, void* b, size_t l)
-            : two_phase_drain_awaiter<recv_all_awaiter, tcp_socket>(s, s._recv_q), buf(static_cast<char*>(b)), len(l)
+            : tp_base<recv_all_awaiter>(s, s._recv_q), buf(static_cast<char*>(b)), len(l)
         {
         }
         int attempt_once()
@@ -232,7 +231,7 @@ public:
                 err = n; // 记录首个错误
             return 0;
         }
-        static void arm(recv_all_awaiter* self, bool /*first*/)
+        static void register_wait(recv_all_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
@@ -395,13 +394,13 @@ public:
      */
     sendv_awaiter sendv(const struct iovec* iov, int iovcnt) { return sendv_awaiter(*this, iov, iovcnt); }
     // ---- 全量发送 Awaiter 基类 (多次等待直至完成或错误) ----
-    template <typename Derived> struct send_full_base : two_phase_drain_awaiter<Derived, tcp_socket> {
+    template <typename Derived> struct send_full_base : tp_base<Derived> {
         size_t  sent { 0 };
         ssize_t err { 0 }; // <0 记录错误
-        send_full_base(tcp_socket& s) : two_phase_drain_awaiter<Derived, tcp_socket>(s, s._send_q) { }
+        send_full_base(tcp_socket& s) : tp_base<Derived>(s, s._send_q) { }
         // attempt_once: >0 有进展继续；0 完成；-1 需等待
         ssize_t     finish_result() const noexcept { return (err < 0 && sent == 0) ? err : (ssize_t)sent; }
-        static void arm(send_full_base* self, bool /*first*/)
+        static void register_wait(send_full_base* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }

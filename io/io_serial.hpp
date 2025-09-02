@@ -137,7 +137,7 @@ template <class Derived, serial_owner Owner> struct serial_slot_awaiter : io_wai
  *
  * Derived 需实现：
  *  int attempt_once();  语义: >0 取得进展继续循环；=0 完成/终止；-1 需等待事件。
- *  static void arm(Derived* self, bool first); 在需等待时注册事件；first 表示是否首轮。
+ *  static void register_wait(Derived* self, bool first); 在需等待时注册事件；first 表示是否首轮。
  */
 template <class Derived, serial_owner Owner> struct two_phase_drain_awaiter : serial_slot_awaiter<Derived, Owner> {
     using base = serial_slot_awaiter<Derived, Owner>;
@@ -162,7 +162,7 @@ template <class Derived, serial_owner Owner> struct two_phase_drain_awaiter : se
             }
             // would block
             self->func = &Derived::drive_cb;
-            Derived::arm(self, true);
+            Derived::register_wait(self, true);
             return;
         }
     }
@@ -182,7 +182,7 @@ template <class Derived, serial_owner Owner> struct two_phase_drain_awaiter : se
             }
             // still would block -> re-arm
             self->func = &Derived::drive_cb;
-            Derived::arm(self, false);
+            Derived::register_wait(self, false);
             return;
         }
     }

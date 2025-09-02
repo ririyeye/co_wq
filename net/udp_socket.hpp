@@ -23,6 +23,9 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class udp_socket {
 public:
+    // Helper aliases for awaiter base types
+    template <class D> using tp_base         = two_phase_drain_awaiter<D, udp_socket>;
+    template <class D> using slot_base       = serial_slot_awaiter<D, udp_socket>;
     udp_socket()                             = delete;
     udp_socket(const udp_socket&)            = delete;
     udp_socket& operator=(const udp_socket&) = delete;
@@ -118,14 +121,14 @@ public:
     /**
      * @brief 异步 recvfrom awaiter。
      */
-    struct recvfrom_awaiter : two_phase_drain_awaiter<recvfrom_awaiter, udp_socket> {
+    struct recvfrom_awaiter : slot_base<recvfrom_awaiter> {
         void*        buf;
         size_t       len;
         sockaddr_in* out_addr;
         socklen_t*   out_len;
         ssize_t      nread { -1 }; // -1 需等待
         recvfrom_awaiter(udp_socket& s, void* b, size_t l, sockaddr_in* oa, socklen_t* ol)
-            : serial_slot_awaiter<recvfrom_awaiter, udp_socket>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
+            : slot_base<recvfrom_awaiter>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
         {
         }
         int attempt_once()
@@ -137,7 +140,7 @@ public:
                 return -1;
             return 0; // error
         }
-        static void arm(recvfrom_awaiter* self, bool /*first*/)
+        static void register_wait(recvfrom_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
@@ -162,13 +165,13 @@ public:
     /**
      * @brief 异步 sendto awaiter，内部循环直到 EAGAIN。
      */
-    struct sendto_awaiter : two_phase_drain_awaiter<sendto_awaiter, udp_socket> {
+    struct sendto_awaiter : slot_base<sendto_awaiter> {
         const void*        buf;
         size_t             len;
         const sockaddr_in* dest;
         size_t             sent { 0 };
         sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d)
-            : serial_slot_awaiter<sendto_awaiter, udp_socket>(s, s._send_q), buf(b), len(l), dest(d)
+            : slot_base<sendto_awaiter>(s, s._send_q), buf(b), len(l), dest(d)
         {
         }
         int attempt_once()
@@ -190,7 +193,7 @@ public:
             }
             return 0; // done or error
         }
-        static void arm(sendto_awaiter* self, bool /*first*/)
+        static void register_wait(sendto_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }
