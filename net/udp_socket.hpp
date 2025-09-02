@@ -44,8 +44,33 @@ public:
     void close()
     {
         if (_fd >= 0) {
+            _closed = true;
+            // 先取消 reactor 事件（唤醒 epoll 中的 waiters）
             if (_reactor)
                 _reactor->remove_fd(_fd);
+            // 取出内部尚未获取锁的发送/接收等待者并唤醒（返回取消）
+            std::vector<worknode*> pending;
+            {
+                std::scoped_lock lk(_io_serial_lock);
+                while (!list_empty(&_send_waiters)) {
+                    auto* lh = _send_waiters.next;
+                    auto* wn = list_entry(lh, worknode, ws_node);
+                    list_del(lh);
+                    pending.push_back(wn);
+                }
+                _send_locked = false;
+                while (!list_empty(&_recv_waiters)) {
+                    auto* lh = _recv_waiters.next;
+                    auto* wn = list_entry(lh, worknode, ws_node);
+                    list_del(lh);
+                    pending.push_back(wn);
+                }
+                _recv_locked = false;
+            }
+            for (auto* wn : pending) {
+                wn->func = &io_waiter_base::resume_cb; // 直接恢复协程，它会在 await_resume 检查 _closed
+                _exec.post(*wn);
+            }
             ::close(_fd);
             _fd = -1;
         }
@@ -111,33 +136,79 @@ public:
         size_t       len;
         sockaddr_in* out_addr;
         socklen_t*   out_len;
-        ssize_t      nread { 0 };
+        ssize_t      nread { -1 }; // -1 需等待
+        bool         have_lock { false };
         recvfrom_awaiter(udp_socket& s, void* b, size_t l, sockaddr_in* oa, socklen_t* ol)
             : sock(s), buf(b), len(l), out_addr(oa), out_len(ol)
         {
         }
-        bool await_ready() noexcept
+        static void lock_acquired_cb(worknode* w)
         {
-            nread = ::recvfrom(sock._fd, buf, len, MSG_DONTWAIT, (sockaddr*)out_addr, out_len);
-            if (nread >= 0)
-                return true;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                nread = -1;
-                return false;
+            auto* self      = static_cast<recvfrom_awaiter*>(w);
+            self->have_lock = true;
+            self->nread     = ::recvfrom(self->sock._fd,
+                                     self->buf,
+                                     self->len,
+                                     MSG_DONTWAIT,
+                                     (sockaddr*)self->out_addr,
+                                     self->out_len);
+            if (self->nread >= 0) {
+                self->sock.release_recv_slot();
+                self->func = &io_waiter_base::resume_cb;
+                if (self->h)
+                    self->h.resume();
+                return;
             }
-            return true;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                // error
+                self->sock.release_recv_slot();
+                self->func = &io_waiter_base::resume_cb;
+                if (self->h)
+                    self->h.resume();
+                return;
+            }
+            // 需要等待可读
+            self->nread = -1;
+            self->func  = &recvfrom_awaiter::drive_cb;
+            self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLIN, self);
         }
+        static void drive_cb(worknode* w)
+        {
+            auto* self  = static_cast<recvfrom_awaiter*>(w);
+            self->nread = ::recvfrom(self->sock._fd,
+                                     self->buf,
+                                     self->len,
+                                     MSG_DONTWAIT,
+                                     (sockaddr*)self->out_addr,
+                                     self->out_len);
+            self->sock.release_recv_slot();
+            self->func = &io_waiter_base::resume_cb;
+            if (self->h)
+                self->h.resume();
+        }
+        bool await_ready() noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h)
         {
-            this->h = h;
+            this->h    = h;
+            this->func = &recvfrom_awaiter::lock_acquired_cb;
             INIT_LIST_HEAD(&this->ws_node);
-            sock._reactor->add_waiter(sock._fd, EPOLLIN, this);
+            {
+                std::scoped_lock lk(sock._io_serial_lock);
+                if (!sock._recv_locked && list_empty(&sock._recv_waiters)) {
+                    sock._recv_locked = true;
+                    sock._exec.post(*this);
+                    return;
+                }
+                list_add_tail(&this->ws_node, &sock._recv_waiters);
+            }
         }
         ssize_t await_resume() noexcept
         {
-            if (nread >= 0)
-                return nread;
-            return ::recvfrom(sock._fd, buf, len, MSG_DONTWAIT, (sockaddr*)out_addr, out_len);
+            if (nread < 0 && sock._closed) {
+                errno = ECANCELED;
+                return -1;
+            }
+            return nread;
         }
     };
     /**
@@ -157,49 +228,88 @@ public:
         size_t             len;
         const sockaddr_in* dest;
         size_t             sent { 0 };
+        bool               have_lock { false };
         sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d) : sock(s), buf(b), len(l), dest(d)
         {
         }
-        bool await_ready() noexcept
+        static void lock_acquired_cb(worknode* w)
         {
-            ssize_t n = ::sendto(sock._fd,
-                                 (const char*)buf + sent,
-                                 len - sent,
-                                 MSG_DONTWAIT | MSG_NOSIGNAL,
-                                 (const sockaddr*)dest,
-                                 sizeof(*dest));
-            if (n >= 0) {
-                sent += (size_t)n;
-                return sent == len;
+            auto* self      = static_cast<sendto_awaiter*>(w);
+            self->have_lock = true;
+            // drain attempt
+            while (self->sent < self->len) {
+                ssize_t n = ::sendto(self->sock._fd,
+                                     (const char*)self->buf + self->sent,
+                                     self->len - self->sent,
+                                     MSG_DONTWAIT | MSG_NOSIGNAL,
+                                     (const sockaddr*)self->dest,
+                                     sizeof(*self->dest));
+                if (n > 0) {
+                    self->sent += (size_t)n;
+                    continue;
+                }
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    // need wait
+                    self->func = &sendto_awaiter::drive_cb;
+                    self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLOUT, self);
+                    return;
+                }
+                // error or n==0
+                break;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return false;
-            return true; // error
+            self->sock.release_send_slot();
+            self->func = &io_waiter_base::resume_cb;
+            if (self->h)
+                self->h.resume();
         }
+        static void drive_cb(worknode* w)
+        {
+            auto* self = static_cast<sendto_awaiter*>(w);
+            while (self->sent < self->len) {
+                ssize_t n = ::sendto(self->sock._fd,
+                                     (const char*)self->buf + self->sent,
+                                     self->len - self->sent,
+                                     MSG_DONTWAIT | MSG_NOSIGNAL,
+                                     (const sockaddr*)self->dest,
+                                     sizeof(*self->dest));
+                if (n > 0) {
+                    self->sent += (size_t)n;
+                    continue;
+                }
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    // still pending
+                    self->func = &sendto_awaiter::drive_cb;
+                    self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLOUT, self);
+                    return;
+                }
+                break; // error or n==0
+            }
+            self->sock.release_send_slot();
+            self->func = &io_waiter_base::resume_cb;
+            if (self->h)
+                self->h.resume();
+        }
+        bool await_ready() noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h)
         {
-            this->h = h;
+            this->h    = h;
+            this->func = &sendto_awaiter::lock_acquired_cb;
             INIT_LIST_HEAD(&this->ws_node);
-            sock._reactor->add_waiter(sock._fd, EPOLLOUT, this);
+            {
+                std::scoped_lock lk(sock._io_serial_lock);
+                if (!sock._send_locked && list_empty(&sock._send_waiters)) {
+                    sock._send_locked = true;
+                    sock._exec.post(*this);
+                    return;
+                }
+                list_add_tail(&this->ws_node, &sock._send_waiters);
+            }
         }
         ssize_t await_resume() noexcept
         {
-            if (sent == len)
-                return (ssize_t)sent;
-            while (sent < len) {
-                ssize_t n = ::sendto(sock._fd,
-                                     (const char*)buf + sent,
-                                     len - sent,
-                                     MSG_DONTWAIT | MSG_NOSIGNAL,
-                                     (const sockaddr*)dest,
-                                     sizeof(*dest));
-                if (n > 0) {
-                    sent += (size_t)n;
-                    continue;
-                }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                    break; // wait again
-                return n;  // error
+            if (sent == 0 && sock._closed) {
+                errno = ECANCELED;
+                return -1;
             }
             return (ssize_t)sent;
         }
@@ -231,6 +341,47 @@ private:
     workqueue<lock>& _exec;
     Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
+    // IO 串行锁与队列
+    lock      _io_serial_lock;
+    list_head _send_waiters;
+    bool      _send_locked { false };
+    list_head _recv_waiters;
+    bool      _recv_locked { false };
+    bool      _closed { false }; // 是否已关闭，用于取消待定操作
+    void      release_send_slot()
+    {
+        worknode* next = nullptr;
+        {
+            std::scoped_lock lk(_io_serial_lock);
+            if (!list_empty(&_send_waiters)) {
+                auto* lh = _send_waiters.next;
+                auto* aw = list_entry(lh, worknode, ws_node);
+                list_del(lh);
+                next = aw;
+            } else {
+                _send_locked = false;
+            }
+        }
+        if (next)
+            _exec.post(*next);
+    }
+    void release_recv_slot()
+    {
+        worknode* next = nullptr;
+        {
+            std::scoped_lock lk(_io_serial_lock);
+            if (!list_empty(&_recv_waiters)) {
+                auto* lh = _recv_waiters.next;
+                auto* aw = list_entry(lh, worknode, ws_node);
+                list_del(lh);
+                next = aw;
+            } else {
+                _recv_locked = false;
+            }
+        }
+        if (next)
+            _exec.post(*next);
+    }
 };
 
 // Convenience async wrappers

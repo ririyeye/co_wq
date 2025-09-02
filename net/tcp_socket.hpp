@@ -143,37 +143,60 @@ public:
         tcp_socket& sock;
         void*       buf;
         size_t      len;
-        ssize_t     nread { 0 };
+        ssize_t     nread { -1 }; // -1 表示需读取
+        bool        have_lock { false };
         recv_awaiter(tcp_socket& s, void* b, size_t l) : sock(s), buf(b), len(l) { }
-        bool await_ready() noexcept
+        static void lock_acquired_cb(worknode* w)
         {
-            nread = ::recv(sock._fd, buf, len, MSG_DONTWAIT);
-            if (nread >= 0)
-                return true;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                nread = -1;
-                return false;
+            auto* self      = static_cast<recv_awaiter*>(w);
+            self->have_lock = true;
+            // 尝试立即读一次
+            self->nread = ::recv(self->sock._fd, self->buf, self->len, MSG_DONTWAIT);
+            if (self->nread >= 0 || (self->nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                // 完成或错误立即恢复
+                if (self->nread == 0)
+                    self->sock._rx_eof = true;
+                self->sock.release_recv_slot();
+                self->func = &io_waiter_base::resume_cb;
+                if (self->h)
+                    self->h.resume();
+                return;
             }
-            return true;
+            // 需要等待 EPOLLIN
+            self->nread = -1; // 标记需在唤醒后再读
+            self->func  = &recv_awaiter::drive_cb;
+            self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLIN, self);
         }
+        static void drive_cb(worknode* w)
+        {
+            auto* self = static_cast<recv_awaiter*>(w);
+            // 被 EPOLLIN 唤醒，最终读取
+            self->nread = ::recv(self->sock._fd, self->buf, self->len, MSG_DONTWAIT);
+            if (self->nread == 0)
+                self->sock._rx_eof = true;
+            self->sock.release_recv_slot();
+            self->func = &io_waiter_base::resume_cb;
+            if (self->h)
+                self->h.resume();
+        }
+        bool await_ready() noexcept { return false; } // 总是走锁流程
         void await_suspend(std::coroutine_handle<> h)
         {
-            this->h = h;
+            this->h    = h;
+            this->func = &recv_awaiter::lock_acquired_cb;
             INIT_LIST_HEAD(&this->ws_node);
-            sock._reactor->add_waiter(sock._fd, EPOLLIN, this);
-        }
-        ssize_t await_resume() noexcept
-        {
-            if (nread >= 0) {
-                if (nread == 0)
-                    sock._rx_eof = true;
-                return nread;
+            // 获取接收互斥
+            {
+                std::scoped_lock lk(sock._io_serial_lock);
+                if (!sock._recv_locked && list_empty(&sock._recv_waiters)) {
+                    sock._recv_locked = true;
+                    sock._exec.post(*this);
+                    return;
+                }
+                list_add_tail(&this->ws_node, &sock._recv_waiters);
             }
-            ssize_t r = ::recv(sock._fd, buf, len, MSG_DONTWAIT);
-            if (r == 0)
-                sock._rx_eof = true;
-            return r;
         }
+        ssize_t await_resume() noexcept { return nread; }
     };
     /**
      * @brief 异步接收一次（最多 len 字节）。
@@ -345,6 +368,7 @@ public:
         tcp_socket& sock;
         size_t      sent { 0 }; // 已发送字节
         ssize_t     err { 0 };  // <0 表示错误（第一次出错时记录）
+        bool        have_lock { false };
         send_full_base(tcp_socket& s) : sock(s) { }
         enum class step { progress, would_block, done }; // progress=继续循环, would_block=需等待, done=完成或错误
         bool drain()
@@ -358,6 +382,22 @@ public:
                 return true; // done
             }
         }
+        static void lock_acquired_cb(worknode* w)
+        {
+            auto* self      = static_cast<Derived*>(w);
+            self->have_lock = true;
+            // 开始真正的发送逻辑
+            if (!self->drain()) {
+                self->func = &Derived::drive_cb;
+                self->sock._reactor->add_waiter_custom(self->sock._fd, EPOLLOUT, self);
+                return;
+            }
+            // 已完成，直接 resume
+            self->sock.release_send_slot();
+            self->func = &io_waiter_base::resume_cb;
+            if (self->h)
+                self->h.resume();
+        }
         static void drive_cb(worknode* w)
         {
             auto* self = static_cast<Derived*>(w);
@@ -366,17 +406,29 @@ public:
                 self->func = &Derived::drive_cb;
                 return;
             }
+            self->sock.release_send_slot();
             self->func = &io_waiter_base::resume_cb;
             if (self->h)
                 self->h.resume();
         }
-        bool await_ready() noexcept { return drain(); }
+        bool await_ready() noexcept
+        {
+            return false; // 始终通过锁路径
+        }
         void await_suspend(std::coroutine_handle<> h)
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
-            this->func = &Derived::drive_cb; // 直接使用 custom 版本避免被覆盖
-            sock._reactor->add_waiter_custom(sock._fd, EPOLLOUT, this);
+            this->func = &Derived::lock_acquired_cb;
+            {
+                std::scoped_lock lk(sock._io_serial_lock);
+                if (!sock._send_locked && list_empty(&sock._send_waiters)) {
+                    sock._send_locked = true;
+                    sock._exec.post(*this);
+                    return;
+                }
+                list_add_tail(&this->ws_node, &sock._send_waiters);
+            }
         }
         ssize_t finish_result() const noexcept { return (err < 0 && sent == 0) ? err : (ssize_t)sent; }
     };
@@ -469,6 +521,42 @@ public:
     };
     sendv_all_awaiter send_all(const struct iovec* iov, int iovcnt) { return sendv_all_awaiter(*this, iov, iovcnt); }
 
+    // 内部串行发送队列：send_all / sendv_all 默认使用
+    void release_send_slot()
+    {
+        worknode* next = nullptr;
+        {
+            std::scoped_lock lk(_io_serial_lock);
+            if (!list_empty(&_send_waiters)) {
+                auto* lh = _send_waiters.next;
+                auto* aw = list_entry(lh, worknode, ws_node);
+                list_del(lh);
+                next = aw;
+            } else {
+                _send_locked = false;
+            }
+        }
+        if (next)
+            _exec.post(*next);
+    }
+    void release_recv_slot()
+    {
+        worknode* next = nullptr;
+        {
+            std::scoped_lock lk(_io_serial_lock);
+            if (!list_empty(&_recv_waiters)) {
+                auto* lh = _recv_waiters.next;
+                auto* aw = list_entry(lh, worknode, ws_node);
+                list_del(lh);
+                next = aw;
+            } else {
+                _recv_locked = false;
+            }
+        }
+        if (next)
+            _exec.post(*next);
+    }
+
 private:
     friend class fd_workqueue<lock, Reactor>;
     explicit tcp_socket(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor)
@@ -478,11 +566,15 @@ private:
             throw std::runtime_error("socket failed");
         set_non_block();
         _reactor->add_fd(_fd);
+        INIT_LIST_HEAD(&_send_waiters);
+        INIT_LIST_HEAD(&_recv_waiters);
     }
     tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor), _fd(fd)
     {
         set_non_block();
         _reactor->add_fd(_fd);
+        INIT_LIST_HEAD(&_send_waiters);
+        INIT_LIST_HEAD(&_recv_waiters);
     }
     void set_non_block()
     {
@@ -495,6 +587,12 @@ private:
     int              _fd { -1 };
     bool             _rx_eof { false };
     bool             _tx_shutdown { false };
+    // IO 串行锁与等待队列（发送 / 接收分别串行）
+    lock      _io_serial_lock;
+    list_head _send_waiters;
+    bool      _send_locked { false };
+    list_head _recv_waiters;
+    bool      _recv_locked { false };
 };
 
 // wrappers

@@ -4,6 +4,7 @@
 #include "epoll_reactor.hpp" // default reactor
 #include "tcp_socket.hpp"    // for factory methods (now templated)
 #include "udp_socket.hpp"
+#include "file_io.hpp"
 #include <fcntl.h>
 #include <stdexcept>
 #include <unistd.h>
@@ -94,6 +95,7 @@ public:
         return tcp_socket<lock, Reactor>(fd, _base, _reactor);
     }                                                                                                  ///< 接管现有 fd
     udp_socket<lock, Reactor> make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); } ///< 创建新 UDP
+    file_handle<lock, Reactor> make_file(int fd) { return file_handle<lock, Reactor>(_base, _reactor, fd); }
 
 private:
     workqueue<lock>& _base;
