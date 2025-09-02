@@ -34,6 +34,7 @@ target("co_wq")
 
 if get_config("USING_NET") then
     add_includedirs("net", {public = true})
+    add_includedirs("io", {public = true})
     add_defines("USING_NET", {public = true})
 end
 
