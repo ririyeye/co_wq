@@ -14,6 +14,7 @@
 #pragma once
 
 #include "callback_wq.hpp"
+#include "reactor_default.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
@@ -51,7 +52,7 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
  * @tparam Reactor 反应器模板（在 Windows 下实际为 iocp_reactor，默认模板参数与 linux 保持形式统一）
  * @brief TCP 套接字封装，提供协程 await 接口。
  */
-template <lockable lock, template <class> class Reactor = iocp_reactor> class tcp_socket {
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR> class tcp_socket {
 public:
     template <class D> using tp_base         = two_phase_drain_awaiter<D, tcp_socket>;
     tcp_socket()                             = delete;

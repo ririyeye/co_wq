@@ -4,6 +4,7 @@
 #ifdef _WIN32
 
 #include "fd_base.hpp"
+#include "reactor_default.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
 #include "tcp_socket.hpp"
@@ -17,7 +18,7 @@ namespace co_wq::net {
 // 统一 accept 语义常量（与 Linux 对齐）
 inline constexpr int k_accept_fatal = -2;
 
-template <lockable lock, template <class> class Reactor = iocp_reactor> class tcp_listener {
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR> class tcp_listener {
 public:
     explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(reactor)
     {
@@ -163,14 +164,14 @@ private:
     LPFN_ACCEPTEX    _acceptex { nullptr };
 };
 
-template <lockable lock, template <class> class Reactor = iocp_reactor>
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR>
 inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock, Reactor>& lst)
 {
     int fd = co_await lst.accept();
     co_return fd;
 }
 
-template <lockable lock, template <class> class Reactor = iocp_reactor>
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR>
 inline Task<tcp_socket<lock, Reactor>, Work_Promise<lock, tcp_socket<lock, Reactor>>>
 async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor>& lst)
 {

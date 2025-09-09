@@ -1,6 +1,7 @@
-// file_io.hpp - async file read/write (non-blocking + epoll) with internal serialization
+// file_io.hpp - async file read/write (non-blocking + epoll/IOCP) with internal serialization
 #pragma once
 #ifdef __linux__
+#include "reactor_default.hpp"
 #include "callback_wq.hpp"
 #include "epoll_reactor.hpp"
 #include "io_serial.hpp"
@@ -14,7 +15,7 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd decl
 
-template <lockable lock, template <class> class Reactor = iocp_reactor> class file_handle {
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR> class file_handle {
 public:
     // Helper alias to simplify two-phase awaiter declarations
     template <class D> using tp_base           = two_phase_drain_awaiter<D, file_handle>;
@@ -198,7 +199,7 @@ private:
     // release handled via serial_slot_awaiter
 };
 
-template <lockable lock, template <class> class Reactor = epoll_reactor>
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR>
 inline file_handle<lock, Reactor> make_file_handle(workqueue<lock>& exec, Reactor<lock>& r, int fd)
 {
     return file_handle<lock, Reactor>(exec, r, fd);
@@ -206,6 +207,7 @@ inline file_handle<lock, Reactor> make_file_handle(workqueue<lock>& exec, Reacto
 
 } // namespace co_wq::net
 #elif defined(_WIN32)
+#include "reactor_default.hpp"
 #include "callback_wq.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
@@ -222,7 +224,7 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class file_handle {
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR> class file_handle {
 public:
     file_handle()                              = delete;
     file_handle(const file_handle&)            = delete;

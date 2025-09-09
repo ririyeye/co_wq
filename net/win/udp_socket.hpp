@@ -11,6 +11,7 @@
 #pragma once
 
 #include "callback_wq.hpp"
+#include "reactor_default.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
@@ -41,7 +42,7 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
-template <lockable lock, template <class> class Reactor = iocp_reactor> class udp_socket {
+template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR> class udp_socket {
 public:
     udp_socket()                             = delete;
     udp_socket(const udp_socket&)            = delete;
