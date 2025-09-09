@@ -264,6 +264,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
+            this->func = &recv_awaiter::lock_acquired_cb; // ensure valid callback before enqueue/post
             serial_acquire_or_enqueue(this->q, this->owner.serial_lock(), this->owner.exec(), *this);
         }
         ssize_t await_resume() noexcept
@@ -385,6 +386,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
+            this->func = &recv_all_awaiter::lock_acquired_cb; // ensure valid callback before enqueue/post
             serial_acquire_or_enqueue(this->q, this->owner.serial_lock(), this->owner.exec(), *this);
         }
         ssize_t await_resume() noexcept { return (err < 0 && recvd == 0) ? err : (ssize_t)recvd; }
@@ -583,6 +585,7 @@ public:
         {
             this->h = h;
             INIT_LIST_HEAD(&this->ws_node);
+            this->func = &send_awaiter::lock_acquired_cb; // ensure valid callback before enqueue/post
             serial_acquire_or_enqueue(this->q, this->owner.serial_lock(), this->owner.exec(), *this);
         }
         ssize_t await_resume() noexcept { return err < 0 ? err : (ssize_t)sent; }

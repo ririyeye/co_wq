@@ -7,3 +7,4 @@ install
 .vscode/settings.json
 *.bin
 *.pyc
+.vs

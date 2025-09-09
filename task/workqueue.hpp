@@ -2,6 +2,9 @@
 
 #include "lock.hpp"
 #include "usrlist.hpp"
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 
 namespace co_wq {
 
@@ -13,6 +16,39 @@ struct worknode {
     struct list_head ws_node;
     work_func_t      func;
 };
+
+// Helper: detect common MSVC debug poison patterns for pointers to catch
+// uninitialized or freed memory being used as function pointers.
+inline bool __wq_is_debug_poison_ptr_uintptr(std::uintptr_t p)
+{
+#if defined(_MSC_VER)
+#if INTPTR_MAX == INT64_MAX
+    constexpr std::uintptr_t POISON_CD = 0xcdcdcdcdcdcdcdcdULL; // uninitialized heap
+    constexpr std::uintptr_t POISON_CC = 0xccccccccccccccccULL; // uninitialized stack
+    constexpr std::uintptr_t POISON_FE = 0xfeeefeeefeeefeeeULL; // freed heap
+    constexpr std::uintptr_t POISON_AB = 0xababababababababULL; // no-init heap (some CRTs)
+#else
+    constexpr std::uintptr_t POISON_CD = 0xcdcdcdcdU;
+    constexpr std::uintptr_t POISON_CC = 0xccccccccU;
+    constexpr std::uintptr_t POISON_FE = 0xfeeefeeeU;
+    constexpr std::uintptr_t POISON_AB = 0xababababU;
+#endif
+    return p == POISON_CD || p == POISON_CC || p == POISON_FE || p == POISON_AB;
+#else
+    (void)p;
+    return false;
+#endif
+}
+
+inline bool __wq_is_debug_poison_func_ptr(worknode::work_func_t fn)
+{
+    return __wq_is_debug_poison_ptr_uintptr(reinterpret_cast<std::uintptr_t>(fn));
+}
+
+inline worknode* __wq_node_to_worknode(struct list_head* node)
+{
+    return reinterpret_cast<worknode*>(reinterpret_cast<char*>(node) - offsetof(worknode, ws_node));
+}
 
 template <lockable Lock> struct workqueue {
     explicit workqueue() { }
@@ -32,8 +68,17 @@ template <lockable Lock> struct workqueue {
         lk.unlock();
 
         if (pnod) {
-            if (pnod->func) {
-                pnod->func(pnod);
+            auto fn = pnod->func;
+            if (fn) {
+#ifndef NDEBUG
+                // Detect and guard against calling invalid debug poison addresses like 0xCDCDCDCD...
+                if (__wq_is_debug_poison_func_ptr(fn)) {
+                    assert(false
+                           && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
+                    return 1; // skip calling to avoid crash in debug
+                }
+#endif
+                fn(pnod);
             }
             return 1;
         }
@@ -41,6 +86,13 @@ template <lockable Lock> struct workqueue {
     }
     void post(struct worknode& pnode)
     {
+#ifndef NDEBUG
+        // Validate func before enqueue
+        auto fn = pnode.func;
+        assert(fn && "worknode.func must not be null when enqueuing");
+        assert(!__wq_is_debug_poison_func_ptr(fn)
+               && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
+#endif
         lk.lock();
         list_del(&pnode.ws_node);
         list_add_tail(&pnode.ws_node, &ws_head);
@@ -55,6 +107,16 @@ template <lockable Lock> struct workqueue {
     {
         if (list_empty(&batch_head))
             return; // nothing to do
+#ifndef NDEBUG
+        // Validate all func pointers in batch before enqueue
+        for (list_head* pos = batch_head.next; pos != &batch_head; pos = pos->next) {
+            worknode* wn = __wq_node_to_worknode(pos);
+            auto      fn = wn->func;
+            assert(fn && "worknode.func must not be null when enqueuing (batch)");
+            assert(!__wq_is_debug_poison_func_ptr(fn)
+                   && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized (batch)");
+        }
+#endif
         lk.lock();
         // splice tail: insert [first..last] before ws_head
         list_head* first = batch_head.next;
@@ -73,6 +135,12 @@ template <lockable Lock> struct workqueue {
     }
     void add_new_nolock(struct worknode& pnode)
     {
+#ifndef NDEBUG
+        auto fn = pnode.func;
+        assert(fn && "worknode.func must not be null when enqueuing (nolock)");
+        assert(!__wq_is_debug_poison_func_ptr(fn)
+               && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized (nolock)");
+#endif
         list_del(&pnode.ws_node);
         list_add_tail(&pnode.ws_node, &ws_head);
     }
