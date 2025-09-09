@@ -1,6 +1,7 @@
 // callback_wq.hpp - per-owner ordered callback dispatcher on top of main workqueue
 #pragma once
 #include "workqueue.hpp"
+#include <mutex>
 
 namespace co_wq::net {
 

@@ -16,13 +16,25 @@
 #include "iocp_reactor.hpp"
 #include "worker.hpp"
 #include <basetsd.h>
+#include <mswsock.h>
 #include <stdexcept>
+#include <string>
+#include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 #ifndef _SSIZE_T_DEFINED
 using ssize_t = SSIZE_T;
 #define _SSIZE_T_DEFINED
+#endif
+
+// Provide POSIX-like iovec for Windows if not yet defined (keep in sync with win/tcp_socket.hpp)
+#ifndef IOVEC_DEFINED_CO_WQ
+struct iovec {
+    void*  iov_base;
+    size_t iov_len;
+};
+#define IOVEC_DEFINED_CO_WQ 1
 #endif
 
 namespace co_wq::net {
@@ -213,43 +225,164 @@ public:
     }
 
     /**
-     * @brief UDP send_to awaiter：发送一个数据报；成功返回字节数，失败 -1。
+     * @brief 统一 UDP 发送 awaiter（单缓冲/向量 + 可选目的地址）。
+     *
+     * 语义说明：
+     *  - UDP 为数据报（message）语义，单次调用提交一个完整报文；不会像 TCP 那样“部分发送”再拼接。
+     *  - 已连接套接字使用 WSASend，未连接使用 WSASendTo（传入目的地址）。
+     *  - 向量发送在 Windows 由 WSASend/WSASendTo 的多缓冲功能承载。
+     *  - 完成后 await_resume 返回提交给内核的字节数；失败返回 -1。
+     *
+     * 并发与调度：
+     *  - 通过 _send_q 串行化，保证同一 socket 不会并发执行多个发送 awaiter。
+     *  - 使用 Overlapped/IOCP；发起后由 IOCP 回调收尾，回调通过 callback_wq 路由，维持回调 FIFO。
      */
-    struct sendto_awaiter : serial_slot_awaiter<sendto_awaiter, udp_socket> {
-        const void*        buf;
-        size_t             len;
-        const sockaddr_in* dest;
-        ssize_t            nsent { -1 };
-        iocp_ovl           ovl;
-        WSABUF             wbuf;
-        bool               inflight { false };
-        bool               finished { false };
-        sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d)
-            : serial_slot_awaiter<sendto_awaiter, udp_socket>(s, s._send_q), buf(b), len(l), dest(d)
+    struct send_awaiter : serial_slot_awaiter<send_awaiter, udp_socket> {
+        // 模式
+        bool use_vec { false };
+        bool has_dest { false };
+        // 单缓冲
+        const void* buf { nullptr };
+        size_t      len { 0 };
+        // 向量
+        std::vector<WSABUF> bufs;
+        // 目的地址
+        sockaddr_in dest {};
+        // 结果/状态
+        ssize_t  nsent { -1 };
+        iocp_ovl ovl;
+        bool     inflight { false };
+        bool     finished { false };
+        // 已连接 + 单缓冲
+        send_awaiter(udp_socket& s, const void* b, size_t l)
+            : serial_slot_awaiter<send_awaiter, udp_socket>(s, s._send_q)
+            , use_vec(false)
+            , has_dest(false)
+            , buf(b)
+            , len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter       = this;
             this->route_ctx  = &this->owner._cbq;
             this->route_post = &callback_wq<lock>::post_adapter;
-            wbuf.len         = (ULONG)l;
-            wbuf.buf         = (CHAR*)const_cast<void*>(b);
+        }
+        // 未连接 + 单缓冲
+        send_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in& d)
+            : serial_slot_awaiter<send_awaiter, udp_socket>(s, s._send_q)
+            , use_vec(false)
+            , has_dest(true)
+            , buf(b)
+            , len(l)
+            , dest(d)
+        {
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
+        // 已连接 + 向量
+        send_awaiter(udp_socket& s, const struct iovec* iov, int iovcnt)
+            : serial_slot_awaiter<send_awaiter, udp_socket>(s, s._send_q), use_vec(true), has_dest(false)
+        {
+            bufs.reserve(iovcnt);
+            for (int i = 0; i < iovcnt; ++i) {
+                WSABUF b;
+                b.len = (ULONG)iov[i].iov_len;
+                b.buf = (CHAR*)iov[i].iov_base;
+                bufs.push_back(b);
+                len += b.len; // 复用 len 记录总字节
+            }
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
+        // 未连接 + 向量
+        send_awaiter(udp_socket& s, const struct iovec* iov, int iovcnt, const sockaddr_in& d)
+            : serial_slot_awaiter<send_awaiter, udp_socket>(s, s._send_q), use_vec(true), has_dest(true), dest(d)
+        {
+            bufs.reserve(iovcnt);
+            for (int i = 0; i < iovcnt; ++i) {
+                WSABUF b;
+                b.len = (ULONG)iov[i].iov_len;
+                b.buf = (CHAR*)iov[i].iov_base;
+                bufs.push_back(b);
+                len += b.len;
+            }
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void lock_acquired_cb(worknode* w)
         {
-            auto* self = static_cast<sendto_awaiter*>(w);
+            auto* self = static_cast<send_awaiter*>(w);
             self->issue();
         }
         void issue()
         {
-            DWORD sent = 0;
-            this->func = &sendto_awaiter::completion_cb;
-            int dlen   = sizeof(sockaddr_in);
-            int r
-                = WSASendTo((SOCKET)this->owner._sock, &wbuf, 1, &sent, 0, (const sockaddr*)dest, dlen, &ovl, nullptr);
-            if (r == 0) { // immediate
-                nsent = (ssize_t)sent;
-                finish();
-                return;
+            DWORD sent  = 0;
+            DWORD flags = 0;
+            this->func  = &send_awaiter::completion_cb;
+            if (!use_vec) {
+                WSABUF one;
+                one.len = (ULONG)len;
+                one.buf = (CHAR*)const_cast<void*>(buf);
+                if (has_dest) {
+                    int dlen = sizeof(sockaddr_in);
+                    int r    = WSASendTo((SOCKET)this->owner._sock,
+                                      &one,
+                                      1,
+                                      &sent,
+                                      flags,
+                                      (const sockaddr*)&dest,
+                                      dlen,
+                                      &ovl,
+                                      nullptr);
+                    if (r == 0) {
+                        nsent = (ssize_t)sent;
+                        finish();
+                        return;
+                    }
+                } else {
+                    int r = WSASend((SOCKET)this->owner._sock, &one, 1, &sent, flags, &ovl, nullptr);
+                    if (r == 0) {
+                        nsent = (ssize_t)sent;
+                        finish();
+                        return;
+                    }
+                }
+            } else {
+                if (has_dest) {
+                    int dlen = sizeof(sockaddr_in);
+                    int r    = WSASendTo((SOCKET)this->owner._sock,
+                                      bufs.data(),
+                                      (DWORD)bufs.size(),
+                                      &sent,
+                                      flags,
+                                      (const sockaddr*)&dest,
+                                      dlen,
+                                      &ovl,
+                                      nullptr);
+                    if (r == 0) {
+                        nsent = (ssize_t)sent;
+                        finish();
+                        return;
+                    }
+                } else {
+                    int r = WSASend((SOCKET)this->owner._sock,
+                                    bufs.data(),
+                                    (DWORD)bufs.size(),
+                                    &sent,
+                                    flags,
+                                    &ovl,
+                                    nullptr);
+                    if (r == 0) {
+                        nsent = (ssize_t)sent;
+                        finish();
+                        return;
+                    }
+                }
             }
             int e = WSAGetLastError();
             if (e == WSA_IO_PENDING) {
@@ -261,7 +394,7 @@ public:
         }
         static void completion_cb(worknode* w)
         {
-            auto* self = static_cast<sendto_awaiter*>(w);
+            auto* self = static_cast<send_awaiter*>(w);
             if (self->finished)
                 return;
             if (self->nsent < 0) {
@@ -278,12 +411,18 @@ public:
             if (finished)
                 return;
             finished = true;
-            serial_slot_awaiter<sendto_awaiter, udp_socket>::release(this);
+            serial_slot_awaiter<send_awaiter, udp_socket>::release(this);
             this->func = &io_waiter_base::resume_cb;
             if (this->h)
                 this->h.resume();
         }
-        bool    await_ready() noexcept { return false; }
+        bool await_ready() noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h)
+        {
+            this->h = h;
+            INIT_LIST_HEAD(&this->ws_node);
+            serial_acquire_or_enqueue(this->q, this->owner.serial_lock(), this->owner.exec(), *this);
+        }
         ssize_t await_resume() noexcept
         {
             if (nsent < 0 && this->owner.closed())
@@ -291,9 +430,20 @@ public:
             return nsent;
         }
     };
-    sendto_awaiter send_to(const void* buf, size_t len, const sockaddr_in& dest)
+    // API 封装
+    /** @brief 已连接 UDP：单缓冲发送。*/
+    send_awaiter send(const void* buf, size_t len) { return send_awaiter(*this, buf, len); }
+    /** @brief 未连接 UDP：单缓冲 + 目的地址发送。*/
+    send_awaiter send_to(const void* buf, size_t len, const sockaddr_in& dest)
     {
-        return sendto_awaiter(*this, buf, len, &dest);
+        return send_awaiter(*this, buf, len, dest);
+    }
+    /** @brief 已连接 UDP：向量发送。*/
+    send_awaiter sendv(const struct iovec* iov, int iovcnt) { return send_awaiter(*this, iov, iovcnt); }
+    /** @brief 未连接 UDP：向量 + 目的地址发送。*/
+    send_awaiter sendv_to(const struct iovec* iov, int iovcnt, const sockaddr_in& dest)
+    {
+        return send_awaiter(*this, iov, iovcnt, dest);
     }
 
 private:

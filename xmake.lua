@@ -1,9 +1,11 @@
+-- 项目名
 set_project(co_wq)
 add_rules("plugin.compile_commands.autoupdate")
 add_rules("mode.release", "mode.debug", "mode.releasedbg", "mode.minsizerel")
 set_languages("c++20")
 set_warnings("all", "extra", "pedantic")
 
+-- Windows 平台编译选项
 if is_plat("windows") then
     add_cxflags("/utf-8")
     add_cxflags("/DWIN32")
@@ -17,13 +19,17 @@ option("USING_NET")
     set_default(true)
 option_end()
 
+-- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
     set_default(true)
 option_end()
 
 
+-- 主静态库
 target("co_wq")
     set_kind("static")
+    -- 至少一个源文件以生成静态库产物（便于 xmake install）
+    add_files("task/empty.cpp")
 
     add_includedirs(
         "task", {public=true}
@@ -45,6 +51,7 @@ end
 
 target_end()
 
+-- 可选 example 程序
 if get_config("USING_EXAMPLE") then
     includes("test")
 end

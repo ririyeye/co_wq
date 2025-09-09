@@ -1,4 +1,4 @@
-// udp_socket.hpp - UDP socket coroutine primitives
+// udp_socket.hpp - UDP socket 协程原语
 #pragma once
 
 #include "callback_wq.hpp"
@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace co_wq::net {
@@ -20,7 +21,12 @@ namespace co_wq::net {
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
 /**
- * @brief UDP socket 协程封装，支持 connect（可选设定默认对端）、recv_from、send_to。
+ * @brief UDP socket 协程封装，支持 connect（可选默认对端）、recv_from、send_to。
+ *
+ * 设计要点：
+ *  - IO 全部非阻塞 + EPOLLET，内部通过串行队列保证同类操作不会并发执行；
+ *  - recv_from 使用统一 two-phase 机制：首轮尝试，若 EAGAIN 则注册 EPOLLIN 等待并继续驱动；
+ *  - send_to 尽量写到 EAGAIN；如需完整发送可在上层循环或未来扩展 full 模式（当前保持单次语义即可）。
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor> class udp_socket {
 public:
@@ -45,6 +51,7 @@ public:
     ~udp_socket() { close(); }
     /**
      * @brief 关闭 socket 并注销 reactor。
+     * @note 会批量唤醒串行队列中的等待者，并在 await_resume 中以 ECANCELED 结束。
      */
     void close()
     {
@@ -72,6 +79,7 @@ public:
     // Optional connect to set default peer
     /**
      * @brief 可选 connect awaiter，用于设定默认发送/接收对端。
+     * @return 0 成功；-1 失败（SO_ERROR 非 0）。
      */
     struct connect_awaiter : io_waiter_base {
         udp_socket& sock;
@@ -122,19 +130,25 @@ public:
     connect_awaiter connect(const std::string& host, uint16_t port) { return connect_awaiter(*this, host, port); }
 
     /**
-     * @brief 异步 recvfrom awaiter。
+     * @brief 异步 recvfrom awaiter（单次语义）。
+     * @details UDP 有报文边界：单次 recvfrom 即处理一个报文（可能被截断），聚合模式意义有限。
+     * @return await_resume: >=0 读到字节；<0 错误（或 ECANCELED）。
      */
-    struct recvfrom_awaiter : slot_base<recvfrom_awaiter> {
+    struct recvfrom_awaiter : tp_base<recvfrom_awaiter> {
         void*        buf;
         size_t       len;
         sockaddr_in* out_addr;
         socklen_t*   out_len;
         ssize_t      nread { -1 }; // -1 需等待
         recvfrom_awaiter(udp_socket& s, void* b, size_t l, sockaddr_in* oa, socklen_t* ol)
-            : slot_base<recvfrom_awaiter>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
+            : tp_base<recvfrom_awaiter>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
         {
             this->route_ctx  = &this->owner._cbq;
             this->route_post = &callback_wq<lock>::post_adapter;
+        }
+        static void register_wait(recvfrom_awaiter* self, bool /*first*/)
+        {
+            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
         }
         int attempt_once()
         {
@@ -145,47 +159,7 @@ public:
                 return -1;
             return 0; // error
         }
-        // 串行槽位获取成功后驱动一次 attempt_once；若需等待则注册事件。
-        static void lock_acquired_cb(worknode* w)
-        {
-            auto* self = static_cast<recvfrom_awaiter*>(w);
-            while (true) {
-                int r = self->attempt_once();
-                if (r == 0) { // 完成或错误
-                    slot_base<recvfrom_awaiter>::release(self);
-                    self->func = &io_waiter_base::resume_cb;
-                    if (self->h)
-                        self->h.resume();
-                    return;
-                }
-                // would block
-                self->func = &recvfrom_awaiter::drive_cb;
-                register_wait(self, true);
-                return;
-            }
-        }
-        static void drive_cb(worknode* w)
-        {
-            auto* self = static_cast<recvfrom_awaiter*>(w);
-            while (true) {
-                int r = self->attempt_once();
-                if (r == 0) { // done
-                    slot_base<recvfrom_awaiter>::release(self);
-                    self->func = &io_waiter_base::resume_cb;
-                    if (self->h)
-                        self->h.resume();
-                    return;
-                }
-                self->func = &recvfrom_awaiter::drive_cb;
-                register_wait(self, false);
-                return;
-            }
-        }
-        static void register_wait(recvfrom_awaiter* self, bool /*first*/)
-        {
-            self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLIN, self);
-        }
-        bool    await_ready() noexcept { return false; }
+        // await_ready 由基类提供（返回 false）
         ssize_t await_resume() noexcept
         {
             if (nread < 0 && this->owner.closed()) {
@@ -197,6 +171,10 @@ public:
     };
     /**
      * @brief 获取 recvfrom awaiter。
+     * @param buf 目标缓冲区。
+     * @param len 缓冲区大小。
+     * @param addr 输出对端地址。
+     * @param addrlen 输入/输出地址长度。
      */
     recvfrom_awaiter recv_from(void* buf, size_t len, sockaddr_in* addr, socklen_t* addrlen)
     {
@@ -204,93 +182,123 @@ public:
     }
 
     /**
-     * @brief 异步 sendto awaiter，内部循环直到 EAGAIN。
+     * @brief 统一 UDP 发送 awaiter（单缓冲/向量 + 可选目的地址）。
+     * @details
+     *  - 已连接：单缓冲使用 send；向量使用 writev；
+     *  - 未连接：单缓冲使用 sendto；向量使用 sendmsg 设置 msg_name。
+     *  - EAGAIN 时注册 EPOLLOUT 等待；完成或错误后结束。
      */
-    struct sendto_awaiter : slot_base<sendto_awaiter> {
-        const void*        buf;
-        size_t             len;
-        const sockaddr_in* dest;
-        size_t             sent { 0 };
-        sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d)
-            : slot_base<sendto_awaiter>(s, s._send_q), buf(b), len(l), dest(d)
+    struct send_awaiter : tp_base<send_awaiter> {
+        // 数据模式
+        bool               use_vec { false };
+        const char*        buf { nullptr };
+        size_t             len { 0 };
+        std::vector<iovec> vec;
+        // 目的地址（可选）
+        bool        has_dest { false };
+        sockaddr_in dest {};
+        // 结果
+        ssize_t nsent { 0 };
+        // 单缓冲（已连接）
+        send_awaiter(udp_socket& s, const void* b, size_t l)
+            : tp_base<send_awaiter>(s, s._send_q), use_vec(false), buf(static_cast<const char*>(b)), len(l)
         {
             this->route_ctx  = &this->owner._cbq;
             this->route_post = &callback_wq<lock>::post_adapter;
         }
-        int attempt_once()
+        // 单缓冲 + 目的地址（未连接）
+        send_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in& d)
+            : tp_base<send_awaiter>(s, s._send_q)
+            , use_vec(false)
+            , buf(static_cast<const char*>(b))
+            , len(l)
+            , has_dest(true)
+            , dest(d)
         {
-            while (sent < len) {
-                ssize_t n = ::sendto(this->owner.native_handle(),
-                                     (const char*)buf + sent,
-                                     len - sent,
-                                     MSG_DONTWAIT | MSG_NOSIGNAL,
-                                     (const sockaddr*)dest,
-                                     sizeof(*dest));
-                if (n > 0) {
-                    sent += (size_t)n;
-                    continue;
-                }
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                    return -1;
-                break;
-            }
-            return 0; // done or error
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
-        static void lock_acquired_cb(worknode* w)
+        // 向量（已连接）
+        send_awaiter(udp_socket& s, const struct iovec* iov, int iovcnt)
+            : tp_base<send_awaiter>(s, s._send_q), use_vec(true)
         {
-            auto* self = static_cast<sendto_awaiter*>(w);
-            while (true) {
-                int r = self->attempt_once();
-                if (r == -1) { // would block
-                    self->func = &sendto_awaiter::drive_cb;
-                    register_wait(self, true);
-                    return;
-                }
-                // 完成 或 错误
-                slot_base<sendto_awaiter>::release(self);
-                self->func = &io_waiter_base::resume_cb;
-                if (self->h)
-                    self->h.resume();
-                return;
+            vec.reserve((size_t)iovcnt);
+            for (int i = 0; i < iovcnt; ++i) {
+                vec.push_back(iov[i]);
+                len += iov[i].iov_len; // 复用 len 作为总字节
             }
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
-        static void drive_cb(worknode* w)
+        // 向量 + 目的地址（未连接）
+        send_awaiter(udp_socket& s, const struct iovec* iov, int iovcnt, const sockaddr_in& d)
+            : tp_base<send_awaiter>(s, s._send_q), use_vec(true), has_dest(true), dest(d)
         {
-            auto* self = static_cast<sendto_awaiter*>(w);
-            while (true) {
-                int r = self->attempt_once();
-                if (r == -1) { // still waiting
-                    self->func = &sendto_awaiter::drive_cb;
-                    register_wait(self, false);
-                    return;
-                }
-                slot_base<sendto_awaiter>::release(self);
-                self->func = &io_waiter_base::resume_cb;
-                if (self->h)
-                    self->h.resume();
-                return;
+            vec.reserve((size_t)iovcnt);
+            for (int i = 0; i < iovcnt; ++i) {
+                vec.push_back(iov[i]);
+                len += iov[i].iov_len;
             }
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
-        static void register_wait(sendto_awaiter* self, bool /*first*/)
+        static void register_wait(send_awaiter* self, bool /*first*/)
         {
             self->owner.reactor()->add_waiter_custom(self->owner.native_handle(), EPOLLOUT, self);
         }
-        bool    await_ready() noexcept { return false; }
+        int attempt_once()
+        {
+            if (!use_vec) {
+                if (has_dest) {
+                    nsent = ::sendto(this->owner.native_handle(),
+                                     buf,
+                                     len,
+                                     MSG_DONTWAIT | MSG_NOSIGNAL,
+                                     (const sockaddr*)&dest,
+                                     sizeof(dest));
+                } else {
+                    nsent = ::send(this->owner.native_handle(), buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                }
+            } else {
+                if (has_dest) {
+                    msghdr msg {};
+                    msg.msg_name    = &dest;
+                    msg.msg_namelen = sizeof(dest);
+                    msg.msg_iov     = vec.data();
+                    msg.msg_iovlen  = (size_t)vec.size();
+                    nsent           = ::sendmsg(this->owner.native_handle(), &msg, MSG_DONTWAIT);
+                } else {
+                    nsent = ::writev(this->owner.native_handle(), vec.data(), (int)vec.size());
+                }
+            }
+            if (nsent >= 0)
+                return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -1;
+            return 0;
+        }
         ssize_t await_resume() noexcept
         {
-            if (sent == 0 && this->owner.closed()) {
+            if (nsent < 0 && this->owner.closed()) {
                 errno = ECANCELED;
                 return -1;
             }
-            return (ssize_t)sent;
+            return nsent;
         }
     };
-    /**
-     * @brief 获取 sendto awaiter。
-     */
-    sendto_awaiter send_to(const void* buf, size_t len, const sockaddr_in& dest)
+    /** @brief 已连接 UDP：单缓冲发送。*/
+    send_awaiter send(const void* buf, size_t len) { return send_awaiter(*this, buf, len); }
+    /** @brief 未连接 UDP：单缓冲 + 目的地址发送。*/
+    send_awaiter send_to(const void* buf, size_t len, const sockaddr_in& dest)
     {
-        return sendto_awaiter(*this, buf, len, &dest);
+        return send_awaiter(*this, buf, len, dest);
+    }
+    /** @brief 已连接 UDP：向量发送。*/
+    send_awaiter sendv(const struct iovec* iov, int iovcnt) { return send_awaiter(*this, iov, iovcnt); }
+    /** @brief 未连接 UDP：向量 + 目的地址发送。*/
+    send_awaiter sendv_to(const struct iovec* iov, int iovcnt, const sockaddr_in& dest)
+    {
+        return send_awaiter(*this, iov, iovcnt, dest);
     }
 
 private:

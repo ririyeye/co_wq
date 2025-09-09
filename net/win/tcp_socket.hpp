@@ -349,19 +349,59 @@ public:
     };
     recv_all_awaiter recv_all(void* buf, size_t len) { return recv_all_awaiter(*this, buf, len); }
     /**
-     * @brief 发送一次（最多 len 剩余）；可能部分发送；返回已发送字节数或错误。
+     * @brief 统一 TCP 发送 awaiter：支持单缓冲/向量 + 部分/全部语义。
+     *
+     * 语义：
+     *  - 部分（partial）：尽力发送一次，可能返回 < 请求长度。
+     *  - 全部（full）：循环推进，直到总字节数发送完成或遇到错误/对端关闭。
+     *  - 向量发送使用 WSASend 的多缓冲功能，内部推进 WSABUF 指针与长度。
+     * 并发：
+     *  - 通过 _send_q 串行化，避免同一 socket 并发写。
+     * 调度：
+     *  - Overlapped/IOCP 完成后由 callback_wq 路由回主执行队列，保持回调有序。
      */
     struct send_awaiter : serial_slot_awaiter<send_awaiter, tcp_socket> {
-        const char* buf;
-        size_t      len;
-        size_t      sent { 0 };
-        ssize_t     err { 0 };
-        iocp_ovl    ovl;
-        bool        inflight { false };
-        bool        finished { false };
-        send_awaiter(tcp_socket& s, const void* b, size_t l)
-            : serial_slot_awaiter<send_awaiter, tcp_socket>(s, s._send_q), buf((const char*)b), len(l)
+        // 配置
+        bool use_vec { false };
+        bool full { false };
+        // 单缓冲
+        const char* buf { nullptr };
+        size_t      len { 0 };
+        // 向量
+        std::vector<WSABUF> bufs;
+        size_t              total { 0 };
+        // 进度/状态
+        size_t   sent { 0 };
+        ssize_t  err { 0 };
+        iocp_ovl ovl;
+        bool     inflight { false };
+        bool     finished { false };
+        // 单缓冲
+        send_awaiter(tcp_socket& s, const void* b, size_t l, bool full_mode)
+            : serial_slot_awaiter<send_awaiter, tcp_socket>(s, s._send_q)
+            , use_vec(false)
+            , full(full_mode)
+            , buf((const char*)b)
+            , len(l)
+            , total(l)
         {
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
+        // 向量
+        send_awaiter(tcp_socket& s, const struct iovec* iov, int iovcnt, bool full_mode)
+            : serial_slot_awaiter<send_awaiter, tcp_socket>(s, s._send_q), use_vec(true), full(full_mode)
+        {
+            bufs.reserve(iovcnt);
+            for (int i = 0; i < iovcnt; ++i) {
+                WSABUF b;
+                b.len = (ULONG)iov[i].iov_len;
+                b.buf = (CHAR*)iov[i].iov_base;
+                bufs.push_back(b);
+                total += b.len;
+            }
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter       = this;
             this->route_ctx  = &this->owner._cbq;
@@ -372,27 +412,70 @@ public:
             auto* self = static_cast<send_awaiter*>(w);
             self->drive();
         }
+        void compact()
+        {
+            while (!bufs.empty() && bufs.front().len == 0)
+                bufs.erase(bufs.begin());
+        }
+        void advance(DWORD done)
+        {
+            sent += done;
+            if (!use_vec)
+                return;
+            DWORD remain = done;
+            for (auto& b : bufs) {
+                if (remain >= b.len) {
+                    remain -= b.len;
+                    b.len = 0;
+                    b.buf = nullptr;
+                } else {
+                    b.buf += remain;
+                    b.len -= remain;
+                    remain = 0;
+                    break;
+                }
+            }
+        }
         void issue()
         {
-            size_t remain = len - sent;
-            if (remain == 0) {
-                finish();
-                return;
-            }
-            WSABUF wb { (ULONG)remain, (CHAR*)(buf + sent) };
-            DWORD  done = 0, flags = 0;
-            this->func = &send_awaiter::drive_cb;
-            int r      = WSASend((SOCKET)this->owner._fd, &wb, 1, &done, flags, &ovl, nullptr);
-            if (r == 0) { // immediate
-                sent += done;
-                if (sent >= len) {
+            DWORD done  = 0;
+            DWORD flags = 0;
+            this->func  = &send_awaiter::drive_cb;
+            if (!use_vec) {
+                size_t remain = len - sent;
+                if (remain == 0) {
                     finish();
                     return;
                 }
-                return;
+                WSABUF wb { (ULONG)remain, (CHAR*)(buf + sent) };
+                int    r = WSASend((SOCKET)this->owner._fd, &wb, 1, &done, flags, &ovl, nullptr);
+                if (r == 0) { // immediate
+                    advance(done);
+                    if (!full || sent >= total) {
+                        finish();
+                        return;
+                    }
+                    return;
+                }
+            } else {
+                compact();
+                if (bufs.empty()) {
+                    finish();
+                    return;
+                }
+                int r = WSASend((SOCKET)this->owner._fd, bufs.data(), (DWORD)bufs.size(), &done, flags, &ovl, nullptr);
+                if (r == 0) { // immediate
+                    if (done)
+                        advance(done);
+                    if (!full || sent >= total) {
+                        finish();
+                        return;
+                    }
+                    return;
+                }
             }
             int e = WSAGetLastError();
-            if (r == SOCKET_ERROR && e == WSA_IO_PENDING) {
+            if (e == WSA_IO_PENDING) {
                 inflight = true;
                 return;
             }
@@ -404,12 +487,20 @@ public:
         }
         void drive()
         {
-            while (!finished && sent < len && err == 0) {
+            if (!full) {
+                // 部分语义：发起一次
+                issue();
+                if (!inflight && !finished)
+                    finish();
+                return;
+            }
+            // 全部语义：直到 total 完成
+            while (!finished && sent < total && err == 0) {
                 issue();
                 if (inflight)
                     return;
             }
-            if (!finished && (err < 0 || sent >= len))
+            if (!finished && (err < 0 || sent >= total))
                 finish();
         }
         static void drive_cb(worknode* w)
@@ -419,9 +510,10 @@ public:
                 return;
             DWORD tr = 0, fl = 0;
             if (WSAGetOverlappedResult((SOCKET)self->owner._fd, &self->ovl, &tr, FALSE, &fl)) {
-                self->sent += tr;
+                if (tr)
+                    self->advance(tr);
                 self->inflight = false;
-                if (self->sent >= self->len) {
+                if (!self->full || self->sent >= self->total) {
                     self->finish();
                     return;
                 }
@@ -453,160 +545,14 @@ public:
         }
         ssize_t await_resume() noexcept { return err < 0 ? err : (ssize_t)sent; }
     };
-    send_awaiter send(const void* buf, size_t len) { return send_awaiter(*this, buf, len); }
-    /**
-     * @brief 循环发送直到缓冲区全部发送或遇到错误；成功返回 len。
-     */
-    struct send_all_awaiter : send_awaiter {
-        using send_awaiter::send_awaiter;
-    };
-    send_all_awaiter send_all(const void* buf, size_t len) { return send_all_awaiter(*this, buf, len); }
-    /**
-     * @brief 多缓冲发送（WSASend 支持）；可能部分完成；内部维护进度并推进 WSABUF。
-     * @note await_resume 返回已发送字节数；错误返回 -1。
-     */
-    struct sendv_awaiter : serial_slot_awaiter<sendv_awaiter, tcp_socket> {
-        std::vector<WSABUF> bufs;
-        size_t              total { 0 };
-        size_t              sent { 0 };
-        ssize_t             err { 0 };
-        iocp_ovl            ovl;
-        bool                inflight { false };
-        bool                finished { false };
-        sendv_awaiter(tcp_socket& s, const struct iovec* iov, int iovcnt)
-            : serial_slot_awaiter<sendv_awaiter, tcp_socket>(s, s._send_q)
-        {
-            bufs.reserve(iovcnt);
-            for (int i = 0; i < iovcnt; ++i) {
-                WSABUF b;
-                b.len = (ULONG)iov[i].iov_len;
-                b.buf = (CHAR*)iov[i].iov_base;
-                bufs.push_back(b);
-                total += b.len;
-            }
-            ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &this->owner._cbq;
-            this->route_post = &callback_wq<lock>::post_adapter;
-        }
-        static void lock_acquired_cb(worknode* w)
-        {
-            auto* self = static_cast<sendv_awaiter*>(w);
-            self->drive();
-        }
-        void compact()
-        {
-            while (!bufs.empty() && bufs.front().len == 0)
-                bufs.erase(bufs.begin());
-        }
-        void issue()
-        {
-            compact();
-            if (bufs.empty()) {
-                finish();
-                return;
-            }
-            DWORD done  = 0;
-            DWORD flags = 0;
-            this->func  = &sendv_awaiter::drive_cb;
-            int r = WSASend((SOCKET)this->owner._fd, bufs.data(), (DWORD)bufs.size(), &done, flags, &ovl, nullptr);
-            if (r == 0) { // immediate completion
-                if (done) {
-                    advance(done);
-                    if (sent >= total) {
-                        finish();
-                        return;
-                    }
-                }
-                return; // let drive() loop continue
-            }
-            int e = WSAGetLastError();
-            if (r == SOCKET_ERROR && e == WSA_IO_PENDING) {
-                inflight = true;
-                return;
-            }
-            if (e == WSAECONNRESET)
-                this->owner._tx_shutdown = true;
-            if (sent == 0)
-                err = -1;
-            finish();
-        }
-        void advance(DWORD done)
-        {
-            sent += done;
-            DWORD remain = done;
-            for (auto& b : bufs) {
-                if (remain >= b.len) {
-                    remain -= b.len;
-                    b.len = 0;
-                    b.buf = nullptr;
-                } else {
-                    b.buf += remain;
-                    b.len -= remain;
-                    remain = 0;
-                    break;
-                }
-            }
-        }
-        void drive()
-        {
-            while (!finished && sent < total && err == 0) {
-                issue();
-                if (inflight)
-                    return; // wait for IOCP
-            }
-            if (!finished && (err < 0 || sent >= total))
-                finish();
-        }
-        static void drive_cb(worknode* w)
-        {
-            auto* self = static_cast<sendv_awaiter*>(w);
-            if (self->finished)
-                return;
-            DWORD tr = 0, fl = 0;
-            if (WSAGetOverlappedResult((SOCKET)self->owner._fd, &self->ovl, &tr, FALSE, &fl)) {
-                self->advance(tr);
-                self->inflight = false;
-                if (self->sent >= self->total) {
-                    self->finish();
-                    return;
-                }
-                self->drive();
-                return;
-            } else {
-                if (self->sent == 0)
-                    self->err = -1;
-                self->finish();
-                return;
-            }
-        }
-        void finish()
-        {
-            if (finished)
-                return;
-            finished = true;
-            serial_slot_awaiter<sendv_awaiter, tcp_socket>::release(this);
-            this->func = &io_waiter_base::resume_cb;
-            if (this->h)
-                this->h.resume();
-        }
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h = h;
-            INIT_LIST_HEAD(&this->ws_node);
-            serial_acquire_or_enqueue(this->q, this->owner.serial_lock(), this->owner.exec(), *this);
-        }
-        ssize_t await_resume() noexcept { return err < 0 ? err : (ssize_t)sent; }
-    };
-    sendv_awaiter sendv(const struct iovec* iov, int iovcnt) { return sendv_awaiter(*this, iov, iovcnt); }
-    /**
-     * @brief sendv 的 “全部发送” 语义版本，复用逻辑（当前与基类一致，当需要严格区分可扩展）。
-     */
-    struct sendv_all_awaiter : sendv_awaiter {
-        using sendv_awaiter::sendv_awaiter;
-    };
-    sendv_all_awaiter send_all(const struct iovec* iov, int iovcnt) { return sendv_all_awaiter(*this, iov, iovcnt); }
+    // API：部分/全部 + 单缓冲/向量
+    send_awaiter send(const void* buf, size_t len) { return send_awaiter(*this, buf, len, /*full*/ false); }
+    send_awaiter send_all(const void* buf, size_t len) { return send_awaiter(*this, buf, len, /*full*/ true); }
+    send_awaiter sendv(const struct iovec* iov, int iovcnt) { return send_awaiter(*this, iov, iovcnt, /*full*/ false); }
+    send_awaiter send_all(const struct iovec* iov, int iovcnt)
+    {
+        return send_awaiter(*this, iov, iovcnt, /*full*/ true);
+    }
 
 private:
     friend class fd_workqueue<lock, Reactor>;
