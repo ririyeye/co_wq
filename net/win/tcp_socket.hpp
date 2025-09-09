@@ -51,7 +51,7 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
  * @tparam Reactor 反应器模板（在 Windows 下实际为 iocp_reactor，默认模板参数与 linux 保持形式统一）
  * @brief TCP 套接字封装，提供协程 await 接口。
  */
-template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_socket {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class tcp_socket {
 public:
     template <class D> using tp_base         = two_phase_drain_awaiter<D, tcp_socket>;
     tcp_socket()                             = delete;
@@ -119,53 +119,94 @@ public:
     void mark_tx_shutdown() { _tx_shutdown = true; }
     struct connect_awaiter : io_waiter_base {
         /**
-         * @brief 异步连接 awaiter（简化实现：依赖非阻塞 connect + 写事件）
-         * @note 未使用 ConnectEx；若需要高性能并发连接，可后续扩展。
-         * 成功返回 0，失败返回 -1。
+         * @brief 基于 ConnectEx 的真正异步连接 awaiter。成功返回 0，失败返回 -1。
          */
-        tcp_socket& sock;
-        std::string host;
-        uint16_t    port;
-        int         ret { 0 };
-        connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p) { }
-        bool await_ready() const noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> awaiting)
+        tcp_socket&    sock;
+        std::string    host;
+        uint16_t       port;
+        int            ret { -1 };
+        iocp_ovl       ovl;
+        LPFN_CONNECTEX _connectex { nullptr };
+        sockaddr_in    _addr {};
+        bool           issued { false };
+        connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p)
         {
-            this->h          = awaiting;
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter       = this;
             this->route_ctx  = &sock._cbq;
             this->route_post = &callback_wq<lock>::post_adapter;
-            INIT_LIST_HEAD(&this->ws_node);
-            sockaddr_in addr {};
-            addr.sin_family = AF_INET;
-            addr.sin_port   = htons(port);
-            if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-                ret = -1;
-                post_via_route(sock._exec, *this);
-                return;
+        }
+        bool load_connectex()
+        {
+            if (_connectex)
+                return true;
+            GUID  guid  = WSAID_CONNECTEX;
+            DWORD bytes = 0;
+            if (WSAIoctl((SOCKET)sock._fd,
+                         SIO_GET_EXTENSION_FUNCTION_POINTER,
+                         &guid,
+                         sizeof(guid),
+                         &_connectex,
+                         sizeof(_connectex),
+                         &bytes,
+                         NULL,
+                         NULL)
+                == SOCKET_ERROR) {
+                _connectex = nullptr;
+                return false;
             }
-            int r = ::connect((SOCKET)sock._fd, (sockaddr*)&addr, sizeof(addr));
-            if (r == 0) {
+            return true;
+        }
+        bool await_ready() noexcept
+        {
+            INIT_LIST_HEAD(&this->ws_node);
+            // 解析目标地址
+            _addr.sin_family = AF_INET;
+            _addr.sin_port   = htons(port);
+            if (InetPtonA(AF_INET, host.c_str(), &_addr.sin_addr) <= 0) {
+                ret = -1;
+                return true;
+            }
+            if (!load_connectex()) {
+                ret = -1;
+                return true;
+            }
+            // ConnectEx 要求先 bind 本地地址（INADDR_ANY:0）
+            sockaddr_in local {};
+            local.sin_family      = AF_INET;
+            local.sin_addr.s_addr = INADDR_ANY;
+            local.sin_port        = 0;
+            ::bind((SOCKET)sock._fd, (sockaddr*)&local, sizeof(local)); // 若已绑定可忽略错误
+            // 发起 Overlapped 连接
+            this->func = &io_waiter_base::resume_cb;
+            BOOL ok    = _connectex((SOCKET)sock._fd, (sockaddr*)&_addr, sizeof(_addr), nullptr, 0, nullptr, &ovl);
+            issued     = true;
+            if (ok) {
+                // 立即完成
+                setsockopt((SOCKET)sock._fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
                 ret = 0;
-                post_via_route(sock._exec, *this);
-                return;
+                return true;
             }
             int err = WSAGetLastError();
-            if (r == SOCKET_ERROR && (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS)) {
-                // emulate async: use reactor immediate post after short delay (no real write readiness tracking yet)
-                sock._reactor->add_waiter(sock._fd, EPOLLOUT, this);
-                return;
+            if (err != ERROR_IO_PENDING) {
+                ret = -1;
+                return true;
             }
-            ret = -1;
-            post_via_route(sock._exec, *this);
+            return false; // pending
         }
-        int await_resume() noexcept
+        void await_suspend(std::coroutine_handle<> awaiting) { this->h = awaiting; }
+        int  await_resume() noexcept
         {
-            if (ret == 0) {
-                int err = 0;
-                int len = sizeof(err);
-                if (getsockopt((SOCKET)sock._fd, SOL_SOCKET, SO_ERROR, (char*)&err, &len) == 0 && err == 0)
-                    return 0;
-                return -1;
+            if (ret == 0)
+                return 0;
+            if (issued && ret != 0) {
+                DWORD tr = 0, fl = 0;
+                if (WSAGetOverlappedResult((SOCKET)sock._fd, &ovl, &tr, FALSE, &fl)) {
+                    setsockopt((SOCKET)sock._fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+                    ret = 0;
+                } else {
+                    ret = -1;
+                }
             }
             return ret;
         }

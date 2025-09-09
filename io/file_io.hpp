@@ -14,7 +14,7 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd decl
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class file_handle {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class file_handle {
 public:
     // Helper alias to simplify two-phase awaiter declarations
     template <class D> using tp_base           = two_phase_drain_awaiter<D, file_handle>;

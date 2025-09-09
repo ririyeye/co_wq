@@ -41,7 +41,7 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue; // fwd
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class udp_socket {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class udp_socket {
 public:
     udp_socket()                             = delete;
     udp_socket(const udp_socket&)            = delete;

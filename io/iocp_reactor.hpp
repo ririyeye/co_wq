@@ -109,3 +109,10 @@ private:
 
 } // namespace co_wq::net
 #endif // _WIN32
+
+// Provide explicit alias iocp_reactor for readability on Windows builds.
+#ifdef _WIN32
+namespace co_wq::net {
+template <lockable lock> using iocp_reactor = epoll_reactor<lock>;
+}
+#endif // _WIN32

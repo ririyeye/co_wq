@@ -17,7 +17,7 @@ namespace co_wq::net {
 // 统一 accept 语义常量（与 Linux 对齐）
 inline constexpr int k_accept_fatal = -2;
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class tcp_listener {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class tcp_listener {
 public:
     explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(reactor)
     {
@@ -66,30 +66,21 @@ public:
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter = this;
         }
-        // Windows 模型: 不尝试 fast path 的 await_ready，统一走 await_suspend。
-        bool await_ready() noexcept { return false; }
-        void await_suspend(std::coroutine_handle<> awaiting)
+        // fast path: 在 await_ready 里直接发起 AcceptEx，若立即完成则不挂起
+        bool await_ready() noexcept
         {
-            this->h    = awaiting;
-            this->func = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
-            issue();
-        }
-        void issue()
-        {
             SOCKET as = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (as == INVALID_SOCKET) {
                 newfd = k_accept_fatal;
-                lst._exec.post(*this);
-                return;
+                return true;
             }
             u_long m = 1;
             ioctlsocket(as, FIONBIO, &m);
             if (!lst._acceptex) {
                 newfd = k_accept_fatal;
                 ::closesocket(as);
-                lst._exec.post(*this);
-                return;
+                return true;
             }
             BOOL ok = lst._acceptex(lst._sock,
                                     as,
@@ -101,27 +92,39 @@ public:
                                     &ovl);
             if (ok) { // immediate completion
                 newfd = (int)as;
-                lst._reactor.post_completion(this);
-                return;
+                // update accept context immediately
+                setsockopt(as, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, (char*)&lst._sock, sizeof(lst._sock));
+                return true;
             }
             int err = WSAGetLastError();
             if (err != ERROR_IO_PENDING) {
                 ::closesocket(as);
                 newfd = k_accept_fatal;
-                lst._exec.post(*this);
-                return;
+                return true;
             }
             _accepted = (int)as; // pending, completion via IOCP
+            return false;
+        }
+        void await_suspend(std::coroutine_handle<> awaiting)
+        {
+            this->h    = awaiting;
+            this->func = &io_waiter_base::resume_cb;
         }
         int await_resume() noexcept
         {
             if (newfd == k_accept_fatal)
                 return k_accept_fatal;
             if (newfd == -1) {
-                // completion path: need to get result
-                DWORD transferred = 0;
-                if (GetOverlappedResult((HANDLE)lst._reactor.iocp_handle(), &ovl, &transferred, FALSE)) {
+                // completion path: query completion with socket-based API
+                DWORD tr = 0, fl = 0;
+                if (WSAGetOverlappedResult(lst._sock, &ovl, &tr, FALSE, &fl)) {
                     newfd = _accepted;
+                    // update context after completion
+                    setsockopt((SOCKET)newfd,
+                               SOL_SOCKET,
+                               SO_UPDATE_ACCEPT_CONTEXT,
+                               (char*)&lst._sock,
+                               sizeof(lst._sock));
                 } else {
                     newfd = k_accept_fatal;
                 }
@@ -160,14 +163,14 @@ private:
     LPFN_ACCEPTEX    _acceptex { nullptr };
 };
 
-template <lockable lock, template <class> class Reactor = epoll_reactor>
+template <lockable lock, template <class> class Reactor = iocp_reactor>
 inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock, Reactor>& lst)
 {
     int fd = co_await lst.accept();
     co_return fd;
 }
 
-template <lockable lock, template <class> class Reactor = epoll_reactor>
+template <lockable lock, template <class> class Reactor = iocp_reactor>
 inline Task<tcp_socket<lock, Reactor>, Work_Promise<lock, tcp_socket<lock, Reactor>>>
 async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor>& lst)
 {

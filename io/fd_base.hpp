@@ -21,7 +21,7 @@ template <lockable lock, template <class> class Reactor> class fd_workqueue; // 
 
 #ifdef _WIN32
 // ---- Windows implementation ----
-template <lockable lock, template <class> class Reactor = epoll_reactor> class fd_object {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class fd_object {
 public:
     fd_object(const fd_object&)            = delete;
     fd_object& operator=(const fd_object&) = delete;
@@ -71,7 +71,7 @@ protected:
     friend class fd_workqueue<lock, Reactor>;
 };
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class fd_workqueue {
+template <lockable lock, template <class> class Reactor = iocp_reactor> class fd_workqueue {
 public:
     explicit fd_workqueue(workqueue<lock>& base) : _base(base), _reactor(base) { }
     workqueue<lock>&           base() { return _base; }
