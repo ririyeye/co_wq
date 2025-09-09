@@ -1,6 +1,7 @@
 // tcp_socket.hpp - TCP socket 协程原语
 #pragma once
 
+#include "callback_wq.hpp"
 #include "epoll_reactor.hpp" // 默认 Reactor
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
@@ -109,7 +110,9 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h)
         {
-            this->h = h;
+            this->h          = h;
+            this->route_ctx  = &sock._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_in addr {};
             addr.sin_family = AF_INET;
@@ -161,7 +164,11 @@ public:
         void*   buf;
         size_t  len;
         ssize_t nread { -1 };
-        recv_awaiter(tcp_socket& s, void* b, size_t l) : tp_base<recv_awaiter>(s, s._recv_q), buf(b), len(l) { }
+        recv_awaiter(tcp_socket& s, void* b, size_t l) : tp_base<recv_awaiter>(s, s._recv_q), buf(b), len(l)
+        {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
         // attempt_once: >0 继续；0 完成；-1 需等待。这里一次 recv 完成后直接返回 0。
         int attempt_once()
         {
@@ -209,6 +216,8 @@ public:
         recv_all_awaiter(tcp_socket& s, void* b, size_t l)
             : tp_base<recv_all_awaiter>(s, s._recv_q), buf(static_cast<char*>(b)), len(l)
         {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         int attempt_once()
         {
@@ -242,7 +251,11 @@ public:
         const void* buf;
         size_t      len;
         size_t      sent { 0 };
-        send_awaiter(tcp_socket& s, const void* b, size_t l) : sock(s), buf(b), len(l) { }
+        send_awaiter(tcp_socket& s, const void* b, size_t l) : sock(s), buf(b), len(l)
+        {
+            this->route_ctx  = &sock._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
         // 尽可能写到 EAGAIN 再决定挂起：EPOLLET 下必须耗尽当前可写边沿，否则可能失去后续事件导致挂起。
         bool await_ready() noexcept
         {
@@ -320,6 +333,8 @@ public:
                 vec.push_back(iov[i]);
                 total += iov[i].iov_len;
             }
+            this->route_ctx  = &sock._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         bool drain_once() // 单次写尝试；返回 true 表示完成或错误
         {
@@ -396,7 +411,11 @@ public:
     template <typename Derived> struct send_full_base : tp_base<Derived> {
         size_t  sent { 0 };
         ssize_t err { 0 }; // <0 记录错误
-        send_full_base(tcp_socket& s) : tp_base<Derived>(s, s._send_q) { }
+        send_full_base(tcp_socket& s) : tp_base<Derived>(s, s._send_q)
+        {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
         // attempt_once: >0 有进展继续；0 完成；-1 需等待
         ssize_t     finish_result() const noexcept { return (err < 0 && sent == 0) ? err : (ssize_t)sent; }
         static void register_wait(send_full_base* self, bool /*first*/)
@@ -525,9 +544,10 @@ private:
     bool             _rx_eof { false };
     bool             _tx_shutdown { false };
     // IO 串行锁与等待队列（发送 / 接收分别串行）
-    lock         _io_serial_lock;
-    serial_queue _send_q;
-    serial_queue _recv_q;
+    lock              _io_serial_lock;
+    serial_queue      _send_q;
+    serial_queue      _recv_q;
+    callback_wq<lock> _cbq { _exec };
 };
 
 // wrappers

@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "callback_wq.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
@@ -88,14 +89,16 @@ public:
         // 注意: 参数名避免与基类 io_waiter_base::h 成员同名引发 MSVC C4458 警告
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h = coro;
+            this->h          = coro;
+            this->route_ctx  = &us._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_in addr {};
             addr.sin_family = AF_INET;
             addr.sin_port   = htons(port);
             if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
                 ret = -1;
-                us._exec.post(*this);
+                post_via_route(us._exec, *this);
                 return;
             }
             int r = ::connect(us._sock, (sockaddr*)&addr, sizeof(addr));
@@ -106,7 +109,7 @@ public:
                 if (e != 0)
                     ret = -1;
             }
-            us._exec.post(*this);
+            post_via_route(us._exec, *this);
         }
         int await_resume() noexcept { return ret; }
     };
@@ -131,9 +134,11 @@ public:
             : serial_slot_awaiter<recvfrom_awaiter, udp_socket>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter = this;
-            wbuf.len   = (ULONG)l;
-            wbuf.buf   = (CHAR*)b;
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+            wbuf.len         = (ULONG)l;
+            wbuf.buf         = (CHAR*)b;
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -223,9 +228,11 @@ public:
             : serial_slot_awaiter<sendto_awaiter, udp_socket>(s, s._send_q), buf(b), len(l), dest(d)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter = this;
-            wbuf.len   = (ULONG)l;
-            wbuf.buf   = (CHAR*)const_cast<void*>(b);
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+            wbuf.len         = (ULONG)l;
+            wbuf.buf         = (CHAR*)const_cast<void*>(b);
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -300,13 +307,14 @@ private:
         ioctlsocket(_sock, FIONBIO, &m);
         _reactor->add_fd((int)_sock);
     }
-    workqueue<lock>& _exec;
-    Reactor<lock>*   _reactor { nullptr };
-    SOCKET           _sock { INVALID_SOCKET };
-    lock             _io_serial_lock; // 串行锁
-    serial_queue     _send_q;         // 发送串行队列
-    serial_queue     _recv_q;         // 接收串行队列
-    bool             _closed { false };
+    workqueue<lock>&  _exec;
+    Reactor<lock>*    _reactor { nullptr };
+    SOCKET            _sock { INVALID_SOCKET };
+    lock              _io_serial_lock; // 串行锁
+    serial_queue      _send_q;         // 发送串行队列
+    serial_queue      _recv_q;         // 接收串行队列
+    bool              _closed { false };
+    callback_wq<lock> _cbq { _exec }; // per-socket ordered callback dispatcher
 };
 
 template <lockable lock, template <class> class Reactor>

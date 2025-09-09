@@ -1,6 +1,7 @@
 // file_io.hpp - async file read/write (non-blocking + epoll) with internal serialization
 #pragma once
 #ifdef __linux__
+#include "callback_wq.hpp"
 #include "epoll_reactor.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
@@ -67,7 +68,11 @@ public:
         ssize_t nrd { -1 };
         off_t*  pofs { nullptr };
         bool    use_offset { false };
-        read_awaiter(file_handle& f, void* b, size_t l) : tp_base<read_awaiter>(f, f._read_q), buf(b), len(l) { }
+        read_awaiter(file_handle& f, void* b, size_t l) : tp_base<read_awaiter>(f, f._read_q), buf(b), len(l)
+        {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
         read_awaiter(file_handle& f, void* b, size_t l, off_t& ofs)
             : tp_base<read_awaiter>(f, f._read_q), buf(b), len(l), pofs(&ofs), use_offset(true)
         {
@@ -118,6 +123,8 @@ public:
         bool        use_offset { false };
         write_awaiter(file_handle& f, const void* b, size_t l) : tp_base<write_awaiter>(f, f._write_q), buf(b), len(l)
         {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         write_awaiter(file_handle& f, const void* b, size_t l, off_t& ofs)
             : tp_base<write_awaiter>(f, f._write_q), buf(b), len(l), pofs(&ofs), use_offset(true)
@@ -180,13 +187,14 @@ private:
         serial_queue_init(_read_q);
         serial_queue_init(_write_q);
     }
-    workqueue<lock>& _exec;
-    Reactor<lock>*   _reactor { nullptr };
-    int              _fd { -1 };
-    lock             _io_serial_lock;
-    serial_queue     _read_q;
-    serial_queue     _write_q;
-    bool             _closed { false };
+    workqueue<lock>&  _exec;
+    Reactor<lock>*    _reactor { nullptr };
+    int               _fd { -1 };
+    lock              _io_serial_lock;
+    serial_queue      _read_q;
+    serial_queue      _write_q;
+    bool              _closed { false };
+    callback_wq<lock> _cbq { _exec };
     // release handled via serial_slot_awaiter
 };
 
@@ -198,6 +206,7 @@ inline file_handle<lock, Reactor> make_file_handle(workqueue<lock>& exec, Reacto
 
 } // namespace co_wq::net
 #elif defined(_WIN32)
+#include "callback_wq.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
 #include <basetsd.h>
@@ -260,8 +269,10 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h    = coro;
-            this->func = &io_waiter_base::resume_cb;
+            this->h          = coro;
+            this->route_ctx  = &fh._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+            this->func       = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
             DWORD tr = 0;
             BOOL  ok = ReadFile(fh._h, buf, (DWORD)len, &tr, &ovl);
@@ -300,8 +311,10 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h    = coro;
-            this->func = &io_waiter_base::resume_cb;
+            this->h          = coro;
+            this->route_ctx  = &fh._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
+            this->func       = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
             DWORD tr = 0;
             BOOL  ok = WriteFile(fh._h, buf, (DWORD)len, &tr, &ovl);
@@ -335,9 +348,10 @@ private:
             throw std::runtime_error("invalid file handle");
         _reactor->add_fd((int)(intptr_t)_h);
     }
-    workqueue<lock>& _exec;
-    Reactor<lock>*   _reactor { nullptr };
-    HANDLE           _h { INVALID_HANDLE_VALUE };
+    workqueue<lock>&  _exec;
+    Reactor<lock>*    _reactor { nullptr };
+    HANDLE            _h { INVALID_HANDLE_VALUE };
+    callback_wq<lock> _cbq { _exec };
 };
 
 } // namespace co_wq::net

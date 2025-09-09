@@ -1,6 +1,7 @@
 // udp_socket.hpp - UDP socket coroutine primitives
 #pragma once
 
+#include "callback_wq.hpp"
 #include "epoll_reactor.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
@@ -81,7 +82,9 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h)
         {
-            this->h = h;
+            this->h          = h;
+            this->route_ctx  = &sock._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_in addr {};
             addr.sin_family = AF_INET;
@@ -130,6 +133,8 @@ public:
         recvfrom_awaiter(udp_socket& s, void* b, size_t l, sockaddr_in* oa, socklen_t* ol)
             : slot_base<recvfrom_awaiter>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
         {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         int attempt_once()
         {
@@ -209,6 +214,8 @@ public:
         sendto_awaiter(udp_socket& s, const void* b, size_t l, const sockaddr_in* d)
             : slot_base<sendto_awaiter>(s, s._send_q), buf(b), len(l), dest(d)
         {
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         int attempt_once()
         {
@@ -308,10 +315,11 @@ private:
     Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
     // IO 串行锁与队列
-    lock         _io_serial_lock;
-    serial_queue _send_q;
-    serial_queue _recv_q;
-    bool         _closed { false }; // 是否已关闭，用于取消待定操作
+    lock              _io_serial_lock;
+    serial_queue      _send_q;
+    serial_queue      _recv_q;
+    bool              _closed { false }; // 是否已关闭，用于取消待定操作
+    callback_wq<lock> _cbq { _exec };
     // release handled via serial_slot_awaiter
 };
 

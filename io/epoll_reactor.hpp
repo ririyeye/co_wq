@@ -91,7 +91,7 @@ public:
         }
         ::epoll_ctl(_epfd, EPOLL_CTL_DEL, fd, nullptr);
         for (auto& wi : to_resume) {
-            _exec.post(*wi.waiter); // 把 waiter 投递回主 workqueue
+            post_via_route(_exec, *wi.waiter); // 回调通过路由队列，保证顺序
         }
     }
 
@@ -177,7 +177,7 @@ private:
                     }
                 }
                 for (auto& wi : to_resume)
-                    _exec.post(*wi.waiter);
+                    post_via_route(_exec, *wi.waiter);
             }
         }
     }

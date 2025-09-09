@@ -10,6 +10,9 @@ namespace co_wq::net {
  */
 struct io_waiter_base : worknode {
     std::coroutine_handle<> h; ///< 目标协程句柄
+    // 可选：指定一个“回调队列”路由，保证在多线程执行器下按队列顺序执行
+    void* route_ctx { nullptr };
+    void (*route_post)(void* ctx, worknode* node) { nullptr };
     /**
      * @brief workqueue 投递回调：恢复协程执行。
      */
@@ -20,5 +23,15 @@ struct io_waiter_base : worknode {
             self->h.resume();
     }
 };
+
+// 通过 route_post（若设置）把节点投递到“串行回调队列”；否则直接投递到主执行队列。
+template <class Lock> inline void post_via_route(workqueue<Lock>& exec, worknode& node)
+{
+    auto& b = static_cast<io_waiter_base&>(node);
+    if (b.route_post)
+        b.route_post(b.route_ctx, &node);
+    else
+        exec.post(node);
+}
 
 } // namespace co_wq::net

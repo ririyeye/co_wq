@@ -59,7 +59,7 @@ public:
     void add_fd(int fd) { CreateIoCompletionPort((HANDLE)_get_socket(fd), _iocp, (ULONG_PTR)fd, 0); }
     void add_waiter(int, uint32_t, io_waiter_base* waiter)
     { // immediate post (not readiness-based)
-        _exec.post(*waiter);
+        post_via_route(_exec, *waiter);
     }
     void add_waiter_custom(int fd, uint32_t mask, io_waiter_base* waiter) { add_waiter(fd, mask, waiter); }
     void remove_fd(int fd)
@@ -68,7 +68,7 @@ public:
         closesocket(_get_socket(fd));
     }
     // helper used by overlapped operations to enqueue completion
-    void   post_completion(io_waiter_base* w) { _exec.post(*w); }
+    void   post_completion(io_waiter_base* w) { post_via_route(_exec, *w); }
     HANDLE iocp_handle() const noexcept { return _iocp; }
 
 private:
@@ -87,7 +87,7 @@ private:
                 auto* ovl = reinterpret_cast<iocp_ovl*>(povl);
                 if (ovl->waiter) {
                     // stash byte count in waiter->ws_node.prev (hack) is messy; better store in derived awaiter
-                    _exec.post(*ovl->waiter);
+                    post_via_route(_exec, *ovl->waiter);
                 }
             }
         }

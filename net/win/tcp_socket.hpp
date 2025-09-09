@@ -13,6 +13,7 @@
  */
 #pragma once
 
+#include "callback_wq.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
@@ -101,21 +102,21 @@ public:
         }
     }
     /** @return 是否已经执行过发送方向关闭 */
-    bool             tx_shutdown() const noexcept { return _tx_shutdown; }
+    bool tx_shutdown() const noexcept { return _tx_shutdown; }
     /** @return 是否已经读到 EOF（对端关闭或 0 字节读取）*/
-    bool             rx_eof() const noexcept { return _rx_eof; }
+    bool rx_eof() const noexcept { return _rx_eof; }
     /** @return 原始 socket 句柄 */
-    int              native_handle() const { return _fd; }
+    int native_handle() const { return _fd; }
     /** @return 关联的执行队列 */
     workqueue<lock>& exec() { return _exec; }
     /** @return 串行化用互斥锁 */
-    lock&            serial_lock() { return _io_serial_lock; }
+    lock& serial_lock() { return _io_serial_lock; }
     /** @return 关联的 Reactor */
-    Reactor<lock>*   reactor() { return _reactor; }
+    Reactor<lock>* reactor() { return _reactor; }
     /** 标记收到 EOF（内部使用）*/
-    void             mark_rx_eof() { _rx_eof = true; }
+    void mark_rx_eof() { _rx_eof = true; }
     /** 标记发送方向关闭（内部使用）*/
-    void             mark_tx_shutdown() { _tx_shutdown = true; }
+    void mark_tx_shutdown() { _tx_shutdown = true; }
     struct connect_awaiter : io_waiter_base {
         /**
          * @brief 异步连接 awaiter（简化实现：依赖非阻塞 connect + 写事件）
@@ -130,20 +131,22 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> awaiting)
         {
-            this->h = awaiting;
+            this->h          = awaiting;
+            this->route_ctx  = &sock._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_in addr {};
             addr.sin_family = AF_INET;
             addr.sin_port   = htons(port);
             if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
                 ret = -1;
-                sock._exec.post(*this);
+                post_via_route(sock._exec, *this);
                 return;
             }
             int r = ::connect((SOCKET)sock._fd, (sockaddr*)&addr, sizeof(addr));
             if (r == 0) {
                 ret = 0;
-                sock._exec.post(*this);
+                post_via_route(sock._exec, *this);
                 return;
             }
             int err = WSAGetLastError();
@@ -153,7 +156,7 @@ public:
                 return;
             }
             ret = -1;
-            sock._exec.post(*this);
+            post_via_route(sock._exec, *this);
         }
         int await_resume() noexcept
         {
@@ -182,7 +185,9 @@ public:
             : serial_slot_awaiter<recv_awaiter, tcp_socket>(s, s._recv_q), buf(b), len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter = this;
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -248,7 +253,9 @@ public:
             : serial_slot_awaiter<recv_all_awaiter, tcp_socket>(s, s._recv_q), buf((char*)b), len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter = this;
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -356,7 +363,9 @@ public:
             : serial_slot_awaiter<send_awaiter, tcp_socket>(s, s._send_q), buf((const char*)b), len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter = this;
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -476,7 +485,9 @@ public:
                 total += b.len;
             }
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter = this;
+            ovl.waiter       = this;
+            this->route_ctx  = &this->owner._cbq;
+            this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -620,14 +631,15 @@ private:
             ioctlsocket((SOCKET)_fd, FIONBIO, &m);
         }
     }
-    workqueue<lock>& _exec;
-    Reactor<lock>*   _reactor { nullptr };
-    int              _fd { -1 };
-    bool             _rx_eof { false };
-    bool             _tx_shutdown { false };
-    lock             _io_serial_lock; // unify naming with linux side
-    serial_queue     _send_q;         // serialized send operations
-    serial_queue     _recv_q;         // serialized recv operations
+    workqueue<lock>&  _exec;
+    Reactor<lock>*    _reactor { nullptr };
+    int               _fd { -1 };
+    bool              _rx_eof { false };
+    bool              _tx_shutdown { false };
+    lock              _io_serial_lock; // unify naming with linux side
+    serial_queue      _send_q;         // serialized send operations
+    serial_queue      _recv_q;         // serialized recv operations
+    callback_wq<lock> _cbq { _exec };  // per-socket ordered callback dispatcher
 };
 
 template <lockable lock>
