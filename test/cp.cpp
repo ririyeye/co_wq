@@ -8,7 +8,6 @@
 #include <sys/stat.h>
 #include <vector>
 
-
 using namespace co_wq;
 
 #ifdef USING_NET
@@ -60,7 +59,7 @@ int main(int argc, char** argv)
         std::cout << "usage: co_cp <src> <dst>\n";
         return 0;
     }
-    auto&                       wq = get_sys_workqueue();
+    auto&                       wq = get_sys_workqueue(0);
     net::fd_workqueue<SpinLock> fdwq(wq);
     auto                        tk      = file_copy_task(fdwq, argv[1], argv[2]);
     auto                        coro    = tk.get();
@@ -72,9 +71,7 @@ int main(int argc, char** argv)
         f->store(true, std::memory_order_release);
     };
     post_to(tk, wq);
-    while (!finished.load(std::memory_order_acquire)) {
-        while (wq.work_once()) { }
-    }
+    sys_wait_until(finished);
     size_t copied = coro.promise().result();
     std::cout << "copied bytes: " << copied << "\n";
     return 0;

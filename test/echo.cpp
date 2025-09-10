@@ -194,7 +194,8 @@ int main(int argc, char* argv[])
         std::signal(SIGINT, sigint_handler);
 #endif
     }
-    auto&                                    wq = get_sys_workqueue();
+    // 0 => 自动检测线程数
+    auto&                                    wq = get_sys_workqueue(0);
     net::fd_workqueue<SpinLock>              fdwq(wq); // 外部创建并传入协程
     Task<void, Work_Promise<SpinLock, void>> server_task { nullptr };
     Task<void, Work_Promise<SpinLock, void>> client_task { nullptr };
@@ -283,11 +284,7 @@ int main(int argc, char* argv[])
     }
 
     // 事件循环: 处理工作项，等待协程完成
-    while (!finished.load(std::memory_order_acquire)) {
-        while (wq.work_once()) {
-            // drain queue fully each tick
-        }
-    }
+    sys_wait_until(finished);
     return 0;
 }
 

@@ -117,8 +117,7 @@ template <co_wq::lockable Lock, exec_like Exec> inline void serial_release(seria
  */
 template <class Derived, serial_owner Owner> struct serial_slot_awaiter : io_waiter_base {
     Owner&        owner;
-    serial_queue& q;                   // queue we serialize on
-    bool          have_lock { false }; // optional flag (set by derived when lock acquired)
+    serial_queue& q; // queue we serialize on
     serial_slot_awaiter(Owner& o, serial_queue& queue) : owner(o), q(queue) { }
     bool await_ready() noexcept { return false; }
     void await_suspend(std::coroutine_handle<> awaiting)
@@ -147,8 +146,7 @@ template <class Derived, serial_owner Owner> struct two_phase_drain_awaiter : se
     {
         static_assert(std::is_base_of_v<two_phase_drain_awaiter, Derived> || true,
                       "CRTP pattern: Derived should inherit two_phase_drain_awaiter<Derived, Owner>");
-        auto* self      = static_cast<Derived*>(w);
-        self->have_lock = true;
+        auto* self = static_cast<Derived*>(w);
         while (true) {
             int r = self->attempt_once();
             if (r > 0)
