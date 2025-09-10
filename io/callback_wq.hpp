@@ -50,8 +50,8 @@ public:
             std::lock_guard<lock> g(_lk);
             // 使用内置 intrusive 链表节点，避免额外分配
             list_add_tail(&node.ws_node, &_pending);
-            if (!_scheduled) {
-                _scheduled = true;
+            if (!_running) {
+                _running   = true; // 进入 RUNNING 状态（runner 已经或即将调度）
                 need_sched = true;
             }
         }
@@ -72,27 +72,40 @@ private:
     // 从队列中逐个取出并调用 worknode::func，直到为空；确保与 post() 互斥
     void drain()
     {
+        // 单 runner 模式：_running==true 表示 runner 已入队或正在处理。
+        // 采用批量提取，减少锁竞争；允许在执行回调时继续 post 新节点。
         for (;;) {
-            worknode* n = nullptr;
+            list_head local { &local, &local };
             {
                 std::lock_guard<lock> g(_lk);
                 if (list_empty(&_pending)) {
-                    _scheduled = false;
+                    // 队列空 => 退出 RUNNING 状态。
+                    _running = false;
                     break;
                 }
-                auto* lh = _pending.next;
-                list_del(lh);
-                n = list_entry(lh, worknode, ws_node);
+                // splice _pending -> local
+                local.next       = _pending.next;
+                local.prev       = _pending.prev;
+                local.next->prev = &local;
+                local.prev->next = &local;
+                INIT_LIST_HEAD(&_pending);
             }
-            if (n && n->func)
-                n->func(n);
+            // 批量处理 local 中的所有节点
+            while (!list_empty(&local)) {
+                list_head* lh = local.next;
+                list_del(lh);
+                worknode* n = list_entry(lh, worknode, ws_node);
+                if (n && n->func)
+                    n->func(n);
+            }
+            // 回到循环再检查是否有新 post
         }
     }
 
     workqueue<lock>& _exec;
     lock             _lk;
     list_head        _pending { &_pending, &_pending };
-    bool             _scheduled { false };
+    bool             _running { false }; // RUNNING 包含“已调度 / 正在执行”两个阶段
     runner_node      _runner;
 };
 
