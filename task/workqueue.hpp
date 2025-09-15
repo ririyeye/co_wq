@@ -6,6 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 
+// 可选的调试 Hook（弱符号，C 链接）：应用可在自身代码中定义以捕获队列中函数指针地址
+// 若未定义，则该符号为 null，不会产生任何副作用。
+extern "C" void wq_debug_check_func_addr(uint32_t addr) __attribute__((weak));
+
 namespace co_wq {
 
 #define USING_WQ_NAME 0
@@ -93,6 +97,11 @@ template <lockable Lock> struct workqueue {
         assert(!__wq_is_debug_poison_func_ptr(fn)
                && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
 #endif
+        // 调试 hook：由应用侧（例如 app/main.cpp）可选实现
+        if (wq_debug_check_func_addr) {
+            wq_debug_check_func_addr((uint32_t)pnode.func);
+        }
+
         lk.lock();
         list_del(&pnode.ws_node);
         list_add_tail(&pnode.ws_node, &ws_head);
