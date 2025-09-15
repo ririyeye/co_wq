@@ -21,7 +21,7 @@ option_end()
 
 -- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
-    set_default(true)
+    set_default(false)
 option_end()
 
 
