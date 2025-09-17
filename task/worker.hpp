@@ -43,13 +43,13 @@ template <lockable lock, class T = void> struct Work_Promise : Promise<T>, Work_
 
     void return_value(T&& ret)
     {
-        Work_promise_base<lock>::post();
+        // Work_promise_base<lock>::post();
         Promise<T>::return_value(std::move(ret));
     }
 
     void return_value(T const& ret)
     {
-        Work_promise_base<lock>::post();
+        // Work_promise_base<lock>::post();
         Promise<T>::return_value(ret);
     }
 };
@@ -57,7 +57,10 @@ template <lockable lock, class T = void> struct Work_Promise : Promise<T>, Work_
 template <lockable lock> struct Work_Promise<lock, void> : Promise<void>, Work_promise_base<lock> {
     auto get_return_object() { return std::coroutine_handle<Work_Promise>::from_promise(*this); }
 
-    void return_void() noexcept { Work_promise_base<lock>::post(); }
+    void return_void() noexcept
+    {
+        // Work_promise_base<lock>::post();
+    }
 };
 
 template <lockable lock, class T, class Alloc>
