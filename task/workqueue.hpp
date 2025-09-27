@@ -7,8 +7,8 @@
 #include <cstdint>
 
 // 可选的调试 Hook（弱符号，C 链接）：应用可在自身代码中定义以捕获队列中函数指针地址
-// 若未定义，则该符号为 null，不会产生任何副作用。
-extern "C" void wq_debug_check_func_addr(uint32_t addr) __attribute__((weak));
+// 形参为指针大小的整数，可在 32/64 位平台安全使用；若未定义，该符号为 null，不会产生任何副作用。
+extern "C" void wq_debug_check_func_addr(std::uintptr_t addr) __attribute__((weak));
 
 namespace co_wq {
 
@@ -99,7 +99,7 @@ template <lockable Lock> struct workqueue {
 #endif
         // 调试 hook：由应用侧（例如 app/main.cpp）可选实现
         if (wq_debug_check_func_addr) {
-            wq_debug_check_func_addr((uint32_t)pnode.func);
+            wq_debug_check_func_addr(reinterpret_cast<std::uintptr_t>(pnode.func));
         }
 
         lk.lock();
