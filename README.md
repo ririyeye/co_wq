@@ -76,7 +76,7 @@ xmake install -o install
 
 ## TLS/SSL 支持
 
-自 v0.?.? 起，`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。默认构建脚本已开启 `USING_SSL`，若需关闭可传入 `xmake f --USING_SSL=n`。
+`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。默认构建脚本已开启 `USING_SSL`，若需关闭可传入 `xmake f --USING_SSL=n`。此外还提供 `net::dtls_socket` 封装，基于 UDP (`net::udp_socket`) 组合实现 DTLS 握手与读写 awaiter，适用于低时延场景（需保证底层 UDP 已绑定/连接到对端）。
 
 ### 快速生成测试证书
 
