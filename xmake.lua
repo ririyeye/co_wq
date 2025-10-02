@@ -37,6 +37,14 @@ end
 
 add_requires("nlohmann_json")
 
+option("USING_USB")
+    set_default(true)
+option_end()
+
+if get_config("USING_USB") then
+    add_requires("libusb")
+end
+
 -- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
     set_default(false)
@@ -76,6 +84,11 @@ target("co_wq")
     end
 
     add_packages("nlohmann_json", {public = true})
+
+        if get_config("USING_USB") then
+            add_defines("USING_USB", {public = true})
+            add_packages("libusb", {public = true})
+        end
 
 target_end()
 

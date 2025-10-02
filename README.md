@@ -63,6 +63,7 @@ $ bash script/clean.sh
 | `USING_NET` | `true` | 启用网络相关头文件与依赖 |
 | `USING_EXAMPLE` | `false` | 构建 `test/` 下示例程序 |
 | `USING_SSL` | `true` | 构建时链接 OpenSSL 并暴露 TLS 支持 |
+| `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
 
 示例命令：
 ```bash
@@ -77,6 +78,47 @@ xmake install -o install
 ## TLS/SSL 支持
 
 `co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。默认构建脚本已开启 `USING_SSL`，若需关闭可传入 `xmake f --USING_SSL=n`。此外还提供 `net::dtls_socket` 封装，基于 UDP (`net::udp_socket`) 组合实现 DTLS 握手与读写 awaiter，适用于低时延场景（需保证底层 UDP 已绑定/连接到对端）。
+
+## USB IO 支持
+
+若需在协程内访问 USB 设备，可启用 `USING_USB` 构建选项（默认关闭，以免在未安装 libusb 时构建失败）：
+
+```bash
+xmake f -y --USING_USB=y
+xmake build co_wq
+```
+
+启用后，头文件 `io/usb_device.hpp` 暴露基于 [libusb](https://libusb.info/) 的 RAII 封装：
+
+- `co_wq::net::usb_context`：管理 `libusb_context` 生命周期，可选设置调试级别；
+- `co_wq::net::usb_device<lock>`：结合 `workqueue<lock>` 管理设备句柄，提供串行化的协程方法：
+  - `bulk_transfer_in/out()`：返回成功传输的字节数，错误时返回 libusb 负值；
+  - `control_transfer()`：直接返回 libusb 状态码；
+  - 接口辅助：`claim_interface` / `release_interface` / `detach_kernel_driver` 等。
+
+示例（假设运行在 `Work_Promise<SpinLock, int>` 协程内）：
+
+```cpp
+#include "usb_device.hpp"
+
+co_wq::net::usb_context ctx;
+auto dev = co_wq::net::usb_device(exec, ctx, libusb_open_device_with_vid_pid(ctx.native_handle(), vid, pid));
+co_await dev.claim_interface(0);
+std::array<std::uint8_t, 64> buf{};
+int received = co_await dev.bulk_transfer_in(0x81, buf.data(), buf.size(), 1000);
+```
+
+> ⚠️ 当前实现使用 libusb 的同步 API，会在协程所在的工作线程内阻塞直到操作完成；如果需要完整的非阻塞事件驱动，可在此封装基础上扩展 libusb Transfer + reactor 集成。
+
+若已启用 `USING_EXAMPLE=y`，可构建示例程序 `co_usb`：
+
+```bash
+xmake f -y --USING_EXAMPLE=y --USING_USB=y
+xmake build co_usb
+xmake run co_usb --help
+```
+
+默认会列出当前总线上的设备，可通过 `--vid/--pid` 指定目标并尝试执行一次标准控制传输（读取设备描述符）。
 
 ### 快速生成测试证书
 

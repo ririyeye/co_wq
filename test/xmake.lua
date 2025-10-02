@@ -24,4 +24,13 @@ target("co_cp")
     add_files("cp.cpp")
 target_end()
 
+if has_config("USING_USB") then
+    target("co_usb")
+        set_kind("binary")
+        add_deps("co_wq")
+        add_files("usb.cpp")
+        add_files("syswork.cpp")
+    target_end()
+end
+
 
