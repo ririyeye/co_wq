@@ -137,7 +137,7 @@ int on_message_complete(llhttp_t* parser)
     return 0;
 }
 
-std::string build_http_response(int status_code,
+std::string build_http_response(int              status_code,
                                 std::string_view reason,
                                 std::string_view body,
                                 std::string_view content_type = "text/plain; charset=utf-8")
@@ -212,6 +212,8 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
     std::array<char, 4096> buffer {};
     bool                   parse_error  = false;
     std::string            error_reason = "";
+    bool                   received_any_data { false };
+    bool                   client_disconnected_early { false };
 
     if constexpr (requires(Socket& s) { s.handshake(); }) {
         int hs = co_await sock.handshake();
@@ -230,13 +232,18 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
             break;
         }
         if (n == 0) {
-            llhttp_errno_t finish_err = llhttp_finish(&parser);
-            if (finish_err != HPE_OK) {
-                parse_error  = true;
-                error_reason = llhttp_errno_name(finish_err);
+            if (!received_any_data) {
+                client_disconnected_early = true;
+            } else {
+                llhttp_errno_t finish_err = llhttp_finish(&parser);
+                if (finish_err != HPE_OK) {
+                    parse_error  = true;
+                    error_reason = llhttp_errno_name(finish_err);
+                }
             }
             break;
         }
+        received_any_data  = true;
         llhttp_errno_t err = llhttp_execute(&parser, buffer.data(), static_cast<size_t>(n));
         if (err != HPE_OK) {
             parse_error        = true;
@@ -247,6 +254,11 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
                 error_reason = llhttp_errno_name(err);
             break;
         }
+    }
+
+    if (client_disconnected_early) {
+        sock.close();
+        co_return;
     }
 
     if (!ctx.message_complete && !parse_error) {
@@ -280,30 +292,24 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
                 }
 
                 nlohmann::json response_json {
-                    {"status", "ok"},
-                    {"method", ctx.method},
-                    {"path", ctx.url},
-                    {"request", request_json}
+                    { "status",  "ok"         },
+                    { "method",  ctx.method   },
+                    { "path",    ctx.url      },
+                    { "request", request_json }
                 };
 
                 if (auto it = ctx.headers.find("content-type"); it != ctx.headers.end())
                     response_json["request_content_type"] = it->second;
 
                 response_body = response_json.dump();
-                response      = build_http_response(200,
-                                               "OK",
-                                               response_body,
-                                               "application/json; charset=utf-8");
+                response      = build_http_response(200, "OK", response_body, "application/json; charset=utf-8");
             } catch (const nlohmann::json::exception& ex) {
                 nlohmann::json error_json {
-                    {"status", "error"},
-                    {"reason", ex.what()}
+                    { "status", "error"   },
+                    { "reason", ex.what() }
                 };
                 response_body = error_json.dump();
-                response      = build_http_response(400,
-                                               "Bad Request",
-                                               response_body,
-                                               "application/json; charset=utf-8");
+                response = build_http_response(400, "Bad Request", response_body, "application/json; charset=utf-8");
             }
         } else {
             response_body = "Not Found\n";
