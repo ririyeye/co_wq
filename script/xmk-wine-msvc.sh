@@ -9,7 +9,6 @@ cd $BASEDIR/..
 export XMAKE_GLOBALDIR=$(pwd)
 
 # export PATH=/opt/toolchain/msvc-wine/msvc/bin/x64:$PATH
-xmake g --network=private
 xmake f -y \
     --sdk=/opt/toolchain/msvc-wine/msvc \
     -p windows -a x64 \

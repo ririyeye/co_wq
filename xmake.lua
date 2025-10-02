@@ -19,6 +19,14 @@ option("USING_NET")
     set_default(true)
 option_end()
 
+option("USE_BUNDLED_LLHTTP")
+    set_default(true)
+option_end()
+
+if get_config("USE_BUNDLED_LLHTTP") then
+    add_requires("llhttp")
+end
+
 -- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
     set_default(false)
@@ -46,6 +54,9 @@ if get_config("USING_NET") then
         add_includedirs("net/win", {public = true})
     else
         add_includedirs("net/linux", {public = true})
+    end
+    if get_config("USE_BUNDLED_LLHTTP") then
+        add_packages("llhttp")
     end
 end
 
