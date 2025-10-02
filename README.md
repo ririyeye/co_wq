@@ -18,6 +18,7 @@
 - `script/`：常用构建脚本（本地、Wine-MSVC、清理）。
 - `xmake.lua`：项目构建入口，包含平台/可选功能开关。
 - `third_party/llhttp/`：HTTP 解析器子模块（来源于 [nodejs/llhttp](https://github.com/nodejs/llhttp.git)）。
+- `script/gen-selfsigned-cert.sh`：快速生成 TLS 自签证书的辅助脚本。
 
 ## 快速开始
 
@@ -61,6 +62,7 @@ $ bash script/clean.sh
 | --- | --- | --- |
 | `USING_NET` | `true` | 启用网络相关头文件与依赖 |
 | `USING_EXAMPLE` | `false` | 构建 `test/` 下示例程序 |
+| `USING_SSL` | `true` | 构建时链接 OpenSSL 并暴露 TLS 支持 |
 
 示例命令：
 ```bash
@@ -71,6 +73,41 @@ xmake install -o install
 ```
 
 `co_wq` 目标为静态库（包含至少一个占位源文件 `task/empty.cpp` 以便安装流程），公共头文件通过 `add_includedirs(..., {public = true})` 暴露。
+
+## TLS/SSL 支持
+
+自 v0.?.? 起，`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。默认构建脚本已开启 `USING_SSL`，若需关闭可传入 `xmake f --USING_SSL=n`。
+
+### 快速生成测试证书
+
+使用脚本生成自签证书：
+
+```bash
+./script/gen-selfsigned-cert.sh -o certs -CN localhost
+```
+
+输出目录将包含：
+
+- `certs/server.key`：RSA 私钥
+- `certs/server.crt`：自签证书
+
+### 启动 TLS HTTP 示例
+
+编译并运行：
+
+```bash
+xmake f -y --USING_EXAMPLE=y
+xmake build co_http
+xmake run co_http --host 0.0.0.0 --port 8443 --cert certs/server.crt --key certs/server.key
+```
+
+随后可通过浏览器或 `curl` 访问：
+
+```bash
+curl -k https://127.0.0.1:8443/
+```
+
+> ⚠️ 自签证书仅用于测试；生产环境请使用受信任的 CA 证书，并在服务端配置 `SSL_CTX_load_verify_locations` 等细节。
 
 ## 示例程序
 启用 `USING_EXAMPLE=y` 后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：

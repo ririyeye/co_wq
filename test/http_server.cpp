@@ -2,6 +2,9 @@
 
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
+#if defined(USING_SSL)
+#include "tls.hpp"
+#endif
 #include "fd_base.hpp"
 #include "worker.hpp"
 
@@ -14,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -32,14 +36,14 @@ using namespace co_wq;
 namespace {
 
 struct HttpRequestContext {
-    std::string                                   method;
-    std::string                                   url;
-    std::unordered_map<std::string, std::string>  headers;
-    std::string                                   current_field;
-    std::string                                   current_value;
-    std::string                                   body;
-    bool                                          headers_complete { false };
-    bool                                          message_complete { false };
+    std::string                                  method;
+    std::string                                  url;
+    std::unordered_map<std::string, std::string> headers;
+    std::string                                  current_field;
+    std::string                                  current_value;
+    std::string                                  body;
+    bool                                         headers_complete { false };
+    bool                                         message_complete { false };
 
     void reset()
     {
@@ -49,8 +53,8 @@ struct HttpRequestContext {
         current_field.clear();
         current_value.clear();
         body.clear();
-        headers_complete  = false;
-        message_complete  = false;
+        headers_complete = false;
+        message_complete = false;
     }
 };
 
@@ -113,7 +117,7 @@ int on_header_value_complete(llhttp_t* parser)
 
 int on_headers_complete(llhttp_t* parser)
 {
-    auto* ctx          = static_cast<HttpRequestContext*>(parser->data);
+    auto* ctx             = static_cast<HttpRequestContext*>(parser->data);
     ctx->headers_complete = true;
     return 0;
 }
@@ -127,7 +131,7 @@ int on_body(llhttp_t* parser, const char* at, size_t length)
 
 int on_message_complete(llhttp_t* parser)
 {
-    auto* ctx            = static_cast<HttpRequestContext*>(parser->data);
+    auto* ctx             = static_cast<HttpRequestContext*>(parser->data);
     ctx->message_complete = true;
     return 0;
 }
@@ -149,8 +153,9 @@ std::string build_http_response(int status_code, std::string_view reason, std::s
     return response;
 }
 
-std::atomic_bool g_stop { false };
-std::atomic<int> g_listener_fd { -1 };
+std::atomic_bool               g_stop { false };
+std::atomic<int>               g_listener_fd { -1 };
+std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
 
 #if defined(_WIN32)
 static BOOL WINAPI console_ctrl_handler(DWORD type)
@@ -160,6 +165,8 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
         int fd = g_listener_fd.exchange(-1, std::memory_order_acq_rel);
         if (fd != -1)
             ::closesocket((SOCKET)fd);
+        if (auto* flag = g_finished_ptr.load(std::memory_order_acquire))
+            flag->store(true, std::memory_order_release);
         return TRUE;
     }
     return FALSE;
@@ -171,10 +178,12 @@ void sigint_handler(int)
     int fd = g_listener_fd.exchange(-1, std::memory_order_acq_rel);
     if (fd != -1)
         ::close(fd);
+    if (auto* flag = g_finished_ptr.load(std::memory_order_acquire))
+        flag->store(true, std::memory_order_release);
 }
 #endif
 
-Task<void, Work_Promise<SpinLock, void>> handle_http_connection(net::tcp_socket<SpinLock> sock)
+template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_connection(Socket sock)
 {
     llhttp_settings_t settings;
     llhttp_settings_init(&settings);
@@ -198,6 +207,15 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_connection(net::tcp_socket<
     bool                   parse_error  = false;
     std::string            error_reason = "";
 
+    if constexpr (requires(Socket& s) { s.handshake(); }) {
+        int hs = co_await sock.handshake();
+        if (hs != 0) {
+            std::cerr << "[http] tls handshake failed, code=" << hs << "\n";
+            sock.close();
+            co_return;
+        }
+    }
+
     while (!ctx.message_complete) {
         ssize_t n = co_await sock.recv(buffer.data(), buffer.size());
         if (n < 0) {
@@ -215,7 +233,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_connection(net::tcp_socket<
         }
         llhttp_errno_t err = llhttp_execute(&parser, buffer.data(), static_cast<size_t>(n));
         if (err != HPE_OK) {
-            parse_error  = true;
+            parse_error        = true;
             const char* reason = llhttp_get_error_reason(&parser);
             if (reason && *reason)
                 error_reason = reason;
@@ -242,7 +260,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_connection(net::tcp_socket<
             response_body = "Hello from co_wq HTTP server!\n";
             response_body += "Method: " + ctx.method + "\n";
             response_body += "Path: " + ctx.url + "\n";
-            response      = build_http_response(200, "OK", response_body);
+            response = build_http_response(200, "OK", response_body);
         } else if (ctx.method == "GET" && ctx.url == "/health") {
             response_body = "OK\n";
             response      = build_http_response(200, "OK", response_body);
@@ -257,7 +275,14 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_connection(net::tcp_socket<
     co_return;
 }
 
-Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port)
+Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>& fdwq,
+                                                     std::string                  host,
+                                                     uint16_t                     port
+#if defined(USING_SSL)
+                                                     ,
+                                                     const net::tls_context* tls_ctx
+#endif
+)
 {
     net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor());
     listener.bind_listen(host, port, 128);
@@ -274,8 +299,25 @@ Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>
         if (fd < 0)
             continue;
         auto socket = fdwq.adopt_tcp_socket(fd);
-        auto task   = handle_http_connection(std::move(socket));
-        post_to(task, fdwq.base());
+#if defined(USING_SSL)
+        if (tls_ctx) {
+            try {
+                auto tls_sock = net::tls_socket<SpinLock>(fdwq.base(),
+                                                          fdwq.reactor(),
+                                                          std::move(socket),
+                                                          *tls_ctx,
+                                                          net::tls_mode::Server);
+                auto task     = handle_http_connection(std::move(tls_sock));
+                post_to(task, fdwq.base());
+            } catch (const std::exception& ex) {
+                std::cerr << "[http] tls socket setup failed: " << ex.what() << "\n";
+            }
+        } else
+#endif
+        {
+            auto task = handle_http_connection(std::move(socket));
+            post_to(task, fdwq.base());
+        }
     }
 
     listener.close();
@@ -289,8 +331,24 @@ int main(int argc, char* argv[])
 {
     std::string host = "0.0.0.0";
     uint16_t    port = 8080;
-    if (argc > 1)
-        port = static_cast<uint16_t>(std::stoi(argv[1]));
+    std::string cert_path;
+    std::string key_path;
+    bool        use_tls = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg(argv[i]);
+        if (arg == "--host" && i + 1 < argc) {
+            host = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
+            port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--cert" && i + 1 < argc) {
+            cert_path = argv[++i];
+            use_tls   = true;
+        } else if (arg == "--key" && i + 1 < argc) {
+            key_path = argv[++i];
+            use_tls  = true;
+        }
+    }
 
 #if defined(_WIN32)
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
@@ -298,12 +356,38 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    auto& wq = get_sys_workqueue(0);
+    auto&                       wq = get_sys_workqueue(0);
     net::fd_workqueue<SpinLock> fdwq(wq);
 
-    auto server_task = http_server(fdwq, host, port);
-    auto coroutine   = server_task.get();
-    auto& promise    = coroutine.promise();
+    const net::tls_context* tls_ctx_ptr = nullptr;
+#if defined(USING_SSL)
+    std::optional<net::tls_context> tls_ctx;
+    if (use_tls) {
+        if (cert_path.empty() || key_path.empty()) {
+            std::cerr << "[http] missing --cert/--key when TLS enabled\n";
+            return 1;
+        }
+        try {
+            tls_ctx.emplace(net::tls_context::make_server_with_pem(cert_path, key_path));
+            tls_ctx_ptr = &(*tls_ctx);
+            std::cout << "[http] TLS enabled, cert=" << cert_path << "\n";
+        } catch (const std::exception& ex) {
+            std::cerr << "[http] failed to setup TLS: " << ex.what() << "\n";
+            return 1;
+        }
+    }
+#endif
+
+    auto server_task = http_server(fdwq,
+                                   host,
+                                   port
+#if defined(USING_SSL)
+                                   ,
+                                   tls_ctx_ptr
+#endif
+    );
+    auto             coroutine = server_task.get();
+    auto&            promise   = coroutine.promise();
     std::atomic_bool finished { false };
     promise.mUserData    = &finished;
     promise.mOnCompleted = [](Promise_base& pb) {
@@ -311,11 +395,11 @@ int main(int argc, char* argv[])
         if (flag)
             flag->store(true, std::memory_order_release);
     };
+    g_finished_ptr.store(&finished, std::memory_order_release);
 
     post_to(server_task, wq);
 
     sys_wait_until(finished);
+    g_finished_ptr.store(nullptr, std::memory_order_release);
     return 0;
 }
-
-

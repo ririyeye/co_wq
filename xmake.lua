@@ -23,8 +23,16 @@ option("USE_BUNDLED_LLHTTP")
     set_default(true)
 option_end()
 
+option("USING_SSL")
+    set_default(true)
+option_end()
+
 if get_config("USE_BUNDLED_LLHTTP") then
     add_requires("llhttp")
+end
+
+if get_config("USING_SSL") then
+    add_requires("openssl3")
 end
 
 -- 是否构建 examples（test 目录）
@@ -48,6 +56,7 @@ target("co_wq")
 
 if get_config("USING_NET") then
     add_includedirs("io", {public = true})
+    add_includedirs("net", {public = true})
     add_defines("USING_NET", {public = true})
     if is_plat("windows") then
         add_links("Ws2_32")
@@ -57,6 +66,10 @@ if get_config("USING_NET") then
     end
     if get_config("USE_BUNDLED_LLHTTP") then
         add_packages("llhttp", {public = true})
+    end
+    if get_config("USING_SSL") then
+        add_defines("USING_SSL", {public = true})
+        add_packages("openssl3", {public = true})
     end
 end
 

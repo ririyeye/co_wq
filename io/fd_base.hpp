@@ -1,10 +1,13 @@
 // unified fd_base.hpp (placed under io/) - platform specific parts separated by macros
 #pragma once
 
+#include "file_io.hpp" // file_handle (platform-specific inside)
 #include "reactor_default.hpp"
-#include "file_io.hpp"    // file_handle (platform-specific inside)
 #include "tcp_socket.hpp" // per-platform (search path provides correct one)
 #include "udp_socket.hpp" // may be unused on some platforms but harmless
+#if defined(USING_SSL)
+#include "tls.hpp"
+#endif
 
 #include <stdexcept>
 
@@ -75,10 +78,20 @@ protected:
 template <lockable lock, template <class> class Reactor = CO_WQ_DEFAULT_REACTOR> class fd_workqueue {
 public:
     explicit fd_workqueue(workqueue<lock>& base) : _base(base), _reactor(base) { }
-    workqueue<lock>&           base() { return _base; }
-    Reactor<lock>&             reactor() { return _reactor; }
-    tcp_socket<lock, Reactor>  make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
-    tcp_socket<lock, Reactor>  adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
+    workqueue<lock>&          base() { return _base; }
+    Reactor<lock>&            reactor() { return _reactor; }
+    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
+    tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
+#if defined(USING_SSL)
+    tls_socket<lock, Reactor> make_tls_socket(tls_context ctx, tls_mode mode)
+    {
+        return tls_socket<lock, Reactor>(_base, _reactor, make_tcp_socket(), std::move(ctx), mode);
+    }
+    tls_socket<lock, Reactor> adopt_tls_socket(int fd, tls_context ctx, tls_mode mode)
+    {
+        return tls_socket<lock, Reactor>(_base, _reactor, adopt_tcp_socket(fd), std::move(ctx), mode);
+    }
+#endif
     udp_socket<lock, Reactor>  make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
     file_handle<lock, Reactor> make_file(HANDLE h) { return file_handle<lock, Reactor>(_base, _reactor, h); }
 
@@ -148,9 +161,19 @@ public:
         _reactor->add_fd(fd);
         return fd;
     }
-    Reactor<lock>&             reactor() { return _reactor; }
-    tcp_socket<lock, Reactor>  make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
-    tcp_socket<lock, Reactor>  adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
+    Reactor<lock>&            reactor() { return _reactor; }
+    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
+    tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
+#if defined(USING_SSL)
+    tls_socket<lock, Reactor> make_tls_socket(tls_context ctx, tls_mode mode)
+    {
+        return tls_socket<lock, Reactor>(_base, _reactor, make_tcp_socket(), std::move(ctx), mode);
+    }
+    tls_socket<lock, Reactor> adopt_tls_socket(int fd, tls_context ctx, tls_mode mode)
+    {
+        return tls_socket<lock, Reactor>(_base, _reactor, adopt_tcp_socket(fd), std::move(ctx), mode);
+    }
+#endif
     udp_socket<lock, Reactor>  make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
     file_handle<lock, Reactor> make_file(int fd) { return file_handle<lock, Reactor>(_base, _reactor, fd); }
 
