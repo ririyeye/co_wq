@@ -56,7 +56,7 @@ if get_config("USING_NET") then
         add_includedirs("net/linux", {public = true})
     end
     if get_config("USE_BUNDLED_LLHTTP") then
-        add_packages("llhttp")
+        add_packages("llhttp", {public = true})
     end
 end
 
