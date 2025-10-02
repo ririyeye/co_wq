@@ -120,6 +120,30 @@ xmake run echo --both --host 127.0.0.1 --port 12345
 - `net::udp_socket` 的 `send_to/recv_from` awaiter；
 - 跨平台信号处理、统计信息输出。
 
+### HTTP JSON 测试
+
+`co_http` 示例引入了 [nlohmann/json](https://github.com/nlohmann/json) 以处理 JSON 负载，并新增 `POST /echo-json` 端点回显请求体。
+
+1. 以明文模式运行：
+
+  ```bash
+  xmake run co_http --host 0.0.0.0 --port 8080
+  ```
+
+2. 发送 JSON 请求并观察响应：
+
+  ```bash
+  curl -X POST http://127.0.0.1:8080/echo-json \
+      -H 'Content-Type: application/json' \
+      -d '{"message":"hello co_wq"}'
+  ```
+
+  服务器会返回 `application/json`，包含请求方法、路径以及原始 payload：
+
+  ```json
+  {"status":"ok","method":"POST","path":"/echo-json","request":{"message":"hello co_wq"},"request_content_type":"application/json"}
+  ```
+
 ## API 文档
 
 ### 协程任务与执行器（`task/`）

@@ -9,6 +9,7 @@
 #include "worker.hpp"
 
 #include <llhttp.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -136,7 +137,10 @@ int on_message_complete(llhttp_t* parser)
     return 0;
 }
 
-std::string build_http_response(int status_code, std::string_view reason, std::string_view body)
+std::string build_http_response(int status_code,
+                                std::string_view reason,
+                                std::string_view body,
+                                std::string_view content_type = "text/plain; charset=utf-8")
 {
     std::string response;
     response.reserve(128 + body.size());
@@ -145,7 +149,9 @@ std::string build_http_response(int status_code, std::string_view reason, std::s
     response.push_back(' ');
     response.append(reason);
     response.append("\r\n");
-    response.append("Content-Type: text/plain; charset=utf-8\r\n");
+    response.append("Content-Type: ");
+    response.append(content_type);
+    response.append("\r\n");
     response.append("Content-Length: ");
     response.append(std::to_string(body.size()));
     response.append("\r\nConnection: close\r\n\r\n");
@@ -264,6 +270,41 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
         } else if (ctx.method == "GET" && ctx.url == "/health") {
             response_body = "OK\n";
             response      = build_http_response(200, "OK", response_body);
+        } else if (ctx.method == "POST" && ctx.url == "/echo-json") {
+            try {
+                nlohmann::json request_json;
+                if (!ctx.body.empty()) {
+                    request_json = nlohmann::json::parse(ctx.body);
+                } else {
+                    request_json = nlohmann::json::object();
+                }
+
+                nlohmann::json response_json {
+                    {"status", "ok"},
+                    {"method", ctx.method},
+                    {"path", ctx.url},
+                    {"request", request_json}
+                };
+
+                if (auto it = ctx.headers.find("content-type"); it != ctx.headers.end())
+                    response_json["request_content_type"] = it->second;
+
+                response_body = response_json.dump();
+                response      = build_http_response(200,
+                                               "OK",
+                                               response_body,
+                                               "application/json; charset=utf-8");
+            } catch (const nlohmann::json::exception& ex) {
+                nlohmann::json error_json {
+                    {"status", "error"},
+                    {"reason", ex.what()}
+                };
+                response_body = error_json.dump();
+                response      = build_http_response(400,
+                                               "Bad Request",
+                                               response_body,
+                                               "application/json; charset=utf-8");
+            }
         } else {
             response_body = "Not Found\n";
             response      = build_http_response(404, "Not Found", response_body);
