@@ -5,7 +5,7 @@
 ## 核心特性
 - **零依赖、轻量化**：纯头文件实现，除标准库外不依赖第三方组件。
 - **可插拔执行器**：`workqueue<lock>` 支持自定义锁类型，适配不同并发模型。
-- **丰富 Awaiter**：信号量、定时器、串行化 IO、TCP/UDP 套接字等 awaiter 开箱即用。
+- **丰富 Awaiter**：信号量、定时器、串行化 IO、TCP/UDP/UDS 套接字等 awaiter 开箱即用。
 - **跨平台网络栈**：Linux 采用 `epoll`，Windows 通过 Wine+MSVC 配置使用 IOCP 封装。
 - **工具完善**：提供 `script/` 下的 xmake 构建脚本，自动生成 `compile_commands.json` 便于 IDE 使用。
 
@@ -186,6 +186,24 @@ xmake run echo --both --host 127.0.0.1 --port 12345
   {"status":"ok","method":"POST","path":"/echo-json","request":{"message":"hello co_wq"},"request_content_type":"application/json"}
   ```
 
+### Unix Domain Socket 示例
+
+`co_uds` 展示了基于 `unix_listener/unix_socket` 的本地 IPC echo 逻辑：
+
+```bash
+xmake f -y --USING_EXAMPLE=y
+xmake build co_uds
+xmake run co_uds --path /tmp/co_wq_uds.sock --message "ping uds"
+```
+
+运行上述命令会同时启动服务器与客户端，客户端发送一条消息后退出。若只想常驻服务器，可执行：
+
+```bash
+xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
+```
+
+路径以 `@` 开头时会切换到 Linux 抽象命名空间（不会在文件系统生成条目），例如 `--path @co_wq_demo`。
+
 ## API 文档
 
 ### 协程任务与执行器（`task/`）
@@ -231,6 +249,8 @@ xmake run echo --both --host 127.0.0.1 --port 12345
   - 状态查询 `rx_eof()`、`tx_shutdown()`。
 - `tcp_listener<lock, Reactor>`：监听/接受连接，提供 `bind_listen()` 与 `accept()` awaiter。
 - `udp_socket<lock, Reactor>`：支持 `send_to/recv_from`、可选 `connect()`。
+- `unix_socket<lock, Reactor>` / `unix_listener<lock, Reactor>`：协程化 Unix Domain Stream 套接字（Linux），
+  支持文件路径或以 `@` 开头的抽象命名空间，API 与 TCP 版本保持一致（`connect/recv/send`、`bind_listen/accept`）。
 - Windows 目录下提供 IOCP 版本，实现接口一致，便于跨平台编译。
 
 ## 设计与最佳实践

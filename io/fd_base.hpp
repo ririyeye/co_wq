@@ -5,6 +5,9 @@
 #include "reactor_default.hpp"
 #include "tcp_socket.hpp" // per-platform (search path provides correct one)
 #include "udp_socket.hpp" // may be unused on some platforms but harmless
+#if !defined(_WIN32)
+#include "unix_socket.hpp"
+#endif
 #if defined(USING_SSL)
 #include "tls.hpp"
 #endif
@@ -175,6 +178,8 @@ public:
     }
 #endif
     udp_socket<lock, Reactor>  make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
+    unix_socket<lock, Reactor> make_unix_socket() { return unix_socket<lock, Reactor>(_base, _reactor); }
+    unix_socket<lock, Reactor> adopt_unix_socket(int fd) { return unix_socket<lock, Reactor>(fd, _base, _reactor); }
     file_handle<lock, Reactor> make_file(int fd) { return file_handle<lock, Reactor>(_base, _reactor, fd); }
 
 private:

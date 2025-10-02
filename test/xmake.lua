@@ -33,4 +33,13 @@ if has_config("USING_USB") then
     target_end()
 end
 
+if is_plat("linux") then
+    target("co_uds")
+        set_kind("binary")
+        add_deps("co_wq")
+        add_files("uds.cpp")
+        add_files("syswork.cpp")
+    target_end()
+end
+
 
