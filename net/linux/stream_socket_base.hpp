@@ -275,8 +275,11 @@ public:
                 this->owner.mark_rx_eof();
                 return 0;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return full ? -1 : 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!full && recvd > 0)
+                    return 0;
+                return -1;
+            }
             if (recvd == 0)
                 err = n;
             return 0;
