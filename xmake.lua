@@ -4,7 +4,7 @@ add_rules("plugin.compile_commands.autoupdate")
 add_rules("mode.release", "mode.debug", "mode.releasedbg", "mode.minsizerel")
 set_languages("c++20")
 set_warnings("all", "extra", "pedantic")
-
+set_license("LGPL-2.1")
 -- Windows 平台编译选项
 if is_plat("windows") then
     add_cxflags("/utf-8")
