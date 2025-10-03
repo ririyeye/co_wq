@@ -9,7 +9,7 @@
 - 优先运行 `bash script/xmk-local.sh`：`xmake` 配置 releasedbg 模式、启用 examples、生成 `compile_commands.json`，并将产物安装到 `install/`。
 - Windows(Wine) 使用 `bash script/xmk-wine-msvc.sh`，需先安装 msvc-wine SDK；脚本会 `xmake -p windows -a x64` 并单独构建 `co_wq`。
 - 清理使用 `bash script/clean.sh`（会删 `.xmake/ build/ install/` 等）。
-- 手动 xmake：`xmake g --network=private` → `xmake f -y -m releasedbg --USING_EXAMPLE=y` → `xmake -vD` → `xmake install -o install`。
+- 手动 xmake：`xmake f -y -m releasedbg --USING_EXAMPLE=y -o build` → `xmake -vD` → `xmake install -o install`。
 - 注意 `xmake` 目标：`co_wq` 静态库 +（启用 examples 时）`test/xmake.lua` 下的 `co_echo/co_http/...` 可执行文件。
 
 ## 运行时执行模型

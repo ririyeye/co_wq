@@ -270,9 +270,9 @@ public:
 
         bool await_ready() const noexcept { return owner._handshake_done; }
 
-        void await_suspend(std::coroutine_handle<> h)
+        void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h          = h;
+            this->h          = coro;
             this->route_ctx  = owner._cbq.get();
             this->route_post = &callback_wq<lock>::post_adapter;
             INIT_LIST_HEAD(&this->ws_node);

@@ -14,7 +14,8 @@ xmake f -y \
     -p windows -a x64 \
     --USING_EXAMPLE=y \
     -vD \
-    -m releasedbg
+    -m releasedbg \
+    -o build
     
 xmake -vD
 # 明确构建静态库目标，避免 install 提示未构建

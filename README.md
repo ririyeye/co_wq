@@ -31,10 +31,19 @@
 $ bash script/xmk-local.sh
 ```
 脚本会执行：
-1. `xmake g --network=private` 初始化配置；
-2. 以 `releasedbg` 模式开启 examples；
-3. 生成 `compile_commands.json`；
-4. 构建并安装产物到 `install/`。
+1. 以 `releasedbg` 模式启用 examples，并将输出目录设置为 `build/`；
+2. 生成 `compile_commands.json`；
+3. 构建并安装产物到 `install/`。
+
+### Windows（MSVC 工具链，本机）
+在包含 Visual Studio 工具链的 PowerShell 提示符中执行：
+```powershell
+PS> .\script\xmsvc.bat
+```
+批处理会：
+1. 以 `releasedbg` 模式启用 examples，并把输出目录设为 `build/`；
+2. 生成 `compile_commands.json`；
+3. 构建并安装到 `install/`。
 
 ### Windows（Wine + MSVC 工具链）
 参考 `script/xmk-wine-msvc.sh`：
@@ -42,10 +51,11 @@ $ bash script/xmk-local.sh
 $ bash script/xmk-wine-msvc.sh
 ```
 脚本会：
-1. 设置 `--sdk=/opt/toolchain/msvc-wine/msvc`；
-2. 切换到 `windows x64` 目标；
-3. 明确构建 `co_wq` 静态库并安装；
-4. 生成 `compile_commands.json` 给 IDE 使用。
+1. 设置 `--sdk=/opt/toolchain/msvc-wine/msvc`，在 `windows x64` 目标上以 `releasedbg` 模式启用 examples（输出目录 `build/`）；
+2. 构建并安装 `co_wq` 静态库；
+3. 生成 `compile_commands.json` 给 IDE 使用。
+
+> ℹ️ 首次执行任一构建脚本时，xmake 会通过内置包管理器下载依赖（如 llhttp、openssl、libusb），请确保网络连通。
 
 > 💡 编译卡住时可运行 `wineserver -k` 重启 Wine。详细工具链搭建请参考脚本内联注释。
 
@@ -55,6 +65,12 @@ $ bash script/clean.sh
 ```
 该脚本会移除 `.xmake/`、`~/.xmake/`、`build/`、`install/` 及 `.cache/`。
 
+Windows 可执行：
+```powershell
+PS> .\script\clean.bat
+```
+会同样清理工作区内的构建产物，并额外尝试删除 `%USERPROFILE%\.xmake` 缓存。
+
 ## 手动使用 xmake
 `xmake.lua` 提供两个可选开关：
 
@@ -63,12 +79,11 @@ $ bash script/clean.sh
 | `USING_NET` | `true` | 启用网络相关头文件与依赖 |
 | `USING_EXAMPLE` | `false` | 构建 `test/` 下示例程序 |
 | `USING_SSL` | `true` | 构建时链接 OpenSSL 并暴露 TLS 支持 |
-| `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
+| `USING_USB` | `true` | 启用基于 libusb 的 USB 协程封装 |
 
 示例命令：
 ```bash
-xmake g --network=private
-xmake f -y -m releasedbg --USING_NET=y --USING_EXAMPLE=n
+xmake f -y -m releasedbg --USING_NET=y --USING_EXAMPLE=n -o build
 xmake -vD
 xmake install -o install
 ```
@@ -81,10 +96,10 @@ xmake install -o install
 
 ## USB IO 支持
 
-若需在协程内访问 USB 设备，可启用 `USING_USB` 构建选项（默认关闭，以免在未安装 libusb 时构建失败）：
+若需在协程内访问 USB 设备，可利用默认开启的 `USING_USB` 构建选项（若系统未安装 libusb，可通过 `--USING_USB=n` 关闭）：
 
 ```bash
-xmake f -y --USING_USB=y
+xmake f -y --USING_USB=y   # 默认即为 y，如需关闭改为 n
 xmake build co_wq
 ```
 

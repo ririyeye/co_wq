@@ -11,10 +11,8 @@
 #include <llhttp.h>
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -22,7 +20,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <vector>
 
 #if defined(_WIN32)
 #include <basetsd.h>
@@ -345,15 +342,10 @@ Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>
         }
         if (fd < 0)
             continue;
-        auto socket = fdwq.adopt_tcp_socket(fd);
 #if defined(USING_SSL)
         if (tls_ctx) {
             try {
-                auto tls_sock = net::tls_socket<SpinLock>(fdwq.base(),
-                                                          fdwq.reactor(),
-                                                          std::move(socket),
-                                                          *tls_ctx,
-                                                          net::tls_mode::Server);
+                auto tls_sock = fdwq.adopt_tls_socket(fd, *tls_ctx, net::tls_mode::Server);
                 auto task     = handle_http_connection(std::move(tls_sock));
                 post_to(task, fdwq.base());
             } catch (const std::exception& ex) {
@@ -362,7 +354,8 @@ Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>
         } else
 #endif
         {
-            auto task = handle_http_connection(std::move(socket));
+            auto socket = fdwq.adopt_tcp_socket(fd);
+            auto task   = handle_http_connection(std::move(socket));
             post_to(task, fdwq.base());
         }
     }

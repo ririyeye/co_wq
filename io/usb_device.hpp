@@ -6,15 +6,17 @@
 #include "io_waiter.hpp"
 #include "worker.hpp"
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
+
 #include <libusb-1.0/libusb.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#if defined(_WIN32)
-#include <winsock2.h>
-#else
+#if !defined(_WIN32)
 #include <sys/time.h>
 #endif
 #include <memory>

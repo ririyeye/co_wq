@@ -7,8 +7,13 @@
 #include <cstdint>
 
 // 可选的调试 Hook（弱符号，C 链接）：应用可在自身代码中定义以捕获队列中函数指针地址
-// 形参为指针大小的整数，可在 32/64 位平台安全使用；若未定义，该符号为 null，不会产生任何副作用。
+// 形参为指针大小的整数，可在 32/64 位平台安全使用；若未定义，该符号在 MSVC 下会别名到一个空实现。
+#if defined(_MSC_VER) && !defined(__clang__)
+extern "C" void wq_debug_check_func_addr(std::uintptr_t addr);
+extern "C" void wq_debug_check_func_addr_default(std::uintptr_t addr);
+#else
 extern "C" void wq_debug_check_func_addr(std::uintptr_t addr) __attribute__((weak));
+#endif
 
 namespace co_wq {
 
@@ -54,6 +59,19 @@ inline worknode* __wq_node_to_worknode(struct list_head* node)
     return reinterpret_cast<worknode*>(reinterpret_cast<char*>(node) - offsetof(worknode, ws_node));
 }
 
+inline void __wq_maybe_invoke_debug_hook(std::uintptr_t addr)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    if (wq_debug_check_func_addr != nullptr && wq_debug_check_func_addr != wq_debug_check_func_addr_default) {
+        wq_debug_check_func_addr(addr);
+    }
+#else
+    if (wq_debug_check_func_addr != nullptr) {
+        wq_debug_check_func_addr(addr);
+    }
+#endif
+}
+
 template <lockable Lock> struct workqueue {
     explicit workqueue() { }
     typedef void (*wq_trig)(struct workqueue* work);
@@ -77,8 +95,8 @@ template <lockable Lock> struct workqueue {
 #ifndef NDEBUG
                 // Detect and guard against calling invalid debug poison addresses like 0xCDCDCDCD...
                 if (__wq_is_debug_poison_func_ptr(fn)) {
-                    assert(false
-                           && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
+                    assert(("worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized",
+                            false));
                     return 1; // skip calling to avoid crash in debug
                 }
 #endif
@@ -93,14 +111,12 @@ template <lockable Lock> struct workqueue {
 #ifndef NDEBUG
         // Validate func before enqueue
         auto fn = pnode.func;
-        assert(fn && "worknode.func must not be null when enqueuing");
+        assert(fn != nullptr && "worknode.func must not be null when enqueuing");
         assert(!__wq_is_debug_poison_func_ptr(fn)
                && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
 #endif
         // 调试 hook：由应用侧（例如 app/main.cpp）可选实现
-        if (wq_debug_check_func_addr) {
-            wq_debug_check_func_addr(reinterpret_cast<std::uintptr_t>(pnode.func));
-        }
+        __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(pnode.func));
 
         lk.lock();
         list_del(&pnode.ws_node);
@@ -121,7 +137,7 @@ template <lockable Lock> struct workqueue {
         for (list_head* pos = batch_head.next; pos != &batch_head; pos = pos->next) {
             worknode* wn = __wq_node_to_worknode(pos);
             auto      fn = wn->func;
-            assert(fn && "worknode.func must not be null when enqueuing (batch)");
+            assert(fn != nullptr && "worknode.func must not be null when enqueuing (batch)");
             assert(!__wq_is_debug_poison_func_ptr(fn)
                    && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized (batch)");
         }
@@ -146,7 +162,7 @@ template <lockable Lock> struct workqueue {
     {
 #ifndef NDEBUG
         auto fn = pnode.func;
-        assert(fn && "worknode.func must not be null when enqueuing (nolock)");
+        assert(fn != nullptr && "worknode.func must not be null when enqueuing (nolock)");
         assert(!__wq_is_debug_poison_func_ptr(fn)
                && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized (nolock)");
 #endif
