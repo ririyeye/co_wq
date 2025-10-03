@@ -241,6 +241,7 @@ xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
 - `epoll_reactor<lock>` / `iocp_reactor<lock>`：平台化事件循环后端，分别封装 `epoll` 与 IOCP，实现 `add_fd/remove_fd/add_waiter[_custom]` 接口。
 
 ### 网络原语（`net/`）
+- `detail::stream_listener_base` / `detail::stream_socket_base` / `detail::datagram_socket_base`：Linux 网络监听/流式/数据报基类，统一封装 fd 生命周期、串行化 send/recv 与 reactor 交互，现已补充中文 Doxygen 注释，方便生成参考文档。
 - `tcp_socket<lock, Reactor>`：非阻塞 TCP 封装，支持：
   - `connect(host, port)`：异步连接；
   - `recv(buf, len, full)` / `send(buf, len, full)`：单次或聚合收发；

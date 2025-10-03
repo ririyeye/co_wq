@@ -1,16 +1,17 @@
-// unix_listener.hpp - Unix Domain socket 异步 accept
+/**
+ * @file unix_listener.hpp
+ * @brief Unix Domain socket 监听器封装，支持抽象命名空间。
+ */
 #pragma once
 
 #include "epoll_reactor.hpp"
-#include "io_waiter.hpp"
+#include "stream_listener_base.hpp"
 #include "unix_socket.hpp"
-#include <cerrno>
+#include "worker.hpp"
 #include <cstddef>
 #include <cstring>
-#include <fcntl.h>
 #include <stdexcept>
 #include <string>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -19,28 +20,32 @@ namespace co_wq::net {
 
 template <lockable lock, template <class> class Reactor> class fd_workqueue;
 
+/** @brief 统一的 Unix Domain accept 致命错误返回值。 */
 inline constexpr int k_accept_fatal = -2;
 
-template <lockable lock, template <class> class Reactor = epoll_reactor> class unix_listener {
-public:
-    explicit unix_listener(workqueue<lock>& exec, Reactor<lock>& reactor) : _exec(exec), _reactor(&reactor)
-    {
-        _fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (_fd < 0)
-            throw std::runtime_error("listener socket failed");
-        set_non_block();
-        _reactor->add_fd(_fd);
-    }
-    ~unix_listener() { close(); }
+/**
+ * @brief Unix Domain socket 监听器，自动处理路径/抽象命名空间。
+ */
+template <lockable lock, template <class> class Reactor = epoll_reactor>
+class unix_listener : public detail::stream_listener_base<unix_listener<lock, Reactor>, lock, Reactor> {
+    using base = detail::stream_listener_base<unix_listener<lock, Reactor>, lock, Reactor>;
 
+public:
+    static constexpr int k_accept_fatal = -2;
+    explicit unix_listener(workqueue<lock>& exec, Reactor<lock>& reactor)
+        : base(exec, reactor, AF_UNIX, SOCK_STREAM) { }
+
+    /**
+     * @brief 绑定路径并开始监听。
+     */
     void bind_listen(const std::string& path, int backlog = 128, bool unlink_existing = true, mode_t mode = 0666)
     {
         if (_bound)
             throw std::runtime_error("listener already bound");
         sockaddr_un addr {};
-        addr.sun_family = AF_UNIX;
-        bool abstract   = !path.empty() && path[0] == '@';
-        socklen_t slen  = 0;
+        addr.sun_family    = AF_UNIX;
+        bool      abstract = !path.empty() && path[0] == '@';
+        socklen_t slen     = 0;
         if (abstract) {
             size_t len = path.size();
             if (len <= 1 || len - 1 >= sizeof(addr.sun_path))
@@ -53,29 +58,27 @@ public:
                 throw std::runtime_error("unix path too long");
             std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
             addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
-            slen                                     = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + std::strlen(addr.sun_path) + 1);
+            slen = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + std::strlen(addr.sun_path) + 1);
             if (unlink_existing)
                 ::unlink(addr.sun_path);
         }
-        if (::bind(_fd, reinterpret_cast<sockaddr*>(&addr), slen) < 0)
+        if (::bind(this->native_handle(), reinterpret_cast<sockaddr*>(&addr), slen) < 0)
             throw std::runtime_error("bind failed");
         if (!abstract)
             ::chmod(addr.sun_path, mode);
-        if (::listen(_fd, backlog) < 0)
+        if (::listen(this->native_handle(), backlog) < 0)
             throw std::runtime_error("listen failed");
-        _path      = path;
-        _abstract  = abstract;
-        _bound     = true;
+        _path     = path;
+        _abstract = abstract;
+        _bound    = true;
     }
 
+    /**
+     * @brief 关闭监听器并清理文件路径。
+     */
     void close()
     {
-        if (_fd >= 0) {
-            if (_reactor)
-                _reactor->remove_fd(_fd);
-            ::close(_fd);
-            _fd = -1;
-        }
+        base::close();
         if (_bound) {
             if (!_abstract && !_path.empty()) {
                 ::unlink(_path.c_str());
@@ -85,61 +88,17 @@ public:
         }
     }
 
-    int native_handle() const { return _fd; }
-
-    struct accept_awaiter : io_waiter_base {
-        unix_listener& lst;
-        int            newfd { -1 };
-        accept_awaiter(unix_listener& l) : lst(l) { }
-        bool await_ready() noexcept
-        {
-            newfd = try_accept();
-            return newfd >= 0 || newfd == k_accept_fatal;
-        }
-        void await_suspend(std::coroutine_handle<> h)
-        {
-            this->h = h;
-            INIT_LIST_HEAD(&this->ws_node);
-            if (lst._reactor)
-                lst._reactor->add_waiter(lst._fd, EPOLLIN, this);
-        }
-        int await_resume() noexcept
-        {
-            if (newfd >= 0 || newfd == k_accept_fatal)
-                return newfd;
-            return try_accept();
-        }
-        int try_accept() noexcept
-        {
-            sockaddr_un addr;
-            socklen_t   alen = sizeof(addr);
-            int         fd   = ::accept4(lst._fd, reinterpret_cast<sockaddr*>(&addr), &alen, SOCK_CLOEXEC | SOCK_NONBLOCK);
-            if (fd >= 0)
-                return fd;
-            if (fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                return -1;
-            return k_accept_fatal;
-        }
-    };
-
-    accept_awaiter accept() { return accept_awaiter(*this); }
+    using base::accept;
 
 private:
-    void set_non_block()
-    {
-        int flags = ::fcntl(_fd, F_GETFL, 0);
-        if (flags >= 0)
-            ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
-    }
-
-    workqueue<lock>& _exec;
-    Reactor<lock>*   _reactor { nullptr };
-    int              _fd { -1 };
-    std::string      _path;
-    bool             _abstract { false };
-    bool             _bound { false };
+    std::string _path;
+    bool        _abstract { false };
+    bool        _bound { false };
 };
 
+/**
+ * @brief 异步等待 Unix Domain 连接。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor>
 inline Task<int, Work_Promise<lock, int>> async_accept(unix_listener<lock, Reactor>& lst)
 {
@@ -147,6 +106,9 @@ inline Task<int, Work_Promise<lock, int>> async_accept(unix_listener<lock, React
     co_return fd;
 }
 
+/**
+ * @brief 接受连接并封装为 `unix_socket`。
+ */
 template <lockable lock, template <class> class Reactor = epoll_reactor>
 inline Task<unix_socket<lock, Reactor>, Work_Promise<lock, unix_socket<lock, Reactor>>>
 async_accept_socket(fd_workqueue<lock, Reactor>& fwq, unix_listener<lock, Reactor>& lst)
