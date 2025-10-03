@@ -201,6 +201,25 @@ xmake run echo --both --host 127.0.0.1 --port 12345
   {"status":"ok","method":"POST","path":"/echo-json","request":{"message":"hello co_wq"},"request_content_type":"application/json"}
   ```
 
+  ### WebSocket Echo 示例
+
+  `net/websocket.hpp` 提供基于 llhttp 的握手辅助与帧收发工具函数，`co_ws` 示例展示了如何在协程中构建 WebSocket 服务：
+
+  ```bash
+  xmake run co_ws --host 0.0.0.0 --port 9000
+  ```
+
+  可使用浏览器或常见客户端（如 [`wscat`](https://github.com/websockets/wscat)）连接并发送文本/二进制消息，服务器会自动回显：
+
+  ```bash
+  wscat -c ws://127.0.0.1:9000
+  ```
+
+  示例涵盖：
+  - 通过 `websocket::accept` 完成 HTTP Upgrade 握手并可选匹配子协议；
+  - 使用 `websocket::read_message` 自动处理分片、Ping/Pong 与 Close 帧；
+  - 借助 `websocket::send_text` / `send_binary` / `send_close` 回写响应。
+
 ### Unix Domain Socket 示例
 
 `co_uds` 展示了基于 `unix_listener/unix_socket` 的本地 IPC echo 逻辑：
