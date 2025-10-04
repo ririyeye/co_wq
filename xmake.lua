@@ -16,7 +16,7 @@ if is_plat("windows") then
 end
 
 option("USING_NET")
-    set_default(true)
+    set_default(false)
 option_end()
 
 option("USE_BUNDLED_LLHTTP")
@@ -24,31 +24,34 @@ option("USE_BUNDLED_LLHTTP")
 option_end()
 
 option("USING_SSL")
-    set_default(true)
+    set_default(false)
 option_end()
-
-if get_config("USE_BUNDLED_LLHTTP") then
-    add_requires("llhttp")
-end
-
-if get_config("USING_SSL") then
-    add_requires("openssl3")
-end
-
-add_requires("nlohmann_json")
 
 option("USING_USB")
-    set_default(true)
+    set_default(false)
 option_end()
-
-if get_config("USING_USB") then
-    add_requires("libusb")
-end
 
 -- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
     set_default(false)
 option_end()
+
+if get_config("USING_NET") then
+    if get_config("USE_BUNDLED_LLHTTP") then
+        add_requires("llhttp")
+    end
+    if get_config("USING_SSL") then
+        add_requires("openssl3")
+    end
+end
+
+if get_config("USING_USB") then
+    add_requires("libusb")
+end
+
+if get_config("USING_EXAMPLE") then
+    add_requires("nlohmann_json")
+end
 
 
 -- 主静态库
@@ -83,12 +86,10 @@ target("co_wq")
         end
     end
 
-    add_packages("nlohmann_json", {public = true})
-
-        if get_config("USING_USB") then
-            add_defines("USING_USB", {public = true})
-            add_packages("libusb", {public = true})
-        end
+    if get_config("USING_USB") then
+        add_defines("USING_USB", {public = true})
+        add_packages("libusb", {public = true})
+    end
 
 target_end()
 

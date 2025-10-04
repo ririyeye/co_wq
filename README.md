@@ -30,30 +30,55 @@
 ```bash
 $ bash script/xmk-local.sh
 ```
-脚本会执行：
-1. 以 `releasedbg` 模式启用 examples，并将输出目录设置为 `build/`；
-2. 生成 `compile_commands.json`；
-3. 构建并安装产物到 `install/`。
+脚本默认以 `releasedbg` 模式启用网络/TLS/USB 模块与全部示例，执行流程：
+1. 以 `releasedbg` 模式写入配置，将输出目录设置为 `build/`；
+2. 根据“full”预设打开 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USING_USB/USING_EXAMPLE`；
+3. 生成 `compile_commands.json`；
+4. 构建并安装产物到 `install/`。
+
+若仅需最小核心（仅 `task/` 与 `sync/`），可执行：
+
+```bash
+$ bash script/xmk-local.sh --core
+```
+
+使用 `--help` 查看可用模式说明。
 
 ### Windows（MSVC 工具链，本机）
 在包含 Visual Studio 工具链的 PowerShell 提示符中执行：
 ```powershell
 PS> .\script\xmsvc.bat
 ```
-批处理会：
-1. 以 `releasedbg` 模式启用 examples，并把输出目录设为 `build/`；
+批处理默认执行与 `xmk-local.sh` 相同的“full”配置（启用网络/TLS/USB/示例），流程包括：
+1. 以 `releasedbg` 模式写入配置并使用 `build/` 目录；
 2. 生成 `compile_commands.json`；
 3. 构建并安装到 `install/`。
+
+若只需核心库，可附加 `--core` 参数：
+
+```powershell
+PS> .\script\xmsvc.bat --core
+```
+
+同样可通过 `--help` 查看模式说明。
 
 ### Windows（Wine + MSVC 工具链）
 参考 `script/xmk-wine-msvc.sh`：
 ```bash
 $ bash script/xmk-wine-msvc.sh
 ```
-脚本会：
-1. 设置 `--sdk=/opt/toolchain/msvc-wine/msvc`，在 `windows x64` 目标上以 `releasedbg` 模式启用 examples（输出目录 `build/`）；
+脚本默认以 `releasedbg` 模式仅构建核心库（关闭 `USING_NET/USING_SSL/USING_USB/USING_EXAMPLE`），步骤包括：
+1. 写入 `--sdk=/opt/toolchain/msvc-wine/msvc` 等配置并使用 `build/` 作为输出目录；
 2. 构建并安装 `co_wq` 静态库；
 3. 生成 `compile_commands.json` 给 IDE 使用。
+
+若需要完整网络/TLS/USB + 示例，可追加 `--full`：
+
+```bash
+$ bash script/xmk-wine-msvc.sh --full
+```
+
+脚本也提供 `--help` 查看全部参数说明。
 
 > ℹ️ 首次执行任一构建脚本时，xmake 会通过内置包管理器下载依赖（如 llhttp、openssl、libusb），请确保网络连通。
 
@@ -72,18 +97,30 @@ PS> .\script\clean.bat
 会同样清理工作区内的构建产物，并额外尝试删除 `%USERPROFILE%\.xmake` 缓存。
 
 ## 手动使用 xmake
-`xmake.lua` 提供两个可选开关：
+默认配置仅输出核心组件（`task/` 与 `sync/`），无额外第三方依赖。可通过下表开关选择性启用模块：
 
 | 选项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `USING_NET` | `true` | 启用网络相关头文件与依赖 |
-| `USING_EXAMPLE` | `false` | 构建 `test/` 下示例程序 |
-| `USING_SSL` | `true` | 构建时链接 OpenSSL 并暴露 TLS 支持 |
-| `USING_USB` | `true` | 启用基于 libusb 的 USB 协程封装 |
+| `USING_NET` | `false` | 启用网络相关头文件与依赖（TCP/UDP/TLS/WebSocket 等） |
+| `USING_SSL` | `false` | 链接 OpenSSL，暴露 TLS/DTLS/socket TLS awaiter |
+| `USE_BUNDLED_LLHTTP` | `true` | 使用内置 `llhttp` 包处理 HTTP/WebSocket 升级（仅在 `USING_NET=y` 时生效） |
+| `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
+| `USING_EXAMPLE` | `false` | 构建 `test/` 目录下示例程序（需要配合 `USING_NET=y`） |
 
-示例命令：
+最小化构建示例：
+
 ```bash
-xmake f -y -m releasedbg --USING_NET=y --USING_EXAMPLE=n -o build
+xmake f -y -m releasedbg -o build
+xmake -vD
+xmake install -o install
+```
+
+启用全部网络 + 示例的配置可手动写为：
+
+```bash
+xmake f -y -m releasedbg -o build \
+  --USING_NET=y --USING_SSL=y --USE_BUNDLED_LLHTTP=y \
+  --USING_USB=y --USING_EXAMPLE=y
 xmake -vD
 xmake install -o install
 ```
@@ -92,14 +129,14 @@ xmake install -o install
 
 ## TLS/SSL 支持
 
-`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。默认构建脚本已开启 `USING_SSL`，若需关闭可传入 `xmake f --USING_SSL=n`。此外还提供 `net::dtls_socket` 封装，基于 UDP (`net::udp_socket`) 组合实现 DTLS 握手与读写 awaiter，适用于低时延场景（需保证底层 UDP 已绑定/连接到对端）。
+`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。核心构建默认不启用 SSL，若需要 TLS/DTLS，可在配置阶段添加 `--USING_NET=y --USING_SSL=y`（或直接运行 `script/xmk-local.sh`/`xmsvc.bat` 默认的 “full” 模式）。此外还提供 `net::dtls_socket` 封装，基于 UDP (`net::udp_socket`) 组合实现 DTLS 握手与读写 awaiter，适用于低时延场景（需保证底层 UDP 已绑定/连接到对端）。
 
 ## USB IO 支持
 
-若需在协程内访问 USB 设备，可利用默认开启的 `USING_USB` 构建选项（若系统未安装 libusb，可通过 `--USING_USB=n` 关闭）：
+若需在协程内访问 USB 设备，可在配置时开启 `USING_USB`（核心配置默认关闭，以避免拉取 libusb）：
 
 ```bash
-xmake f -y --USING_USB=y   # 默认即为 y，如需关闭改为 n
+xmake f -y --USING_USB=y
 xmake build co_wq
 ```
 
@@ -153,10 +190,13 @@ xmake run co_usb --help
 编译并运行：
 
 ```bash
-xmake f -y --USING_EXAMPLE=y
+xmake f -y -m releasedbg -o build \
+  --USING_NET=y --USING_SSL=y --USE_BUNDLED_LLHTTP=y --USING_EXAMPLE=y
 xmake build co_http
 xmake run co_http --host 0.0.0.0 --port 8443 --cert certs/server.crt --key certs/server.key
 ```
+
+> ✅ 已执行 `script/xmk-local.sh` 或 `script/xmsvc.bat` 默认的 “full” 模式时，可跳过上述 `xmake f` 配置步骤。
 
 随后可通过浏览器或 `curl` 访问：
 
@@ -167,7 +207,7 @@ curl -k https://127.0.0.1:8443/
 > ⚠️ 自签证书仅用于测试；生产环境请使用受信任的 CA 证书，并在服务端配置 `SSL_CTX_load_verify_locations` 等细节。
 
 ## 示例程序
-启用 `USING_EXAMPLE=y` 后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：
+以下示例假设已通过 `script/xmk-local.sh`（默认 full）或手动执行 `xmake f` 使 `USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_EXAMPLE=y`（以及按需开启 `USING_SSL/USING_USB`）。完成配置后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：
 ```bash
 xmake run echo --both --host 127.0.0.1 --port 12345
 ```
@@ -227,7 +267,7 @@ xmake run echo --both --host 127.0.0.1 --port 12345
 `co_uds` 展示了基于 `unix_listener/unix_socket` 的本地 IPC echo 逻辑：
 
 ```bash
-xmake f -y --USING_EXAMPLE=y
+xmake f -y -m releasedbg -o build --USING_NET=y --USING_EXAMPLE=y
 xmake build co_uds
 xmake run co_uds --path /tmp/co_wq_uds.sock --message "ping uds"
 ```

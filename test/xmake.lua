@@ -14,6 +14,7 @@ target("co_http")
 
     add_files("http_server.cpp")
     add_files("syswork.cpp")
+    add_packages("nlohmann_json")
 
 target_end()
 
