@@ -241,6 +241,29 @@ xmake run echo --both --host 127.0.0.1 --port 12345
   {"status":"ok","method":"POST","path":"/echo-json","request":{"message":"hello co_wq"},"request_content_type":"application/json"}
   ```
 
+### HTTP Forward Proxy 示例
+
+`co_http_proxy` 展示了如何基于 `llhttp` 解析器实现带 CONNECT 支持的正向代理。示例在解析请求后会重新构造 origin-form 请求并回源，同时为 `CONNECT` 方法建立双向隧道。
+
+```bash
+xmake run co_http_proxy --host 127.0.0.1 --port 18080
+```
+
+然后通过 curl 验证：
+
+```bash
+curl --proxy http://127.0.0.1:18080 http://example.com
+curl --proxy http://127.0.0.1:18080 https://example.com --proxytunnel
+```
+
+程序默认开启调试日志（输出到 `stderr`），包含时间戳、线程 ID 以及关键事件，例如“收到请求”“上游连接结果”“CONNECT 隧道关闭”等。可使用标准重定向将日志落地：
+
+```bash
+xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
+```
+
+如需关闭日志，可在源码中将 `g_debug_logging` 初始化为 `false`，或依据自身需求扩展命令行开关。
+
   ### WebSocket Echo 示例
 
   `net/websocket.hpp` 提供基于 llhttp 的握手辅助与帧收发工具函数，`co_ws` 示例展示了如何在协程中构建 WebSocket 服务：

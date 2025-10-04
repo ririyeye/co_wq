@@ -18,6 +18,15 @@ target("co_http")
 
 target_end()
 
+target("co_http_proxy")
+    set_kind("binary")
+    add_deps("co_wq")
+
+    add_files("http_proxy.cpp")
+    add_files("syswork.cpp")
+
+target_end()
+
 target("co_ws")
     set_kind("binary")
     add_deps("co_wq")

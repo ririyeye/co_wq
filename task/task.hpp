@@ -29,10 +29,12 @@ struct Promise_base {
         bool                    await_ready() const noexcept { return false; }
         std::coroutine_handle<> await_suspend(std::coroutine_handle<>) const noexcept
         {
-            if (self->mOnCompleted) {
-                self->mOnCompleted(*self);
+            auto previous     = self->mPrevious;
+            auto on_completed = self->mOnCompleted;
+            if (on_completed) {
+                on_completed(*self);
             }
-            return self->mPrevious ? self->mPrevious : std::noop_coroutine();
+            return previous ? previous : std::noop_coroutine();
         }
         void await_resume() const noexcept { }
     };
