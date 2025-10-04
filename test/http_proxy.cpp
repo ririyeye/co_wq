@@ -13,22 +13,16 @@
 
 #include <llhttp.h>
 
-#include <algorithm>
-#include <arpa/inet.h>
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <cerrno>
 #include <chrono>
-#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
-#include <netdb.h>
-#include <netinet/in.h>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -41,8 +35,16 @@
 #if defined(_WIN32)
 #include <basetsd.h>
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <unistd.h>
+
 #endif
 
 using namespace co_wq;
@@ -239,29 +241,61 @@ std::optional<ConnectTarget> parse_connect_target(std::string_view target)
     return ct;
 }
 
-// 提供给 tcp_socket::connect_with 的地址提供器，内部使用 getaddrinfo。
-struct ResolvedEndpoint {
-    std::string host;
-    uint16_t    port { 0 };
+Task<int, Work_Promise<SpinLock, int>>
+connect_upstream(net::tcp_socket<SpinLock>& socket, const std::string& host, uint16_t port)
+{
+    struct addrinfo hints {};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
-    bool build(sockaddr_storage& storage, socklen_t& len) const
-    {
-        struct addrinfo hints {};
-        hints.ai_family   = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_protocol = IPPROTO_TCP;
-
-        struct addrinfo* result   = nullptr;
-        std::string      port_str = std::to_string(port);
-        int              rc       = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
-        if (rc != 0 || result == nullptr)
-            return false;
-        len = static_cast<socklen_t>(std::min<size_t>(result->ai_addrlen, sizeof(storage)));
-        std::memcpy(&storage, result->ai_addr, len);
-        ::freeaddrinfo(result);
-        return true;
+    struct addrinfo* result   = nullptr;
+    std::string      port_str = std::to_string(port);
+    int              rc       = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
+    if (rc != 0 || result == nullptr) {
+        if (result)
+            ::freeaddrinfo(result);
+        co_return -1;
     }
-};
+
+    int ret = -1;
+#if !defined(_WIN32)
+    struct StaticEndpoint {
+        sockaddr_storage addr {};
+        socklen_t        len { 0 };
+        bool             build(sockaddr_storage& storage, socklen_t& out_len) const
+        {
+            std::memcpy(&storage, &addr, len);
+            out_len = len;
+            return true;
+        }
+    };
+#endif
+
+    for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
+        if (ai->ai_family != AF_INET)
+            continue;
+#if defined(_WIN32)
+        auto* in = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
+        char  ip_buf[INET_ADDRSTRLEN] {};
+        if (::inet_ntop(AF_INET, &in->sin_addr, ip_buf, sizeof(ip_buf)) == nullptr)
+            continue;
+        ret = co_await socket.connect(ip_buf, static_cast<uint16_t>(ntohs(in->sin_port)));
+#else
+        StaticEndpoint endpoint;
+        endpoint.len = static_cast<socklen_t>(ai->ai_addrlen);
+        if (endpoint.len > static_cast<socklen_t>(sizeof(endpoint.addr)))
+            endpoint.len = static_cast<socklen_t>(sizeof(endpoint.addr));
+        std::memcpy(&endpoint.addr, ai->ai_addr, endpoint.len);
+        ret = co_await socket.connect_with(endpoint);
+#endif
+        if (ret == 0)
+            break;
+    }
+
+    ::freeaddrinfo(result);
+    co_return ret;
+}
 
 // 构造最小化的 HTTP/1.1 错误/控制响应。
 std::string build_http_response(int status_code, std::string_view reason, std::string_view body)
@@ -473,7 +507,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
         auto msg = oss.str();
         debug_log(msg);
     }
-    int rc = co_await upstream.connect_with(ResolvedEndpoint { target.host, target.port });
+    int rc = co_await connect_upstream(upstream, target.host, target.port);
     if (rc != 0) {
         std::ostringstream oss;
         oss << peer_id << " CONNECT upstream failed: " << target.host << ':' << target.port << " rc=" << rc;
@@ -520,7 +554,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         auto msg = oss.str();
         debug_log(msg);
     }
-    int rc = co_await upstream.connect_with(ResolvedEndpoint { parts.host, parts.port });
+    int rc = co_await connect_upstream(upstream, parts.host, parts.port);
     if (rc != 0) {
         std::ostringstream oss;
         oss << peer_id << " upstream connect failed: " << parts.host << ':' << parts.port << " rc=" << rc;
@@ -686,7 +720,29 @@ Task<void, Work_Promise<SpinLock, void>>
 proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_t port)
 {
     net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor());
-    listener.bind_listen(host, port, 128);
+    try {
+        listener.bind_listen(host, port, 128);
+    } catch (const std::exception& ex) {
+        std::ostringstream oss;
+        oss << "[proxy] failed to bind " << host << ':' << port << ": " << ex.what();
+#if defined(_WIN32)
+        int wsa_err = WSAGetLastError();
+        if (wsa_err != 0) {
+            oss << " (WSA error " << wsa_err << ')';
+        }
+#else
+        int sys_err = errno;
+        if (sys_err != 0) {
+            oss << " (" << std::strerror(sys_err) << " errno=" << sys_err << ')';
+        }
+#endif
+        auto msg = oss.str();
+        std::cerr << msg << '\n';
+        debug_log(msg);
+        listener.close();
+        g_listener_fd.store(-1, std::memory_order_release);
+        co_return;
+    }
     g_listener_fd.store(listener.native_handle(), std::memory_order_release);
 
     std::cout << "[proxy] listening on " << host << ':' << port << "\n";
