@@ -12,11 +12,11 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #if defined(_WIN32)
 #include <basetsd.h>
@@ -29,6 +29,14 @@
 using namespace co_wq;
 
 namespace {
+
+inline std::string errno_message(int err)
+{
+    if (err <= 0)
+        return {};
+    std::error_code ec(err, std::system_category());
+    return ec.message();
+}
 
 std::atomic_bool               g_stop { false };
 std::atomic<int>               g_listener_fd { -1 };
@@ -107,13 +115,19 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_webso
             int err = -msg_res.error;
             if (msg_res.error == -ECONNRESET || msg_res.error == -EPIPE) {
                 std::cout << "[ws] peer closed connection";
-                if (err > 0)
-                    std::cout << " (" << err << ": " << std::strerror(err) << ")";
+                if (err > 0) {
+                    const auto err_text = errno_message(err);
+                    if (!err_text.empty())
+                        std::cout << " (" << err << ": " << err_text << ")";
+                }
                 std::cout << "\n";
             } else {
                 std::cerr << "[ws] read error: " << msg_res.error;
-                if (err > 0)
-                    std::cerr << " (" << err << ": " << std::strerror(err) << ")";
+                if (err > 0) {
+                    const auto err_text = errno_message(err);
+                    if (!err_text.empty())
+                        std::cerr << " (" << err << ": " << err_text << ")";
+                }
                 std::cerr << "\n";
             }
             break;
