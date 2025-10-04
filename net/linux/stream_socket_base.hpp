@@ -119,30 +119,33 @@ protected:
         Derived& owner;
         Provider provider;
         int      ret { 0 };
-        connect_awaiter(Derived& s, Provider p) : owner(s), provider(std::move(p)) { }
+        connect_awaiter(Derived& s, Provider p) : owner(s), provider(std::move(p))
+        {
+            this->route_ctx  = &owner.callback_queue();
+            this->route_post = &callback_wq<lock>::post_adapter;
+        }
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> h)
         {
-            this->h          = h;
-            this->route_ctx  = &owner.callback_queue();
-            this->route_post = &callback_wq<lock>::post_adapter;
+            this->h    = h;
+            this->func = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_storage addr {};
             socklen_t        len { 0 };
             if (!provider.build(addr, len)) {
                 ret = -1;
-                owner.exec().post(*this);
+                net::post_via_route(owner.exec(), *this);
                 return;
             }
             int r = ::connect(owner.native_handle(), reinterpret_cast<sockaddr*>(&addr), len);
             if (r == 0) {
                 ret = 0;
-                owner.exec().post(*this);
+                net::post_via_route(owner.exec(), *this);
                 return;
             }
             if (r < 0 && errno != EINPROGRESS) {
                 ret = -1;
-                owner.exec().post(*this);
+                net::post_via_route(owner.exec(), *this);
                 return;
             }
             owner.reactor()->add_waiter(owner.native_handle(), EPOLLOUT, this);

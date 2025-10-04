@@ -11,10 +11,10 @@
 #pragma once
 
 #include "callback_wq.hpp"
-#include "reactor_default.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
+#include "reactor_default.hpp"
 #include "worker.hpp"
 #include <basetsd.h>
 #include <mswsock.h>
@@ -105,6 +105,7 @@ public:
             this->h          = coro;
             this->route_ctx  = &us._cbq;
             this->route_post = &callback_wq<lock>::post_adapter;
+            this->func       = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
             sockaddr_in addr {};
             addr.sin_family = AF_INET;
