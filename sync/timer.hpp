@@ -102,6 +102,13 @@ private:
             dpos->parent      = nullptr;
             dpos->child       = nullptr;
             dpos->sibling     = nullptr;
+            if (!dpos->func) {
+                std::fprintf(stderr,
+                             "[timer] warning: popped node %p has null func (queue=%p)\n",
+                             static_cast<void*>(dpos),
+                             static_cast<void*>(this));
+                continue;
+            }
             _executor.add_new_nolock(*dpos);
             trig_flg = 1;
         }

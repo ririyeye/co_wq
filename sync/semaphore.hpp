@@ -281,6 +281,11 @@ template <lockable lock> struct SemReqTimeoutAwaiter : Sem_req {
         mTimeout.req    = this;
         mTimeout.armed.store(true, std::memory_order_release);
 
+        // Ensure worknode links are in a clean initial state before enqueueing
+        INIT_LIST_HEAD(&this->ws_node);
+        INIT_LIST_HEAD(&mTimeout.ws_node);
+        mTimeout.func = &TimeoutNode::on_timer;
+
         // 当信号量可用时被 post，检查是否仍有效；有效则取消定时器并恢复协程
         func = [](struct worknode* pws) {
             auto* self = static_cast<SemReqTimeoutAwaiter*>(pws);

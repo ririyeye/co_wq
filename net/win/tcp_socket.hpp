@@ -13,9 +13,9 @@
 #include "reactor_default.hpp"
 #include "stream_socket_base.hpp"
 #include "worker.hpp"
+#include <atomic>
 #include <basetsd.h>
 #include <mswsock.h>
-#include <stdexcept>
 #include <string>
 #include <vector>
 #include <winsock2.h>
@@ -72,6 +72,28 @@ public:
     using base::socket_handle;
     using base::tx_shutdown;
 
+    static void
+    log_waiter_state(const char* tag, const io_waiter_base* waiter, [[maybe_unused]] const char* detail = nullptr)
+    {
+        if (!tag)
+            tag = "<null-tag>";
+        [[maybe_unused]] const char*   name  = (waiter && waiter->debug_name) ? waiter->debug_name : "<null-name>";
+        [[maybe_unused]] std::uint32_t magic = waiter ? waiter->debug_magic : 0;
+        [[maybe_unused]] void*         func  = waiter ? reinterpret_cast<void*>(waiter->func) : nullptr;
+        auto                           guard = waiter ? waiter->load_route_guard() : io_waiter_base::route_guard_ptr {};
+        [[maybe_unused]] long          guard_use = io_waiter_base::route_guard_use_count(guard);
+        [[maybe_unused]] void*         guard_ptr = guard ? guard.get() : nullptr;
+        CO_WQ_CBQ_TRACE("[tcp_socket] %s waiter=%p func=%p name=%s magic=%08x guard_use=%ld guard_ptr=%p detail=%s\n",
+                        tag,
+                        static_cast<const void*>(waiter),
+                        func,
+                        name,
+                        magic,
+                        guard_use,
+                        guard_ptr,
+                        detail ? detail : "");
+    }
+
     /**
      * @brief ConnectEx Awaiter，负责协程化的 TCP 建连。
      */
@@ -84,12 +106,40 @@ public:
         LPFN_CONNECTEX _connectex { nullptr };
         sockaddr_in    addr {};
         bool           issued { false };
+        std::uint32_t  ovl_generation { 0 };
         connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &sock.callback_queue();
+            ovl.cancelled.store(true, std::memory_order_relaxed);
+            ovl.waiter = this;
+            auto& cbq  = sock.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
+            this->set_debug_name("tcp_socket::connect");
+            log_waiter_state("connect ctor", this, host.c_str());
+        }
+        ~connect_awaiter()
+        {
+            if (ovl.waiter == this) {
+                ovl.cancelled.store(true);
+                CO_WQ_CBQ_TRACE("[tcp_socket] connect dtor clearing ovl waiter=%p\n", static_cast<void*>(this));
+                ovl.waiter = nullptr;
+            }
+            if (auto guard = this->exchange_route_guard()) {
+                [[maybe_unused]] long  guard_use = io_waiter_base::route_guard_use_count(guard);
+                [[maybe_unused]] void* guard_ptr = guard.get();
+                CO_WQ_CBQ_TRACE("[tcp_socket] connect guard release waiter=%p guard_use=%ld guard_ptr=%p\n",
+                                static_cast<void*>(this),
+                                guard_use,
+                                guard_ptr);
+                CO_WQ_CBQ_TRACE("[tcp_socket] connect guard released waiter=%p\n", static_cast<void*>(this));
+            }
+            if (issued && ret != 0 && this->func == &io_waiter_base::resume_cb && !this->h) {
+                CO_WQ_CBQ_WARN("[tcp_socket] connect dtor warning: issued without coroutine handle waiter=%p\n",
+                               static_cast<void*>(this));
+            }
+            log_waiter_state("connect dtor", this, issued ? "issued" : "not-issued");
         }
         bool load_connectex()
         {
@@ -107,6 +157,12 @@ public:
                          NULL,
                          NULL)
                 == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                ret     = err ? -static_cast<int>(err) : -1;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] load_connectex failed host=%s port=%u err=%d\n",
+                               host.c_str(),
+                               static_cast<unsigned>(port),
+                               err);
                 _connectex = nullptr;
                 return false;
             }
@@ -118,27 +174,43 @@ public:
             addr.sin_family = AF_INET;
             addr.sin_port   = htons(port);
             if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-                ret = -1;
+                int err = WSAGetLastError();
+                ret     = err ? -static_cast<int>(err) : -1;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] InetPtonA failed host=%s port=%u err=%d\n",
+                               host.c_str(),
+                               static_cast<unsigned>(port),
+                               err);
                 return true;
             }
             if (!load_connectex()) {
-                ret = -1;
                 return true;
             }
             sockaddr_in local {};
             local.sin_family      = AF_INET;
             local.sin_addr.s_addr = INADDR_ANY;
             local.sin_port        = 0;
-            ::bind(sock.socket_handle(), reinterpret_cast<sockaddr*>(&local), sizeof(local));
+            if (::bind(sock.socket_handle(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                ret     = err ? -static_cast<int>(err) : -1;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] bind failed host=%s port=%u err=%d\n",
+                               host.c_str(),
+                               static_cast<unsigned>(port),
+                               err);
+                return true;
+            }
             this->func = &io_waiter_base::resume_cb;
-            BOOL ok    = _connectex(sock.socket_handle(),
+            ovl.cancelled.store(false, std::memory_order_release);
+            ovl.waiter     = this;
+            ovl_generation = ovl.generation.fetch_add(1) + 1;
+            ovl.generation.store(ovl_generation, std::memory_order_release);
+            BOOL ok = _connectex(sock.socket_handle(),
                                  reinterpret_cast<sockaddr*>(&addr),
                                  sizeof(addr),
                                  nullptr,
                                  0,
                                  nullptr,
                                  &ovl);
-            issued     = true;
+            issued  = true;
             if (ok) {
                 setsockopt(sock.socket_handle(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
                 ret = 0;
@@ -146,14 +218,36 @@ public:
             }
             int err = WSAGetLastError();
             if (err != ERROR_IO_PENDING) {
-                ret = -1;
+                ret = err ? -static_cast<int>(err) : -1;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] ConnectEx immediate failure host=%s port=%u err=%d\n",
+                               host.c_str(),
+                               static_cast<unsigned>(port),
+                               err);
                 return true;
             }
             return false;
         }
-        void await_suspend(std::coroutine_handle<> awaiting) { this->h = awaiting; }
-        int  await_resume() noexcept
+        void await_suspend(std::coroutine_handle<> awaiting)
         {
+            [[maybe_unused]] void* haddr = awaiting ? awaiting.address() : nullptr;
+            CO_WQ_CBQ_TRACE("[tcp_socket::connect] await_suspend this=%p awaiting=%p host=%s port=%u issued=%d\n",
+                            static_cast<void*>(this),
+                            haddr,
+                            host.c_str(),
+                            static_cast<unsigned>(port),
+                            issued ? 1 : 0);
+            this->h = awaiting;
+            log_waiter_state("connect suspend", this, issued ? "issued" : "not-issued");
+        }
+        int await_resume() noexcept
+        {
+            CO_WQ_CBQ_TRACE("[tcp_socket::connect] await_resume this=%p h=%p host=%s port=%u ret=%d issued=%d\n",
+                            static_cast<void*>(this),
+                            this->h ? this->h.address() : nullptr,
+                            host.c_str(),
+                            static_cast<unsigned>(port),
+                            ret,
+                            issued ? 1 : 0);
             if (ret == 0)
                 return 0;
             if (issued && ret != 0) {
@@ -163,9 +257,15 @@ public:
                     setsockopt(sock.socket_handle(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
                     ret = 0;
                 } else {
-                    ret = -1;
+                    int err = WSAGetLastError();
+                    ret     = err ? -static_cast<int>(err) : -1;
+                    CO_WQ_CBQ_WARN("[tcp_socket::connect] overlapped completion failed host=%s port=%u err=%d\n",
+                                   host.c_str(),
+                                   static_cast<unsigned>(port),
+                                   err);
                 }
             }
+            log_waiter_state("connect resume", this, ret == 0 ? "ok" : "error");
             return ret;
         }
     };
@@ -189,9 +289,13 @@ public:
             : serial_slot_awaiter<recv_awaiter, tcp_socket>(owner, owner.recv_queue()), buf(b), len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &owner.callback_queue();
+            ovl.waiter = this;
+            ovl.cancelled.store(true, std::memory_order_relaxed);
+            auto& cbq = owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
+            this->set_debug_name("tcp_socket::recv");
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -209,6 +313,7 @@ public:
             DWORD  flags = 0;
             DWORD  recvd = 0;
             ovl.waiter   = this;
+            ovl.cancelled.store(false, std::memory_order_release);
             this->func   = &recv_awaiter::completion_cb;
             int r        = WSARecv(socket_handle(), &wbuf, 1, &recvd, &flags, &ovl, nullptr);
             if (r == 0) {
@@ -251,6 +356,7 @@ public:
             if (finished)
                 return;
             finished   = true;
+            ovl.cancelled.store(true, std::memory_order_release);
             ovl.waiter = nullptr;
             this->func = &io_waiter_base::resume_cb;
             serial_slot_awaiter<recv_awaiter, tcp_socket>::release(this);
@@ -306,9 +412,13 @@ public:
             , len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &owner.callback_queue();
+            ovl.waiter = this;
+            ovl.cancelled.store(true, std::memory_order_relaxed);
+            auto& cbq = owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
+            this->set_debug_name("tcp_socket::recv_all");
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -321,6 +431,7 @@ public:
             DWORD  flags = 0;
             DWORD  got   = 0;
             ovl.waiter   = this;
+            ovl.cancelled.store(false, std::memory_order_release);
             this->func   = &recv_all_awaiter::drive_cb;
             int r        = WSARecv(socket_handle(), &wbuf, 1, &got, &flags, &ovl, nullptr);
             if (r == 0) {
@@ -386,6 +497,7 @@ public:
             if (finished)
                 return;
             finished   = true;
+            ovl.cancelled.store(true, std::memory_order_release);
             ovl.waiter = nullptr;
             serial_slot_awaiter<recv_all_awaiter, tcp_socket>::release(this);
             this->func = &io_waiter_base::resume_cb;
@@ -431,9 +543,13 @@ public:
             , total(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &owner.callback_queue();
+            ovl.waiter = this;
+            ovl.cancelled.store(true, std::memory_order_relaxed);
+            auto& cbq = owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
+            this->set_debug_name(full_mode ? "tcp_socket::send_all" : "tcp_socket::send");
         }
         send_awaiter(tcp_socket& owner, const struct iovec* iov, int iovcnt, bool full_mode)
             : serial_slot_awaiter<send_awaiter, tcp_socket>(owner, owner.send_queue()), use_vec(true), full(full_mode)
@@ -447,9 +563,13 @@ public:
                 total += b.len;
             }
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &owner.callback_queue();
+            ovl.waiter = this;
+            ovl.cancelled.store(true, std::memory_order_relaxed);
+            auto& cbq = owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
+            this->set_debug_name(full_mode ? "tcp_socket::send_all" : "tcp_socket::sendv");
         }
         static void lock_acquired_cb(worknode* w)
         {
@@ -485,6 +605,7 @@ public:
             DWORD sent_now = 0;
             DWORD flags    = 0;
             ovl.waiter     = this;
+            ovl.cancelled.store(false, std::memory_order_release);
             this->func     = &send_awaiter::drive_cb;
             if (!use_vec) {
                 size_t remain = len - sent;
@@ -579,6 +700,7 @@ public:
             if (finished)
                 return;
             finished   = true;
+            ovl.cancelled.store(true, std::memory_order_release);
             ovl.waiter = nullptr;
             serial_slot_awaiter<send_awaiter, tcp_socket>::release(this);
             this->func = &io_waiter_base::resume_cb;

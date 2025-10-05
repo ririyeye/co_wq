@@ -208,7 +208,9 @@ template <lockable lock> struct NotifyReqTimeoutAwaiter : notify_req {
         mTimeout.armed.store(true, std::memory_order_release);
         mTimedOut = false;
         INIT_LIST_HEAD(&ws_node);
-        func = [](struct worknode* pws) {
+        INIT_LIST_HEAD(&mTimeout.ws_node);
+        mTimeout.func = &TimeoutNode::on_timer;
+        func          = [](struct worknode* pws) {
             auto* self = static_cast<NotifyReqTimeoutAwaiter*>(pws);
             if (!self->mTimeout.armed.exchange(false, std::memory_order_acq_rel)) {
                 return; // 已被超时处理

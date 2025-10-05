@@ -9,4 +9,11 @@ void __co_wq_archive_anchor__() { }
 extern "C" void wq_debug_check_func_addr(std::uintptr_t);
 extern "C" void wq_debug_check_func_addr_default(std::uintptr_t) { }
 #pragma comment(linker, "/alternatename:wq_debug_check_func_addr=wq_debug_check_func_addr_default")
+
+namespace co_wq {
+struct worknode;
+}
+extern "C" void wq_debug_null_func(co_wq::worknode*);
+extern "C" void wq_debug_null_func_default(co_wq::worknode*) { }
+#pragma comment(linker, "/alternatename:wq_debug_null_func=wq_debug_null_func_default")
 #endif

@@ -1,11 +1,11 @@
 // file_io.hpp - async file read/write (non-blocking + epoll/IOCP) with internal serialization
 #pragma once
 #ifdef __linux__
-#include "reactor_default.hpp"
 #include "callback_wq.hpp"
 #include "epoll_reactor.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
+#include "reactor_default.hpp"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdexcept>
@@ -44,10 +44,11 @@ public:
     int  native_handle() const { return _fd; }
     bool closed() const { return _closed || _fd < 0; }
     // Accessors for serial_slot_awaiter
-    workqueue<lock>& exec() { return _exec; }
-    lock&            serial_lock() { return _io_serial_lock; }
-    Reactor<lock>*   reactor() { return _reactor; }
-    void             close()
+    workqueue<lock>&   exec() { return _exec; }
+    lock&              serial_lock() { return _io_serial_lock; }
+    Reactor<lock>*     reactor() { return _reactor; }
+    callback_wq<lock>& callback_queue() { return _cbq; }
+    void               close()
     {
         if (_fd < 0)
             return;
@@ -71,7 +72,9 @@ public:
         bool    use_offset { false };
         read_awaiter(file_handle& f, void* b, size_t l) : tp_base<read_awaiter>(f, f._read_q), buf(b), len(l)
         {
-            this->route_ctx  = &this->owner._cbq;
+            auto& cbq = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         read_awaiter(file_handle& f, void* b, size_t l, off_t& ofs)
@@ -124,7 +127,9 @@ public:
         bool        use_offset { false };
         write_awaiter(file_handle& f, const void* b, size_t l) : tp_base<write_awaiter>(f, f._write_q), buf(b), len(l)
         {
-            this->route_ctx  = &this->owner._cbq;
+            auto& cbq = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         write_awaiter(file_handle& f, const void* b, size_t l, off_t& ofs)
@@ -207,10 +212,10 @@ inline file_handle<lock, Reactor> make_file_handle(workqueue<lock>& exec, Reacto
 
 } // namespace co_wq::net
 #elif defined(_WIN32)
-#include "reactor_default.hpp"
 #include "callback_wq.hpp"
 #include "io_waiter.hpp"
 #include "iocp_reactor.hpp"
+#include "reactor_default.hpp"
 #include <basetsd.h>
 #include <stdexcept>
 #include <windows.h>
@@ -253,10 +258,11 @@ public:
             _h = INVALID_HANDLE_VALUE;
         }
     }
-    bool             closed() const { return _h == INVALID_HANDLE_VALUE; }
-    int              native_handle() const { return (int)(intptr_t)_h; }
-    workqueue<lock>& exec() { return _exec; }
-    Reactor<lock>*   reactor() { return _reactor; }
+    bool               closed() const { return _h == INVALID_HANDLE_VALUE; }
+    int                native_handle() const { return (int)(intptr_t)_h; }
+    workqueue<lock>&   exec() { return _exec; }
+    Reactor<lock>*     reactor() { return _reactor; }
+    callback_wq<lock>& callback_queue() { return _cbq; }
     struct read_awaiter : io_waiter_base {
         file_handle& fh;
         void*        buf;
@@ -271,8 +277,10 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h          = coro;
-            this->route_ctx  = &fh._cbq;
+            this->h   = coro;
+            auto& cbq = fh.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
             this->func       = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
@@ -313,8 +321,10 @@ public:
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h          = coro;
-            this->route_ctx  = &fh._cbq;
+            this->h   = coro;
+            auto& cbq = fh.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
             this->func       = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);

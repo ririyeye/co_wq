@@ -459,7 +459,8 @@ public:
     {
         INIT_LIST_HEAD(&this->ws_node);
         if (_dev._cbq) {
-            this->route_ctx  = _dev._cbq.get();
+            this->store_route_guard(_dev._cbq->retain_guard());
+            this->route_ctx  = _dev._cbq->context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
     }

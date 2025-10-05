@@ -5,14 +5,42 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+
+#ifndef CO_WQ_ENABLE_CALLBACK_WQ_TRACE
+#define CO_WQ_ENABLE_CALLBACK_WQ_TRACE 0
+#endif
+
+#ifndef CO_WQ_ENABLE_CALLBACK_WQ_WARN
+#define CO_WQ_ENABLE_CALLBACK_WQ_WARN 1
+#endif
+
+#if CO_WQ_ENABLE_CALLBACK_WQ_TRACE
+#define CO_WQ_CBQ_TRACE(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define CO_WQ_CBQ_TRACE(...) ((void)0)
+#endif
+
+#if CO_WQ_ENABLE_CALLBACK_WQ_WARN
+#define CO_WQ_CBQ_WARN(...) std::fprintf(stderr, __VA_ARGS__)
+#else
+#define CO_WQ_CBQ_WARN(...) ((void)0)
+#endif
 
 // 可选的调试 Hook（弱符号，C 链接）：应用可在自身代码中定义以捕获队列中函数指针地址
 // 形参为指针大小的整数，可在 32/64 位平台安全使用；若未定义，该符号在 MSVC 下会别名到一个空实现。
+namespace co_wq {
+struct worknode;
+}
+
 #if defined(_MSC_VER) && !defined(__clang__)
 extern "C" void wq_debug_check_func_addr(std::uintptr_t addr);
 extern "C" void wq_debug_check_func_addr_default(std::uintptr_t addr);
+extern "C" void wq_debug_null_func(co_wq::worknode* node);
+extern "C" void wq_debug_null_func_default(co_wq::worknode* node);
 #else
 extern "C" void wq_debug_check_func_addr(std::uintptr_t addr) __attribute__((weak));
+extern "C" void wq_debug_null_func(co_wq::worknode* node) __attribute__((weak));
 #endif
 
 namespace co_wq {
@@ -101,6 +129,8 @@ template <lockable Lock> struct workqueue {
                 }
 #endif
                 fn(pnod);
+            } else {
+                CO_WQ_CBQ_WARN("[workqueue] warning: null func for node %p\n", static_cast<void*>(pnod));
             }
             return 1;
         }
@@ -111,12 +141,25 @@ template <lockable Lock> struct workqueue {
 #ifndef NDEBUG
         // Validate func before enqueue
         auto fn = pnode.func;
+        // 调试 hook：由应用侧（例如 app/main.cpp）可选实现
+        __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(fn));
+        if (fn == nullptr) {
+#if defined(_MSC_VER) && !defined(__clang__)
+            if (wq_debug_null_func != nullptr && wq_debug_null_func != wq_debug_null_func_default) {
+                wq_debug_null_func(&pnode);
+            }
+#else
+            if (wq_debug_null_func != nullptr) {
+                wq_debug_null_func(&pnode);
+            }
+#endif
+        }
         assert(fn != nullptr && "worknode.func must not be null when enqueuing");
         assert(!__wq_is_debug_poison_func_ptr(fn)
                && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
-#endif
-        // 调试 hook：由应用侧（例如 app/main.cpp）可选实现
+#else
         __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(pnode.func));
+#endif
 
         lk.lock();
         list_del(&pnode.ws_node);
@@ -137,9 +180,26 @@ template <lockable Lock> struct workqueue {
         for (list_head* pos = batch_head.next; pos != &batch_head; pos = pos->next) {
             worknode* wn = __wq_node_to_worknode(pos);
             auto      fn = wn->func;
+            __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(fn));
+            if (fn == nullptr) {
+#if defined(_MSC_VER) && !defined(__clang__)
+                if (wq_debug_null_func != nullptr && wq_debug_null_func != wq_debug_null_func_default) {
+                    wq_debug_null_func(wn);
+                }
+#else
+                if (wq_debug_null_func != nullptr) {
+                    wq_debug_null_func(wn);
+                }
+#endif
+            }
             assert(fn != nullptr && "worknode.func must not be null when enqueuing (batch)");
             assert(!__wq_is_debug_poison_func_ptr(fn)
                    && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized (batch)");
+        }
+#else
+        for (list_head* pos = batch_head.next; pos != &batch_head; pos = pos->next) {
+            worknode* wn = __wq_node_to_worknode(pos);
+            __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(wn->func));
         }
 #endif
         lk.lock();
@@ -162,9 +222,23 @@ template <lockable Lock> struct workqueue {
     {
 #ifndef NDEBUG
         auto fn = pnode.func;
+        __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(fn));
+        if (fn == nullptr) {
+#if defined(_MSC_VER) && !defined(__clang__)
+            if (wq_debug_null_func != nullptr && wq_debug_null_func != wq_debug_null_func_default) {
+                wq_debug_null_func(&pnode);
+            }
+#else
+            if (wq_debug_null_func != nullptr) {
+                wq_debug_null_func(&pnode);
+            }
+#endif
+        }
         assert(fn != nullptr && "worknode.func must not be null when enqueuing (nolock)");
         assert(!__wq_is_debug_poison_func_ptr(fn)
                && "worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized (nolock)");
+#else
+        __wq_maybe_invoke_debug_hook(reinterpret_cast<std::uintptr_t>(pnode.func));
 #endif
         list_del(&pnode.ws_node);
         list_add_tail(&pnode.ws_node, &ws_head);

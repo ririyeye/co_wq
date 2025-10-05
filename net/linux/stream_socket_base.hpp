@@ -121,7 +121,9 @@ protected:
         int      ret { 0 };
         connect_awaiter(Derived& s, Provider p) : owner(s), provider(std::move(p))
         {
-            this->route_ctx  = &owner.callback_queue();
+            auto& cbq = owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         bool await_ready() const noexcept { return false; }
@@ -256,7 +258,9 @@ public:
             , buf(static_cast<char*>(b))
             , len(l)
         {
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void register_wait(recv_awaiter* self, bool)
@@ -307,7 +311,9 @@ public:
             , buf(static_cast<const char*>(b))
             , len(l)
         {
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         send_awaiter(Derived& s, const struct iovec* iov, int iovcnt, bool f)
@@ -318,7 +324,9 @@ public:
                 vec.push_back(iov[i]);
                 len += iov[i].iov_len;
             }
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void register_wait(send_awaiter* self, bool)
@@ -465,7 +473,9 @@ public:
             , out_addr(addr)
             , out_len(alen)
         {
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void register_wait(recvfrom_awaiter* self, bool)
@@ -512,7 +522,9 @@ public:
             , buf(static_cast<const char*>(b))
             , len(l)
         {
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         send_awaiter(Derived& s, const void* b, size_t l, const address_type& d)
@@ -521,7 +533,9 @@ public:
             , buf(static_cast<const char*>(b))
             , len(l)
         {
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         send_awaiter(Derived& s, const struct iovec* iov, int iovcnt)
@@ -532,7 +546,9 @@ public:
                 vec.push_back(iov[i]);
                 len += iov[i].iov_len;
             }
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         send_awaiter(Derived& s, const struct iovec* iov, int iovcnt, const address_type& d)
@@ -545,7 +561,9 @@ public:
                 vec.push_back(iov[i]);
                 len += iov[i].iov_len;
             }
-            this->route_ctx  = &s.callback_queue();
+            auto& cbq = s.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void register_wait(send_awaiter* self, bool)

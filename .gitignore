@@ -10,3 +10,6 @@ install
 .vs
 certs
 core.*
+*.log
+log.txt
+event

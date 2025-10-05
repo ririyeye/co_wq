@@ -6,6 +6,7 @@
 #include "syswork.hpp"
 
 #include "fd_base.hpp"
+#include "io_waiter.hpp"
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
 #include "when_all.hpp"
@@ -18,6 +19,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
@@ -26,7 +28,6 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -34,9 +35,12 @@
 
 #if defined(_WIN32)
 #include <basetsd.h>
+#include <dbghelp.h>
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+#pragma comment(lib, "Dbghelp.lib")
 #else
 #include <arpa/inet.h>
 #include <cerrno>
@@ -51,19 +55,194 @@ using namespace co_wq;
 
 namespace {
 
+#if defined(_WIN32)
+extern "C" void wq_debug_check_func_addr(std::uintptr_t addr)
+{
+    const char* reason = nullptr;
+    if (addr == 0) {
+        reason = "null";
+    } else if (addr <= 0xFFFF) {
+        reason = "low-address";
+    }
+    void*           stack[32] {};
+    constexpr DWORD capacity = static_cast<DWORD>(sizeof(stack) / sizeof(stack[0]));
+    USHORT          frames   = CaptureStackBackTrace(0, capacity, stack, nullptr);
+    HANDLE          process  = GetCurrentProcess();
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS);
+    SymInitialize(process, nullptr, TRUE);
+    DWORD64                            displacement = 0;
+    constexpr DWORD                    max_name_len = 256;
+    alignas(SYMBOL_INFO) unsigned char func_symbol_buffer[sizeof(SYMBOL_INFO) + max_name_len];
+    auto*                              func_symbol = reinterpret_cast<PSYMBOL_INFO>(func_symbol_buffer);
+    func_symbol->SizeOfStruct                      = sizeof(SYMBOL_INFO);
+    func_symbol->MaxNameLen                        = max_name_len;
+    BOOL has_symbol = SymFromAddr(process, static_cast<DWORD64>(addr), &displacement, func_symbol);
+    bool misaligned = (addr & 0xF) != 0;
+    if (!reason && misaligned) {
+        if (has_symbol && func_symbol->Name[0] != '\0') {
+            const char* name = func_symbol->Name;
+            if (std::strstr(name, "ILT") != nullptr || std::strstr(name, "__guard_dispatch") != nullptr
+                || std::strstr(name, "__guard_check") != nullptr) {
+                misaligned = false; // treat import thunks / guard helpers as expected
+            }
+        }
+        if (misaligned)
+            reason = "misaligned";
+    }
+    if (!reason && has_symbol)
+        return; // resolved symbol looks valid, skip noise
+
+    if (has_symbol) {
+        std::fprintf(stderr,
+                     "[proxy] wq_debug_check_func_addr suspicious func=%p (%s+0x%llx) frames=%u reason=%s\n",
+                     reinterpret_cast<void*>(addr),
+                     func_symbol->Name,
+                     static_cast<unsigned long long>(displacement),
+                     frames,
+                     reason ? reason : "?");
+    } else {
+        std::fprintf(stderr,
+                     "[proxy] wq_debug_check_func_addr suspicious func=%p frames=%u reason=%s\n",
+                     reinterpret_cast<void*>(addr),
+                     frames,
+                     reason ? reason : "?");
+    }
+    for (USHORT i = 0; i < frames; ++i) {
+        auto* frame_addr = stack[i];
+        std::fprintf(stderr, "  [%u] %p", static_cast<unsigned>(i), frame_addr);
+        DWORD64                            frame_disp = 0;
+        alignas(SYMBOL_INFO) unsigned char symbol_buffer[sizeof(SYMBOL_INFO) + max_name_len];
+        auto*                              symbol_info = reinterpret_cast<PSYMBOL_INFO>(symbol_buffer);
+        symbol_info->SizeOfStruct                      = sizeof(SYMBOL_INFO);
+        symbol_info->MaxNameLen                        = max_name_len;
+        if (SymFromAddr(process, reinterpret_cast<DWORD64>(frame_addr), &frame_disp, symbol_info)) {
+            std::fprintf(stderr, " (%s+0x%llx)\n", symbol_info->Name, static_cast<unsigned long long>(frame_disp));
+        } else {
+            std::fprintf(stderr, "\n");
+        }
+    }
+}
+#endif
+
 // 是否开启调试日志，可根据需要在运行时调整。
-std::atomic_bool g_debug_logging { true };
+std::atomic_bool g_debug_logging { false };
+
+#if defined(_WIN32)
+LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
+{
+    auto* record = info ? info->ExceptionRecord : nullptr;
+    DWORD code   = record ? record->ExceptionCode : 0;
+    void* addr   = record ? record->ExceptionAddress : nullptr;
+    std::fprintf(stderr, "[proxy] unhandled exception code=0x%08lx addr=%p", static_cast<unsigned long>(code), addr);
+    auto ensure_dbghelp_initialized = [] {
+        static std::once_flag initialized;
+        std::call_once(initialized, [] {
+            HANDLE process = GetCurrentProcess();
+            SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS);
+            if (!SymInitialize(process, nullptr, TRUE)) {
+                DWORD err = GetLastError();
+                std::fprintf(stderr, "\n[proxy] SymInitialize failed: %lu\n", static_cast<unsigned long>(err));
+            }
+        });
+    };
+    ensure_dbghelp_initialized();
+    HANDLE                             process_handle = GetCurrentProcess();
+    DWORD64                            displacement   = 0;
+    constexpr DWORD                    max_name_len   = 256;
+    alignas(SYMBOL_INFO) unsigned char symbol_buffer[sizeof(SYMBOL_INFO) + max_name_len];
+    auto*                              symbol_info = reinterpret_cast<PSYMBOL_INFO>(symbol_buffer);
+    symbol_info->SizeOfStruct                      = sizeof(SYMBOL_INFO);
+    symbol_info->MaxNameLen                        = max_name_len;
+    if (addr != nullptr && SymFromAddr(process_handle, reinterpret_cast<DWORD64>(addr), &displacement, symbol_info)) {
+        IMAGEHLP_LINE64 line_info {};
+        line_info.SizeOfStruct  = sizeof(line_info);
+        DWORD line_displacement = 0;
+        if (SymGetLineFromAddr64(process_handle, reinterpret_cast<DWORD64>(addr), &line_displacement, &line_info)) {
+            std::fprintf(stderr,
+                         " (%s+0x%llx) %s:%lu\n",
+                         symbol_info->Name,
+                         static_cast<unsigned long long>(displacement),
+                         line_info.FileName ? line_info.FileName : "<unknown>",
+                         static_cast<unsigned long>(line_info.LineNumber));
+        } else {
+            std::fprintf(stderr, " (%s+0x%llx)\n", symbol_info->Name, static_cast<unsigned long long>(displacement));
+        }
+    } else {
+        std::fprintf(stderr, "\n");
+    }
+    if (info && info->ContextRecord) {
+        ensure_dbghelp_initialized();
+        CONTEXT      context_copy = *info->ContextRecord;
+        STACKFRAME64 frame {};
+        frame.AddrPC.Offset    = context_copy.Rip;
+        frame.AddrPC.Mode      = AddrModeFlat;
+        frame.AddrFrame.Offset = context_copy.Rsp;
+        frame.AddrFrame.Mode   = AddrModeFlat;
+        frame.AddrStack.Offset = context_copy.Rsp;
+        frame.AddrStack.Mode   = AddrModeFlat;
+
+        HANDLE thread_handle  = GetCurrentThread();
+        HANDLE process_handle = GetCurrentProcess();
+        for (USHORT i = 0;; ++i) {
+            BOOL ok = StackWalk64(IMAGE_FILE_MACHINE_AMD64,
+                                  process_handle,
+                                  thread_handle,
+                                  &frame,
+                                  &context_copy,
+                                  nullptr,
+                                  SymFunctionTableAccess64,
+                                  SymGetModuleBase64,
+                                  nullptr);
+            if (!ok)
+                break;
+            DWORD64 frame_addr = frame.AddrPC.Offset;
+            if (frame_addr == 0)
+                break;
+            std::fprintf(stderr, "  frame[%u] = %p", static_cast<unsigned>(i), reinterpret_cast<void*>(frame_addr));
+            DWORD64                            frame_disp   = 0;
+            constexpr DWORD                    max_name_len = 256;
+            alignas(SYMBOL_INFO) unsigned char frame_symbol_buffer[sizeof(SYMBOL_INFO) + max_name_len];
+            auto*                              frame_symbol_info = reinterpret_cast<PSYMBOL_INFO>(frame_symbol_buffer);
+            frame_symbol_info->SizeOfStruct                      = sizeof(SYMBOL_INFO);
+            frame_symbol_info->MaxNameLen                        = max_name_len;
+            if (SymFromAddr(process_handle, frame_addr, &frame_disp, frame_symbol_info)) {
+                IMAGEHLP_LINE64 line_info {};
+                line_info.SizeOfStruct = sizeof(line_info);
+                DWORD line_disp        = 0;
+                if (SymGetLineFromAddr64(process_handle, frame_addr, &line_disp, &line_info)) {
+                    std::fprintf(stderr,
+                                 " (%s+0x%llx) %s:%lu\n",
+                                 frame_symbol_info->Name,
+                                 static_cast<unsigned long long>(frame_disp),
+                                 line_info.FileName ? line_info.FileName : "<unknown>",
+                                 static_cast<unsigned long>(line_info.LineNumber));
+                } else {
+                    std::fprintf(stderr,
+                                 " (%s+0x%llx)\n",
+                                 frame_symbol_info->Name,
+                                 static_cast<unsigned long long>(frame_disp));
+                }
+            } else {
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
 
 /**
  * @brief 打印带时间戳/线程 ID 的调试日志。
  */
-void debug_log(std::string_view message)
+template <typename Str> void debug_log(Str&& message_input)
 {
     if (!g_debug_logging.load(std::memory_order_relaxed))
         return;
 
     static std::mutex           log_mutex;
     std::lock_guard<std::mutex> guard(log_mutex);
+
+    std::string message(std::forward<Str>(message_input));
 
     using clock = std::chrono::system_clock;
     auto    now = clock::now();
@@ -128,24 +307,93 @@ struct HttpProxyContext {
     bool                                         message_complete { false };
     int                                          http_major { 1 };
     int                                          http_minor { 1 };
-
-    void reset()
-    {
-        method.clear();
-        url.clear();
-        headers.clear();
-        header_sequence.clear();
-        current_field.clear();
-        current_value.clear();
-        body.clear();
-        headers_complete = false;
-        message_complete = false;
-        http_major       = 1;
-        http_minor       = 1;
-    }
+    void                                         reset();
 };
 
-std::string to_lower(std::string_view input)
+inline void HttpProxyContext::reset()
+{
+    method.clear();
+    url.clear();
+    headers.clear();
+    header_sequence.clear();
+    current_field.clear();
+    current_value.clear();
+    body.clear();
+    headers_complete = false;
+    message_complete = false;
+    http_major       = 1;
+    http_minor       = 1;
+}
+
+void debug_check_string_integrity(const char* label, const std::string& value)
+{
+    const char* data           = value.data();
+    const auto  size           = value.size();
+    const auto  cap            = value.capacity();
+    bool        suspicious_ptr = false;
+    bool        suspicious_buf = false;
+
+#if defined(_WIN32)
+    auto addr = reinterpret_cast<std::uintptr_t>(data);
+#if INTPTR_MAX == INT64_MAX
+    constexpr std::uintptr_t POISON_CD = 0xcdcdcdcdcdcdcdcdULL;
+    constexpr std::uintptr_t POISON_CC = 0xccccccccccccccccULL;
+    constexpr std::uintptr_t POISON_FE = 0xfeeefeeefeeefeeeULL;
+#else
+    constexpr std::uintptr_t POISON_CD = 0xcdcdcdcdUL;
+    constexpr std::uintptr_t POISON_CC = 0xccccccccUL;
+    constexpr std::uintptr_t POISON_FE = 0xfeeefeeeUL;
+#endif
+    if (addr == POISON_CD || addr == POISON_CC || addr == POISON_FE) {
+        suspicious_ptr = true;
+    }
+#endif
+
+    if (size > cap) {
+        suspicious_buf = true;
+    }
+
+    if (size > 0 && data != nullptr) {
+        const size_t sample = std::min<size_t>(size, 16);
+        bool         all_cd = true;
+        for (size_t i = 0; i < sample; ++i) {
+            if (static_cast<unsigned char>(data[i]) != 0xCD) {
+                all_cd = false;
+                break;
+            }
+        }
+        if (all_cd) {
+            suspicious_buf = true;
+        }
+    }
+
+    if (data == nullptr) {
+        suspicious_ptr = true;
+    }
+
+    if (suspicious_ptr || suspicious_buf) {
+        std::fprintf(stderr,
+                     "[proxy] string integrity alert: %s data=%p size=%zu cap=%zu ptr_bad=%d buf_bad=%d\n",
+                     label,
+                     static_cast<const void*>(data),
+                     static_cast<size_t>(size),
+                     static_cast<size_t>(cap),
+                     suspicious_ptr ? 1 : 0,
+                     suspicious_buf ? 1 : 0);
+#if defined(_WIN32)
+        __debugbreak();
+#endif
+    } else if (g_debug_logging.load(std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[proxy] string ok: %s data=%p size=%zu cap=%zu\n",
+                     label,
+                     static_cast<const void*>(data),
+                     static_cast<size_t>(size),
+                     static_cast<size_t>(cap));
+    }
+}
+
+std::string to_lower(const std::string& input)
 {
     std::string out;
     out.reserve(input.size());
@@ -156,12 +404,12 @@ std::string to_lower(std::string_view input)
 }
 
 // 将十进制端口字符串转换为 uint16_t。
-bool parse_port(std::string_view sv, uint16_t& out)
+bool parse_port(const std::string& str, uint16_t& out)
 {
-    if (sv.empty())
+    if (str.empty())
         return false;
     unsigned long value = 0;
-    for (char ch : sv) {
+    for (char ch : str) {
         if (ch < '0' || ch > '9')
             return false;
         value = value * 10 + static_cast<unsigned long>(ch - '0');
@@ -181,30 +429,38 @@ struct UrlParts {
 };
 
 // 解析绝对形式的 HTTP URL（scheme://host[:port]/path）。
-std::optional<UrlParts> parse_http_url(std::string_view url)
+std::optional<UrlParts> parse_http_url(const std::string& url)
 {
+    debug_check_string_integrity("parse_http_url.url", url);
     auto pos = url.find("://");
-    if (pos == std::string_view::npos)
+    if (pos == std::string::npos)
         return std::nullopt;
     std::string scheme = to_lower(url.substr(0, pos));
     if (scheme != "http")
         return std::nullopt;
-    url.remove_prefix(pos + 3);
-    auto             slash_pos = url.find('/');
-    std::string_view authority = slash_pos == std::string_view::npos ? url : url.substr(0, slash_pos);
-    std::string      path = slash_pos == std::string_view::npos ? std::string("/") : std::string(url.substr(slash_pos));
+    size_t rest_idx = pos + 3;
+    if (rest_idx >= url.size())
+        return std::nullopt;
+
+    auto        slash_pos = url.find('/', rest_idx);
+    std::string authority = slash_pos == std::string::npos ? url.substr(rest_idx)
+                                                           : url.substr(rest_idx, slash_pos - rest_idx);
+    std::string path      = slash_pos == std::string::npos ? std::string("/") : url.substr(slash_pos);
     if (authority.empty())
         return std::nullopt;
     UrlParts parts;
     auto     colon_pos = authority.find(':');
-    if (colon_pos != std::string_view::npos) {
-        parts.host = std::string(authority.substr(0, colon_pos));
+    debug_check_string_integrity("parse_http_url.authority", authority);
+    if (colon_pos != std::string::npos) {
+        parts.host = authority.substr(0, colon_pos);
         uint16_t port { 0 };
-        if (!parse_port(authority.substr(colon_pos + 1), port))
+        auto     port_str = authority.substr(colon_pos + 1);
+        debug_check_string_integrity("parse_http_url.port", port_str);
+        if (!parse_port(port_str, port))
             return std::nullopt;
         parts.port = port;
     } else {
-        parts.host = std::string(authority);
+        parts.host = authority;
     }
     if (parts.host.empty())
         return std::nullopt;
@@ -218,21 +474,24 @@ struct ConnectTarget {
 };
 
 // 解析 CONNECT 动词目标（host[:port]）。
-std::optional<ConnectTarget> parse_connect_target(std::string_view target)
+std::optional<ConnectTarget> parse_connect_target(const std::string& target)
 {
     if (target.empty())
         return std::nullopt;
+    debug_check_string_integrity("parse_connect_target", target);
     auto          colon_pos = target.find(':');
     ConnectTarget ct;
-    if (colon_pos == std::string_view::npos) {
-        ct.host = std::string(target);
+    if (colon_pos == std::string::npos) {
+        ct.host = target;
         ct.port = 443;
     } else {
-        ct.host = std::string(target.substr(0, colon_pos));
+        ct.host = target.substr(0, colon_pos);
         if (ct.host.empty())
             return std::nullopt;
         uint16_t port { 0 };
-        if (!parse_port(target.substr(colon_pos + 1), port))
+        auto     port_str = target.substr(colon_pos + 1);
+        debug_check_string_integrity("parse_connect_target.port", port_str);
+        if (!parse_port(port_str, port))
             return std::nullopt;
         ct.port = port;
     }
@@ -240,6 +499,34 @@ std::optional<ConnectTarget> parse_connect_target(std::string_view target)
         return std::nullopt;
     return ct;
 }
+
+#if defined(_WIN32)
+extern "C" void wq_debug_null_func(co_wq::worknode* node)
+{
+    std::fprintf(stderr, "[proxy] wq_debug_null_func fired: node=%p\n", static_cast<void*>(node));
+    if (node != nullptr) {
+        auto* waiter            = reinterpret_cast<co_wq::net::io_waiter_base*>(node);
+        bool  looks_like_waiter = waiter->debug_magic == co_wq::net::io_waiter_base::debug_magic_value;
+        if (looks_like_waiter) {
+            std::fprintf(stderr,
+                         "  debug_name=%s h=%p callback_enqueued=%s route_post=%p route_ctx=%p\n",
+                         waiter->debug_name ? waiter->debug_name : "<null>",
+                         waiter->h ? waiter->h.address() : nullptr,
+                         waiter->callback_enqueued.load(std::memory_order_relaxed) ? "true" : "false",
+                         reinterpret_cast<void*>(waiter->route_post),
+                         waiter->route_ctx);
+        } else {
+            std::fprintf(stderr, "  node is not recognized as io_waiter_base (debug_magic mismatch)\n");
+        }
+    }
+    void*           stack[32] {};
+    constexpr DWORD capacity = static_cast<DWORD>(std::size(stack));
+    USHORT          frames   = CaptureStackBackTrace(0, capacity, stack, nullptr);
+    for (USHORT i = 0; i < frames; ++i) {
+        std::fprintf(stderr, "  stack[%u]=%p\n", static_cast<unsigned>(i), stack[i]);
+    }
+}
+#endif
 
 Task<int, Work_Promise<SpinLock, int>>
 connect_upstream(net::tcp_socket<SpinLock>& socket, const std::string& host, uint16_t port)
@@ -298,7 +585,7 @@ connect_upstream(net::tcp_socket<SpinLock>& socket, const std::string& host, uin
 }
 
 // 构造最小化的 HTTP/1.1 错误/控制响应。
-std::string build_http_response(int status_code, std::string_view reason, std::string_view body)
+std::string build_http_response(int status_code, const std::string& reason, const std::string& body)
 {
     std::string response;
     response.reserve(128 + body.size());
@@ -419,6 +706,9 @@ void sigint_handler(int)
 // 将解析得到的绝对 URI 请求转换为上游服务器期望的 origin-form。
 std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& parts)
 {
+    debug_check_string_integrity("build_request.method", ctx.method);
+    debug_check_string_integrity("build_request.url", ctx.url);
+    debug_check_string_integrity("build_request.path", parts.path);
     std::string request;
     request.reserve(ctx.method.size() + parts.path.size() + ctx.body.size() + 128);
     request.append(ctx.method);
@@ -441,6 +731,8 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
             has_host_header = true;
         request.append(entry.name);
         request.append(": ");
+        debug_check_string_integrity("build_request.header.name", entry.name);
+        debug_check_string_integrity("build_request.header.value", entry.value);
         request.append(entry.value);
         request.append("\r\n");
     }
@@ -462,11 +754,11 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
 
 template <typename SrcSocket, typename DstSocket>
 Task<void, Work_Promise<SpinLock, void>>
-pipe_data(SrcSocket& src, DstSocket& dst, std::string_view label, const std::string& peer_id)
+pipe_data(SrcSocket& src, DstSocket& dst, std::string label, const std::string& peer_id)
 {
     std::array<char, 8192> buffer {};
     {
-        debug_log(peer_id + " " + std::string(label) + " pipe started");
+        debug_log(peer_id + " " + label + " pipe started");
     }
     while (true) {
         ssize_t n = co_await src.recv(buffer.data(), buffer.size());
@@ -485,7 +777,7 @@ pipe_data(SrcSocket& src, DstSocket& dst, std::string_view label, const std::str
         while (offset < static_cast<size_t>(n)) {
             ssize_t sent = co_await dst.send(buffer.data() + offset, static_cast<size_t>(n) - offset);
             if (sent <= 0) {
-                debug_log(peer_id + " " + std::string(label) + " pipe stopping (send error)");
+                debug_log(peer_id + " " + label + " pipe stopping (send error)");
                 dst.shutdown_tx();
                 co_return;
             }
@@ -794,7 +1086,7 @@ int main(int argc, char* argv[])
     uint16_t    port = 8081;
 
     for (int i = 1; i < argc; ++i) {
-        std::string_view arg(argv[i]);
+        std::string arg(argv[i]);
         if (arg == "--host" && i + 1 < argc) {
             host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
@@ -806,6 +1098,9 @@ int main(int argc, char* argv[])
 
 #if defined(_WIN32)
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+    SetUnhandledExceptionFilter(proxy_exception_filter);
+    HMODULE self_module = ::GetModuleHandleW(nullptr);
+    std::fprintf(stderr, "[proxy] module base=%p\n", static_cast<void*>(self_module));
 #else
     std::signal(SIGINT, sigint_handler);
 #endif

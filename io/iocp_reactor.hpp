@@ -4,9 +4,11 @@
 #include "io_waiter.hpp"
 #include "workqueue.hpp"
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -28,9 +30,33 @@
 // simple overlapped header embedding waiter pointer
 struct iocp_ovl : OVERLAPPED {
     co_wq::net::io_waiter_base* waiter { nullptr };
+    std::atomic<std::uint32_t>  generation { 0 };
+    std::atomic<bool>           cancelled { false };
 };
 
 namespace co_wq::net {
+
+static bool is_pointer_plausible(const void* ptr) noexcept
+{
+    if (!ptr)
+        return false;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi {};
+    SIZE_T                   queried = VirtualQuery(ptr, &mbi, sizeof(mbi));
+    if (queried == 0)
+        return false;
+    if (!(mbi.State & MEM_COMMIT))
+        return false;
+    DWORD protect = mbi.Protect;
+    if (protect & PAGE_NOACCESS)
+        return false;
+    if (protect & PAGE_GUARD)
+        return false;
+#else
+    (void)ptr;
+#endif
+    return true;
+}
 
 // We reuse the name epoll_reactor so existing code works unchanged.
 template <lockable lock> class epoll_reactor { // reuse name for templates
@@ -166,11 +192,81 @@ private:
                 continue;
             }
             if (povl) {
-                auto* ovl = reinterpret_cast<iocp_ovl*>(povl);
-                if (ovl->waiter) {
-                    // stash byte count in waiter->ws_node.prev (hack) is messy; better store in derived awaiter
-                    post_via_route(_exec, *ovl->waiter);
+                auto* ovl        = reinterpret_cast<iocp_ovl*>(povl);
+                auto  generation = ovl->generation.load(std::memory_order_acquire);
+                auto* waiter     = ovl->waiter;
+                if (!waiter) {
+                    if (ovl->cancelled.load(std::memory_order_acquire)) {
+                        CO_WQ_CBQ_TRACE("[iocp] info: completion after cancellation povl=%p bytes=%lu key=%p gen=%lu\n",
+                                        static_cast<void*>(povl),
+                                        static_cast<unsigned long>(bytes),
+                                        reinterpret_cast<void*>(key),
+                                        static_cast<unsigned long>(generation));
+                        continue;
+                    }
+                    CO_WQ_CBQ_WARN("[iocp] warning: completion without waiter povl=%p bytes=%lu key=%p gen=%lu\n",
+                                   static_cast<void*>(povl),
+                                   static_cast<unsigned long>(bytes),
+                                   reinterpret_cast<void*>(key),
+                                   static_cast<unsigned long>(generation));
+                    continue;
                 }
+
+                if (!is_pointer_plausible(waiter)) {
+                    CO_WQ_CBQ_WARN("[iocp] warning: completion with invalid waiter pointer waiter=%p povl=%p bytes=%lu "
+                                   "key=%p gen=%lu\n",
+                                   static_cast<void*>(waiter),
+                                   static_cast<void*>(povl),
+                                   static_cast<unsigned long>(bytes),
+                                   reinterpret_cast<void*>(key),
+                                   static_cast<unsigned long>(generation));
+                    ovl->waiter = nullptr;
+                    ovl->cancelled.store(true, std::memory_order_release);
+                    continue;
+                }
+
+                io_waiter_base::route_guard_ptr guard     = waiter->load_route_guard();
+                long                            guard_use = io_waiter_base::route_guard_use_count(guard);
+                bool                            magic_ok  = waiter->has_valid_magic();
+                bool  already_enqueued                    = waiter->callback_enqueued.load(std::memory_order_acquire);
+                void* func_ptr                            = reinterpret_cast<void*>(waiter->func);
+                if (!magic_ok) {
+                    CO_WQ_CBQ_WARN("[iocp] warning: waiter magic invalid waiter=%p func=%p guard_use=%ld bytes=%lu "
+                                   "key=%p gen=%lu\n",
+                                   static_cast<void*>(waiter),
+                                   func_ptr,
+                                   static_cast<long>(guard_use),
+                                   static_cast<unsigned long>(bytes),
+                                   reinterpret_cast<void*>(key),
+                                   static_cast<unsigned long>(generation));
+                    waiter->exchange_route_guard();
+                    continue;
+                }
+                if (!waiter->func) {
+                    CO_WQ_CBQ_WARN("[iocp] warning: waiter func null waiter=%p guard_use=%ld bytes=%lu key=%p\n",
+                                   static_cast<void*>(waiter),
+                                   static_cast<long>(guard_use),
+                                   static_cast<unsigned long>(bytes),
+                                   reinterpret_cast<void*>(key));
+                    continue;
+                }
+                if (already_enqueued) {
+                    CO_WQ_CBQ_TRACE("[iocp] info: skip repost waiter=%p func=%p guard_use=%ld bytes=%lu key=%p\n",
+                                    static_cast<void*>(waiter),
+                                    func_ptr,
+                                    static_cast<long>(guard_use),
+                                    static_cast<unsigned long>(bytes),
+                                    reinterpret_cast<void*>(key));
+                    continue;
+                }
+                CO_WQ_CBQ_TRACE("[iocp] dispatch waiter=%p func=%p guard_use=%ld bytes=%lu key=%p\n",
+                                static_cast<void*>(waiter),
+                                func_ptr,
+                                static_cast<long>(guard_use),
+                                static_cast<unsigned long>(bytes),
+                                reinterpret_cast<void*>(key));
+                // stash byte count in waiter->ws_node.prev (hack) is messy; better store in derived awaiter
+                post_via_route(_exec, *waiter);
             }
         }
     }

@@ -74,6 +74,8 @@ target("co_wq")
         if is_plat("windows") then
             add_links("Ws2_32")
             add_includedirs("net/win", {public = true})
+            -- add_defines("_ITERATOR_DEBUG_LEVEL=2")
+            add_defines("_DISABLE_VECTOR_ALGORITHMS")
         else
             add_includedirs("net/linux", {public = true})
         end

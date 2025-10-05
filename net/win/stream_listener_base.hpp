@@ -17,7 +17,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-
 namespace co_wq::net::detail {
 
 /**
@@ -120,6 +119,7 @@ public:
         {
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter = this;
+            this->set_debug_name("tcp_listener::accept");
         }
         /** @brief 若 AcceptEx 能立即完成则返回 true，否则挂起等待 IOCP 完成。 */
         bool await_ready() noexcept

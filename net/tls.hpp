@@ -272,8 +272,9 @@ public:
 
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h          = coro;
-            this->route_ctx  = owner._cbq.get();
+            this->h = coro;
+            this->store_route_guard(owner._cbq->retain_guard());
+            this->route_ctx  = owner._cbq->context();
             this->route_post = &callback_wq<lock>::post_adapter;
             INIT_LIST_HEAD(&this->ws_node);
             drive();
@@ -335,7 +336,8 @@ public:
         recv_awaiter(basic_tls_socket& s, void* b, size_t l, bool f)
             : tp_base<recv_awaiter>(s, s._recv_q), owner(s), buf(b), len(l), full(f)
         {
-            this->route_ctx  = owner._cbq.get();
+            this->store_route_guard(owner._cbq->retain_guard());
+            this->route_ctx  = owner._cbq->context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
 
@@ -400,7 +402,8 @@ public:
         send_awaiter(basic_tls_socket& s, const void* b, size_t l, bool f)
             : tp_base<send_awaiter>(s, s._send_q), owner(s), buf(b), len(l), full(f)
         {
-            this->route_ctx  = owner._cbq.get();
+            this->store_route_guard(owner._cbq->retain_guard());
+            this->route_ctx  = owner._cbq->context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
 

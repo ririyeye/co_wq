@@ -84,11 +84,12 @@ public:
             _sock = INVALID_SOCKET;
         }
     }
-    int              native_handle() const { return (int)_sock; }
-    workqueue<lock>& exec() { return _exec; }
-    lock&            serial_lock() { return _io_serial_lock; }
-    Reactor<lock>*   reactor() { return _reactor; }
-    bool             closed() const { return _closed; }
+    int                native_handle() const { return (int)_sock; }
+    workqueue<lock>&   exec() { return _exec; }
+    lock&              serial_lock() { return _io_serial_lock; }
+    Reactor<lock>*     reactor() { return _reactor; }
+    callback_wq<lock>& callback_queue() { return _cbq; }
+    bool               closed() const { return _closed; }
     /**
      * @brief 可选的 connect（为 UDP 设定默认对端）。成功返回0，失败-1。
      */
@@ -102,8 +103,10 @@ public:
         // 注意: 参数名避免与基类 io_waiter_base::h 成员同名引发 MSVC C4458 警告
         void await_suspend(std::coroutine_handle<> coro)
         {
-            this->h          = coro;
-            this->route_ctx  = &us._cbq;
+            this->h   = coro;
+            auto& cbq = us.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
             this->func       = &io_waiter_base::resume_cb;
             INIT_LIST_HEAD(&this->ws_node);
@@ -148,8 +151,10 @@ public:
             : serial_slot_awaiter<recvfrom_awaiter, udp_socket>(s, s._recv_q), buf(b), len(l), out_addr(oa), out_len(ol)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &this->owner._cbq;
+            ovl.waiter = this;
+            auto& cbq  = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
             wbuf.len         = (ULONG)l;
             wbuf.buf         = (CHAR*)b;
@@ -264,8 +269,10 @@ public:
             , len(l)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &this->owner._cbq;
+            ovl.waiter = this;
+            auto& cbq  = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         // 未连接 + 单缓冲
@@ -278,8 +285,10 @@ public:
             , dest(d)
         {
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &this->owner._cbq;
+            ovl.waiter = this;
+            auto& cbq  = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         // 已连接 + 向量
@@ -295,8 +304,10 @@ public:
                 len += b.len; // 复用 len 记录总字节
             }
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &this->owner._cbq;
+            ovl.waiter = this;
+            auto& cbq  = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         // 未连接 + 向量
@@ -312,8 +323,10 @@ public:
                 len += b.len;
             }
             ZeroMemory(&ovl, sizeof(ovl));
-            ovl.waiter       = this;
-            this->route_ctx  = &this->owner._cbq;
+            ovl.waiter = this;
+            auto& cbq  = this->owner.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
         static void lock_acquired_cb(worknode* w)
