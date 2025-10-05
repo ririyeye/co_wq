@@ -491,6 +491,11 @@ pipe_data(SrcSocket& src, DstSocket& dst, std::string_view label, const std::str
             }
             offset += static_cast<size_t>(sent);
         }
+        {
+            std::ostringstream oss;
+            oss << peer_id << " " << label << " forwarded " << n << " bytes";
+            debug_log(oss.str());
+        }
     }
 }
 
@@ -794,6 +799,8 @@ int main(int argc, char* argv[])
             host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--verbose" || arg == "--debug-log") {
+            g_debug_logging.store(true, std::memory_order_relaxed);
         }
     }
 

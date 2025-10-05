@@ -1,6 +1,7 @@
 // io_waiter.hpp - common waiter base for fd-based async operations
 #pragma once
 #include "workqueue.hpp"
+#include <atomic>
 #include <coroutine>
 
 namespace co_wq::net {
@@ -13,6 +14,7 @@ struct io_waiter_base : worknode {
     // 可选：指定一个“回调队列”路由，保证在多线程执行器下按队列顺序执行
     void* route_ctx { nullptr };
     void (*route_post)(void* ctx, worknode* node) { nullptr };
+    std::atomic_bool callback_enqueued { false };
     /**
      * @brief workqueue 投递回调：恢复协程执行。
      */

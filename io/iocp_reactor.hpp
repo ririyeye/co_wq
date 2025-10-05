@@ -61,7 +61,20 @@ public:
     { // immediate post (not readiness-based)
         post_via_route(_exec, *waiter);
     }
-    void add_waiter_custom(int fd, uint32_t mask, io_waiter_base* waiter) { add_waiter(fd, mask, waiter); }
+    void add_waiter_custom(int fd, uint32_t mask, io_waiter_base* waiter)
+    {
+        if (!waiter) {
+            return;
+        }
+        if (mask == 0) {
+            post_via_route(_exec, *waiter);
+            return;
+        }
+        auto ctx = new custom_wait_context(*this, _get_socket(fd), mask, waiter);
+        if (!ctx->start()) {
+            delete ctx;
+        }
+    }
     void remove_fd(int fd)
     {
         // Nothing besides closing; active overlapped completions will deliver with failure.
@@ -72,6 +85,75 @@ public:
     HANDLE iocp_handle() const noexcept { return _iocp; }
 
 private:
+    struct custom_wait_context : io_waiter_base {
+        epoll_reactor&  reactor;
+        io_waiter_base* target { nullptr };
+        SOCKET          sock { INVALID_SOCKET };
+        bool            use_send { false };
+        iocp_ovl        ovl {};
+        char            dummy { 0 };
+
+        custom_wait_context(epoll_reactor& r, SOCKET s, uint32_t mask, io_waiter_base* t)
+            : reactor(r), target(t), sock(s)
+        {
+            this->route_ctx  = t->route_ctx;
+            this->route_post = t->route_post;
+            this->func       = &custom_wait_context::dispatch_cb;
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.waiter = this;
+            if (mask & EPOLLIN)
+                use_send = false;
+            else if (mask & EPOLLOUT)
+                use_send = true;
+            else
+                use_send = false;
+        }
+
+        bool start()
+        {
+            if (sock == INVALID_SOCKET || !target) {
+                if (target)
+                    post_via_route(reactor._exec, *target);
+                return false;
+            }
+            DWORD  bytes = 0;
+            DWORD  flags = 0;
+            WSABUF buf;
+            buf.buf = &dummy;
+            if (!use_send) {
+                buf.len = sizeof(dummy);
+                flags   = MSG_PEEK;
+            } else {
+                buf.len = 0;
+                flags   = 0;
+            }
+            int r;
+            if (!use_send) {
+                r = WSARecv(sock, &buf, 1, &bytes, &flags, &ovl, nullptr);
+            } else {
+                r = WSASend(sock, &buf, 1, &bytes, flags, &ovl, nullptr);
+            }
+            if (r == 0) {
+                post_via_route(reactor._exec, *target);
+                return false;
+            }
+            int err = WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
+                post_via_route(reactor._exec, *target);
+                return false;
+            }
+            return true; // waiting for IOCP callback
+        }
+
+        static void dispatch_cb(worknode* w)
+        {
+            auto* self = static_cast<custom_wait_context*>(w);
+            if (self->target)
+                post_via_route(self->reactor._exec, *self->target);
+            delete self;
+        }
+    };
+
     static SOCKET _get_socket(int fd) { return (SOCKET)fd; }
     void          loop()
     {

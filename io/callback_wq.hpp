@@ -1,5 +1,6 @@
 // callback_wq.hpp - per-owner ordered callback dispatcher on top of main workqueue
 #pragma once
+#include "io_waiter.hpp"
 #include "workqueue.hpp"
 #include <mutex>
 
@@ -48,6 +49,11 @@ public:
         bool need_sched = false;
         {
             std::lock_guard<lock> g(_lk);
+            auto*                 waiter = static_cast<io_waiter_base*>(&node);
+            if (waiter->callback_enqueued.exchange(true, std::memory_order_acq_rel))
+                return; // already enqueued, skip duplicate
+            if (node.ws_node.next != &node.ws_node)
+                list_del(&node.ws_node); // 脱离任何旧链表，避免损坏
             // 使用内置 intrusive 链表节点，避免额外分配
             list_add_tail(&node.ws_node, &_pending);
             if (!_running) {
@@ -95,6 +101,8 @@ private:
                 list_head* lh = local.next;
                 list_del(lh);
                 worknode* n = list_entry(lh, worknode, ws_node);
+                if (n)
+                    static_cast<io_waiter_base*>(n)->callback_enqueued.store(false, std::memory_order_release);
                 if (n && n->func)
                     n->func(n);
             }

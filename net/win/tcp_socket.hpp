@@ -21,7 +21,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-
 #ifndef _SSIZE_T_DEFINED
 using ssize_t = SSIZE_T;
 #define _SSIZE_T_DEFINED
@@ -183,6 +182,9 @@ public:
         ssize_t  nread { -1 };
         iocp_ovl ovl {};
         bool     started { false };
+        bool     inflight { false };
+        bool     finished { false };
+        bool     result_ready { false };
         recv_awaiter(tcp_socket& owner, void* b, size_t l)
             : serial_slot_awaiter<recv_awaiter, tcp_socket>(owner, owner.recv_queue()), buf(b), len(l)
         {
@@ -199,30 +201,60 @@ public:
         }
         void issue()
         {
+            inflight     = false;
+            finished     = false;
+            result_ready = false;
+            nread        = -1;
             WSABUF wbuf { static_cast<ULONG>(len), static_cast<CHAR*>(buf) };
             DWORD  flags = 0;
             DWORD  recvd = 0;
-            this->func   = &io_waiter_base::resume_cb;
+            ovl.waiter   = this;
+            this->func   = &recv_awaiter::completion_cb;
             int r        = WSARecv(socket_handle(), &wbuf, 1, &recvd, &flags, &ovl, nullptr);
             if (r == 0) {
-                nread = static_cast<ssize_t>(recvd);
+                nread        = static_cast<ssize_t>(recvd);
+                result_ready = true;
+                if (recvd == 0)
+                    this->owner.mark_rx_eof();
                 finish();
                 return;
             }
             int err = WSAGetLastError();
-            if (r == SOCKET_ERROR && err == WSA_IO_PENDING)
+            if (r == SOCKET_ERROR && err == WSA_IO_PENDING) {
+                inflight = true;
                 return;
-            nread = -1;
+            }
+            nread        = -1;
+            result_ready = true;
             finish();
+        }
+        static void completion_cb(worknode* w)
+        {
+            auto* self = static_cast<recv_awaiter*>(w);
+            if (self->finished)
+                return;
+            DWORD transferred = 0;
+            DWORD flags       = 0;
+            if (WSAGetOverlappedResult(self->socket_handle(), &self->ovl, &transferred, FALSE, &flags)) {
+                self->nread = static_cast<ssize_t>(transferred);
+                if (transferred == 0)
+                    self->owner.mark_rx_eof();
+            } else {
+                self->nread = -1;
+            }
+            self->result_ready = true;
+            self->inflight     = false;
+            self->finish();
         }
         void finish()
         {
+            if (finished)
+                return;
+            finished   = true;
+            ovl.waiter = nullptr;
+            this->func = &io_waiter_base::resume_cb;
             serial_slot_awaiter<recv_awaiter, tcp_socket>::release(this);
-            if (auto* r = this->owner.reactor()) {
-                r->post_completion(this);
-            } else {
-                post_via_route(this->owner.exec(), *this);
-            }
+            post_via_route(this->owner.exec(), *this);
         }
         bool await_ready() noexcept { return false; }
         void await_suspend(std::coroutine_handle<> awaiting)
@@ -234,11 +266,17 @@ public:
         }
         ssize_t await_resume() noexcept
         {
-            if (nread == -1) {
+            if (!result_ready) {
                 DWORD transferred = 0;
                 DWORD flags       = 0;
-                if (WSAGetOverlappedResult(socket_handle(), &ovl, &transferred, FALSE, &flags))
+                if (WSAGetOverlappedResult(socket_handle(), &ovl, &transferred, FALSE, &flags)) {
                     nread = static_cast<ssize_t>(transferred);
+                    if (transferred == 0)
+                        this->owner.mark_rx_eof();
+                } else {
+                    nread = -1;
+                }
+                result_ready = true;
             }
             if (nread == 0)
                 this->owner.mark_rx_eof();
@@ -282,6 +320,7 @@ public:
             WSABUF wbuf { static_cast<ULONG>(len - recvd), buf + recvd };
             DWORD  flags = 0;
             DWORD  got   = 0;
+            ovl.waiter   = this;
             this->func   = &recv_all_awaiter::drive_cb;
             int r        = WSARecv(socket_handle(), &wbuf, 1, &got, &flags, &ovl, nullptr);
             if (r == 0) {
@@ -346,11 +385,11 @@ public:
         {
             if (finished)
                 return;
-            finished = true;
+            finished   = true;
+            ovl.waiter = nullptr;
             serial_slot_awaiter<recv_all_awaiter, tcp_socket>::release(this);
             this->func = &io_waiter_base::resume_cb;
-            if (this->h)
-                this->h.resume();
+            post_via_route(this->owner.exec(), *this);
         }
         bool await_ready() noexcept { return false; }
         void await_suspend(std::coroutine_handle<> awaiting)
@@ -445,6 +484,7 @@ public:
         {
             DWORD sent_now = 0;
             DWORD flags    = 0;
+            ovl.waiter     = this;
             this->func     = &send_awaiter::drive_cb;
             if (!use_vec) {
                 size_t remain = len - sent;
@@ -538,11 +578,11 @@ public:
         {
             if (finished)
                 return;
-            finished = true;
+            finished   = true;
+            ovl.waiter = nullptr;
             serial_slot_awaiter<send_awaiter, tcp_socket>::release(this);
             this->func = &io_waiter_base::resume_cb;
-            if (this->h)
-                this->h.resume();
+            post_via_route(this->owner.exec(), *this);
         }
         bool await_ready() noexcept { return false; }
         void await_suspend(std::coroutine_handle<> awaiting)
