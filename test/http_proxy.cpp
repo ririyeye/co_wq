@@ -363,12 +363,6 @@ void debug_check_string_integrity(const char* label, const std::string& value)
 #if defined(_WIN32)
         __debugbreak();
 #endif
-    } else if (g_debug_logging.load(std::memory_order_relaxed)) {
-        CO_WQ_LOG_DEBUG("[proxy] string ok: %s data=%p size=%zu cap=%zu",
-                        label,
-                        static_cast<const void*>(data),
-                        static_cast<size_t>(size),
-                        static_cast<size_t>(cap));
     }
 }
 

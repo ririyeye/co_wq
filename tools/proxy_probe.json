@@ -1,0 +1,28 @@
+{
+    "proxy": {
+        "host": "192.168.30.32",
+        "port": 18100
+    },
+    "mode": "https",
+    "timeout": 5.0,
+    "count": 10,
+    "concurrency": 4,
+    "compare_direct": true,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "verbose": false,
+    "urls": [
+        "https://www.baidu.com/",
+        "https://www.bilibili.com/",
+        "https://www.qq.com/",
+        "https://www.163.com/",
+        "https://www.taobao.com/",
+        "https://www.jd.com/",
+        "http://www.sohu.com/",
+        "http://www.ifeng.com/",
+        "http://www.china.com.cn/",
+        "http://news.sina.com.cn/"
+    ],
+    "targets": [
+        "www.google.com:443"
+    ]
+}

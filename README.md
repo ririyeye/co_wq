@@ -267,6 +267,36 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
 
 如需关闭日志，可在源码中将 `g_debug_logging` 初始化为 `false`，或依据自身需求扩展命令行开关。
 
+### Proxy 稳定性测试工具
+
+为帮助定位代理偶发卡顿或丢包问题，仓库提供两个独立的压力/探测工具：
+
+1. **Python 脚本（推荐快速联调）**：使用标准库通过代理发送原始 HTTP/CONNECT 请求，不依赖 co_wq 运行时，可独立暴露代理实现的竞态。
+
+   ```bash
+   python tools/proxy_probe.py --proxy-host 127.0.0.1 --proxy-port 18080 \
+     --url http://example.com --url http://httpbin.org/get --count 20 --concurrency 8
+   ```
+
+  主要参数：
+
+  - `--mode http|https|connect`：切换常规 HTTP GET、HTTPS GET（经 CONNECT+TLS）或 CONNECT 隧道握手；
+  - `--url/--urls-file`：HTTP/HTTPS 目标列表（`https://` 仅在 HTTPS 模式下使用，支持文件批量导入）；
+  - `--target/--targets-file`：CONNECT 目标（`host:port`）；
+  - `--count` / `--concurrency`：每个目标的发送次数与并发工作协程；
+  - `--timeout`：单次请求超时时间（秒）。
+  - `--compare-direct`：在代理测试完成后，再对同一批 HTTP/HTTPS 目标进行直连请求，方便对比代理与直连表现；
+
+   也可以准备一个 JSON 配置文件（示例见 `tools/proxy_probe.sample.json`）并直接执行：
+
+   ```bash
+   python tools/proxy_probe.py --config tools/proxy_probe.sample.json
+   ```
+
+   命令行参数仍可覆盖配置文件中的字段，例如添加额外的 `--url` 或调整 `--concurrency`。
+
+  脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。
+
   ### WebSocket Echo 示例
 
   `net/websocket.hpp` 提供基于 llhttp 的握手辅助与帧收发工具函数，`co_ws` 示例展示了如何在协程中构建 WebSocket 服务：
