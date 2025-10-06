@@ -19,10 +19,14 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -31,11 +35,12 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
 
 #if defined(_WIN32)
 #include <basetsd.h>
@@ -170,6 +175,339 @@ extern "C" void wq_debug_check_func_addr(std::uintptr_t addr)
 
 // 是否开启调试日志，可根据需要在运行时调整。
 std::atomic_bool g_debug_logging { false };
+
+std::string getenv_string(const char* name)
+{
+    if (!name)
+        return {};
+#if defined(_WIN32)
+    char*  buffer = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr)
+        return {};
+    std::string value(buffer);
+    std::free(buffer);
+    return value;
+#else
+    const char* value = std::getenv(name);
+    return value ? std::string(value) : std::string {};
+#endif
+}
+
+std::string hex_encode_upper(const std::uint8_t* data, std::size_t len)
+{
+    static constexpr char hex_table[] = "0123456789ABCDEF";
+    std::string           result;
+    result.resize(len * 2);
+    for (std::size_t i = 0; i < len; ++i) {
+        std::uint8_t byte = data[i];
+        result[2 * i]     = hex_table[(byte >> 4) & 0x0F];
+        result[2 * i + 1] = hex_table[byte & 0x0F];
+    }
+    return result;
+}
+
+class TlsKeyLogRegistry {
+public:
+    static TlsKeyLogRegistry& instance()
+    {
+        static TlsKeyLogRegistry registry;
+        return registry;
+    }
+
+    void configure(const std::filesystem::path& project_root)
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (configured_)
+            return;
+
+        std::string src_env = getenv_string("CO_WQ_PROXY_KEYLOG_SOURCE");
+        std::string out_env = getenv_string("CO_WQ_PROXY_KEYLOG_OUTPUT");
+        std::string ssl_env = getenv_string("SSLKEYLOGFILE");
+
+        std::filesystem::path source = src_env.empty() ? std::filesystem::path {} : std::filesystem::path(src_env);
+        if (source.empty() && !ssl_env.empty())
+            source = std::filesystem::path(ssl_env);
+        std::filesystem::path output = out_env.empty() ? std::filesystem::path {} : std::filesystem::path(out_env);
+
+        if (!project_root.empty()) {
+            if (!source.empty() && !source.is_absolute())
+                source = project_root / source;
+            if (!output.empty() && !output.is_absolute())
+                output = project_root / output;
+        }
+
+        if (source.empty() && !project_root.empty())
+            source = project_root / "logs" / "tls_keys.log";
+        if (output.empty() && !project_root.empty())
+            output = project_root / "logs" / "proxy_tls_keys.log";
+
+        if (!source.empty()) {
+            auto parent = source.parent_path();
+            if (!parent.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(parent, ec);
+            }
+        }
+        if (!output.empty()) {
+            auto parent = output.parent_path();
+            if (!parent.empty()) {
+                std::error_code ec;
+                std::filesystem::create_directories(parent, ec);
+            }
+        }
+
+        if (source.empty() || output.empty()) {
+            configured_ = true;
+            return;
+        }
+
+        source_path_ = source.lexically_normal();
+        output_path_ = output.lexically_normal();
+        enabled_.store(true, std::memory_order_release);
+        configured_ = true;
+        CO_WQ_LOG_INFO("[proxy] TLS key log source=%s output=%s",
+                       source_path_.string().c_str(),
+                       output_path_.string().c_str());
+        std::atexit(&TlsKeyLogRegistry::shutdown_static);
+    }
+
+    bool is_enabled() const { return enabled_.load(std::memory_order_acquire); }
+
+    void enqueue(const std::string& peer_id, uint16_t remote_port, const std::string& client_random)
+    {
+        if (!is_enabled() || client_random.empty())
+            return;
+        Pending pending;
+        pending.peer_id       = peer_id;
+        pending.remote_port   = remote_port;
+        pending.client_random = client_random;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            queue_.push_back(std::move(pending));
+            if (!worker_started_)
+                start_worker_locked();
+        }
+        cv_.notify_one();
+    }
+
+    void shutdown()
+    {
+        if (!worker_started_)
+            return;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            stop_requested_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+        worker_started_ = false;
+    }
+
+    static void shutdown_static() { instance().shutdown(); }
+
+private:
+    struct Pending {
+        std::string client_random;
+        std::string peer_id;
+        uint16_t    remote_port { 0 };
+    };
+
+    void start_worker_locked()
+    {
+        if (worker_started_)
+            return;
+        stop_requested_ = false;
+        worker_         = std::thread([this] { worker_loop(); });
+        worker_started_ = true;
+    }
+
+    std::optional<std::string> lookup_secret_once(const std::string& client_random)
+    {
+        if (source_path_.empty())
+            return std::nullopt;
+        std::ifstream in(source_path_);
+        if (!in.is_open())
+            return std::nullopt;
+        std::string line;
+        std::string prefix = "CLIENT_RANDOM " + client_random + ' ';
+        while (std::getline(in, line)) {
+            if (line.rfind(prefix, 0) == 0) {
+                return line.substr(prefix.size());
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::string> wait_for_secret(const std::string& client_random)
+    {
+        using namespace std::chrono_literals;
+        constexpr int max_attempts = 15;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            if (auto secret = lookup_secret_once(client_random); secret.has_value())
+                return secret;
+            std::this_thread::sleep_for(100ms);
+        }
+        return std::nullopt;
+    }
+
+    void write_output(const Pending& pending, const std::string& secret)
+    {
+        if (output_path_.empty())
+            return;
+        std::ofstream out(output_path_, std::ios::app);
+        if (!out.is_open()) {
+            CO_WQ_LOG_WARN("[proxy] failed to open TLS key log output %s", output_path_.string().c_str());
+            return;
+        }
+        out << pending.peer_id;
+        if (pending.remote_port != 0)
+            out << " remote_port=" << pending.remote_port;
+        out << " CLIENT_RANDOM " << pending.client_random << ' ' << secret << '\n';
+        out.flush();
+    }
+
+    void process_pending(Pending pending)
+    {
+        if (source_path_.empty() || output_path_.empty())
+            return;
+        auto secret = wait_for_secret(pending.client_random);
+        if (secret) {
+            write_output(pending, *secret);
+            CO_WQ_LOG_INFO("[proxy] recorded TLS key for %s random=%s",
+                           pending.peer_id.c_str(),
+                           pending.client_random.c_str());
+        } else {
+            CO_WQ_LOG_WARN("[proxy] TLS key for %s random=%s not found in %s",
+                           pending.peer_id.c_str(),
+                           pending.client_random.c_str(),
+                           source_path_.string().c_str());
+        }
+    }
+
+    void worker_loop()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            cv_.wait(lock, [this] { return stop_requested_ || !queue_.empty(); });
+            if (stop_requested_ && queue_.empty())
+                break;
+            if (queue_.empty())
+                continue;
+            Pending pending = std::move(queue_.front());
+            queue_.pop_front();
+            lock.unlock();
+            process_pending(std::move(pending));
+            lock.lock();
+        }
+    }
+
+    mutable std::mutex      mutex_;
+    std::condition_variable cv_;
+    std::deque<Pending>     queue_;
+    std::thread             worker_;
+    std::filesystem::path   source_path_;
+    std::filesystem::path   output_path_;
+    std::atomic_bool        enabled_ { false };
+    bool                    configured_ { false };
+    bool                    worker_started_ { false };
+    bool                    stop_requested_ { false };
+};
+
+struct TlsClientHelloSniffer {
+    bool                      active { false };
+    bool                      recorded { false };
+    std::string               peer_id;
+    uint16_t                  remote_port { 0 };
+    std::vector<std::uint8_t> buffer;
+
+    void activate(const std::string& peer, uint16_t port)
+    {
+        active      = true;
+        peer_id     = peer;
+        remote_port = port;
+        buffer.clear();
+        buffer.reserve(512);
+    }
+
+    void feed(const char* data, std::size_t len)
+    {
+        if (!active || recorded || len == 0)
+            return;
+        buffer.insert(buffer.end(),
+                      reinterpret_cast<const std::uint8_t*>(data),
+                      reinterpret_cast<const std::uint8_t*>(data) + len);
+        parse();
+        if (buffer.size() > 4096)
+            buffer.erase(buffer.begin(), buffer.end());
+    }
+
+private:
+    void parse()
+    {
+        if (buffer.size() < 43)
+            return;
+        std::size_t offset = 0;
+        while (offset + 43 <= buffer.size()) {
+            std::uint8_t record_type = buffer[offset];
+            std::size_t  record_len  = (static_cast<std::size_t>(buffer[offset + 3]) << 8)
+                | static_cast<std::size_t>(buffer[offset + 4]);
+            if (offset + 5 + record_len > buffer.size())
+                return; // need more data
+            if (record_type != 0x16) {
+                recorded = true;
+                return;
+            }
+            if (record_len < 38) {
+                recorded = true;
+                return;
+            }
+            std::uint8_t handshake_type = buffer[offset + 5];
+            if (handshake_type != 0x01) {
+                recorded = true;
+                return;
+            }
+            if (offset + 43 > buffer.size())
+                return;
+            const std::uint8_t* random_ptr = buffer.data() + offset + 5 + 4 + 2;
+            std::string         random_hex = hex_encode_upper(random_ptr, 32);
+            TlsKeyLogRegistry::instance().enqueue(peer_id, remote_port, random_hex);
+            recorded = true;
+            return;
+        }
+    }
+};
+
+uint16_t get_remote_port(net::tcp_socket<SpinLock>& socket)
+{
+#if defined(_WIN32)
+    SOCKET handle = socket.native_handle();
+    if (handle == INVALID_SOCKET)
+        return 0;
+    sockaddr_storage addr {};
+    int              len = static_cast<int>(sizeof(addr));
+    if (::getpeername(handle, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+        return 0;
+#else
+    int handle = socket.native_handle();
+    if (handle < 0)
+        return 0;
+    sockaddr_storage addr {};
+    socklen_t        len = static_cast<socklen_t>(sizeof(addr));
+    if (::getpeername(handle, reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+        return 0;
+#endif
+    if (addr.ss_family == AF_INET) {
+        auto* in = reinterpret_cast<sockaddr_in*>(&addr);
+        return ntohs(in->sin_port);
+    }
+    if (addr.ss_family == AF_INET6) {
+        auto* in6 = reinterpret_cast<sockaddr_in6*>(&addr);
+        return ntohs(in6->sin6_port);
+    }
+    return 0;
+}
 
 #if defined(_WIN32)
 LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
@@ -621,6 +959,7 @@ struct RawUpstreamCandidate {
     int              len { 0 };
     std::string      label;
     std::string      stats_key;
+    std::size_t      ordinal { 0 };
 };
 
 struct CandidateSnapshot {
@@ -662,19 +1001,14 @@ resolve_upstream_candidates(net::tcp_socket<SpinLock>& socket, const std::string
         int              family { AF_UNSPEC };
     };
 
-    std::vector<CandidateEntry> primary;
+    std::vector<CandidateEntry> preferred;
     std::vector<CandidateEntry> fallback;
 
     for (auto* ai = result; ai; ai = ai->ai_next) {
         if (!ai->ai_addr || ai->ai_addrlen <= 0 || ai->ai_addrlen > static_cast<int>(sizeof(sockaddr_storage)))
             continue;
         CandidateEntry entry;
-        if (ai->ai_family == family) {
-            std::memcpy(&entry.addr, ai->ai_addr, static_cast<size_t>(ai->ai_addrlen));
-            entry.len    = static_cast<int>(ai->ai_addrlen);
-            entry.family = ai->ai_family;
-            primary.push_back(entry);
-        } else if (family == AF_INET6 && dual_stack && ai->ai_family == AF_INET) {
+        if (family == AF_INET6 && dual_stack && ai->ai_family == AF_INET) {
             auto* src = reinterpret_cast<const sockaddr_in*>(ai->ai_addr);
             auto* dst = reinterpret_cast<sockaddr_in6*>(&entry.addr);
             std::memset(dst, 0, sizeof(*dst));
@@ -686,29 +1020,43 @@ resolve_upstream_candidates(net::tcp_socket<SpinLock>& socket, const std::string
             std::memcpy(bytes + 12, &src->sin_addr, sizeof(src->sin_addr));
             entry.len    = static_cast<int>(sizeof(sockaddr_in6));
             entry.family = ai->ai_family;
-            fallback.push_back(entry);
+            preferred.push_back(entry);
+        } else if (ai->ai_family == family) {
+            std::memcpy(&entry.addr, ai->ai_addr, static_cast<size_t>(ai->ai_addrlen));
+            entry.len    = static_cast<int>(ai->ai_addrlen);
+            entry.family = ai->ai_family;
+            if (family == AF_INET6 && dual_stack)
+                fallback.push_back(entry);
+            else
+                preferred.push_back(entry);
         }
     }
 
-    const auto* source = primary.empty() ? &fallback : &primary;
-    output.reserve(source->size());
-    for (size_t i = 0; i < source->size(); ++i) {
-        const auto&          src_entry = (*source)[i];
-        RawUpstreamCandidate candidate;
-        candidate.addr      = src_entry.addr;
-        candidate.len       = src_entry.len;
-        candidate.label     = format_candidate_label(reinterpret_cast<const sockaddr*>(&candidate.addr), candidate.len);
-        candidate.stats_key = format_numeric_endpoint(reinterpret_cast<const sockaddr*>(&candidate.addr),
-                                                      candidate.len);
-        if (candidate.stats_key.empty()) {
-            std::ostringstream key;
-            key << "candidate#" << i;
-            candidate.stats_key = key.str();
+    size_t ordinal        = 0;
+    auto   append_entries = [&](const std::vector<CandidateEntry>& entries) {
+        for (const auto& src_entry : entries) {
+            RawUpstreamCandidate candidate;
+            candidate.addr = src_entry.addr;
+            candidate.len  = src_entry.len;
+            candidate.label = format_candidate_label(reinterpret_cast<const sockaddr*>(&candidate.addr), candidate.len);
+            candidate.stats_key = format_numeric_endpoint(reinterpret_cast<const sockaddr*>(&candidate.addr),
+                                                          candidate.len);
+            if (candidate.stats_key.empty()) {
+                std::ostringstream key;
+                key << "candidate#" << ordinal;
+                candidate.stats_key = key.str();
+            }
+            if (candidate.label.empty())
+                candidate.label = candidate.stats_key;
+            candidate.ordinal = ordinal;
+            output.push_back(std::move(candidate));
+            ++ordinal;
         }
-        if (candidate.label.empty())
-            candidate.label = candidate.stats_key;
-        output.push_back(std::move(candidate));
-    }
+    };
+
+    output.reserve(preferred.size() + fallback.size());
+    append_entries(preferred);
+    append_entries(fallback);
 
     return output;
 }
@@ -867,6 +1215,8 @@ struct RelayMetrics {
     std::size_t   recv_ops { 0 };
     std::size_t   send_ops { 0 };
     std::size_t   partial_send_ops { 0 };
+    std::size_t   send_overrun_ops { 0 };
+    std::uint64_t send_overrun_bytes { 0 };
     ssize_t       last_recv_rc { 0 };
     ssize_t       last_send_rc { 0 };
     bool          send_failed { false };
@@ -1084,6 +1434,7 @@ void log_relay_summary(const RelayMetrics& metrics, const std::string& context, 
     oss << peer_id << ' ' << context << " summary: recv=" << metrics.total_recv_bytes << "B"
         << " send=" << metrics.total_sent_bytes << "B" << " recv_ops=" << metrics.recv_ops
         << " send_ops=" << metrics.send_ops << " partial_send_ops=" << metrics.partial_send_ops
+        << " send_overrun_ops=" << metrics.send_overrun_ops << " send_overrun_bytes=" << metrics.send_overrun_bytes
         << " last_recv=" << metrics.last_recv_rc << " last_send=" << metrics.last_send_rc;
     long long diff = static_cast<long long>(metrics.total_recv_bytes)
         - static_cast<long long>(metrics.total_sent_bytes);
@@ -1096,7 +1447,8 @@ void log_relay_summary(const RelayMetrics& metrics, const std::string& context, 
             << (metrics.shutdown_tx_performed ? "performed" : (metrics.request_shutdown_tx ? "pending" : "skipped"));
     }
     auto message = oss.str();
-    if (metrics.send_failed || metrics.recv_failed || diff != 0) {
+    if (metrics.send_failed || metrics.recv_failed || diff != 0 || metrics.send_overrun_ops > 0
+        || metrics.send_overrun_bytes > 0) {
         CO_WQ_LOG_WARN("%s", message.c_str());
     } else {
         CO_WQ_LOG_INFO("%s", message.c_str());
@@ -1376,6 +1728,8 @@ Task<int, Work_Promise<SpinLock, int>> connect_upstream(net::tcp_socket<SpinLock
             return a.total_failures < b.total_failures;
         if (a.last_success != b.last_success)
             return a.last_success > b.last_success;
+        if (lhs.snapshot.candidate.ordinal != rhs.snapshot.candidate.ordinal)
+            return lhs.snapshot.candidate.ordinal < rhs.snapshot.candidate.ordinal;
         return lhs.snapshot.candidate.stats_key < rhs.snapshot.candidate.stats_key;
     });
 
@@ -1613,13 +1967,24 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
 }
 
 template <typename SrcSocket, typename DstSocket>
-Task<void, Work_Promise<SpinLock, void>>
-pipe_data(SrcSocket& src, DstSocket& dst, std::string label, const std::string& peer_id, RelayMetrics& metrics)
+Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket&         src,
+                                                   DstSocket&         dst,
+                                                   std::string        label,
+                                                   const std::string& peer_id,
+                                                   RelayMetrics&      metrics,
+                                                   bool               propagate_shutdown)
 {
     std::array<char, 8192> buffer {};
     debug_log(peer_id + " " + label + " pipe started");
-    bool request_shutdown_tx = false;
-    bool shutdown_applied    = false;
+    bool                  request_shutdown_tx = false;
+    bool                  shutdown_applied    = false;
+    TlsClientHelloSniffer tls_sniffer;
+    if (TlsKeyLogRegistry::instance().is_enabled() && label == "client->upstream") {
+        if constexpr (std::is_same_v<std::decay_t<SrcSocket>, net::tcp_socket<SpinLock>>) {
+            uint16_t remote_port = get_remote_port(src);
+            tls_sniffer.activate(peer_id, remote_port);
+        }
+    }
     while (true) {
         ssize_t n            = co_await src.recv(buffer.data(), buffer.size());
         metrics.last_recv_rc = n;
@@ -1654,6 +2019,9 @@ pipe_data(SrcSocket& src, DstSocket& dst, std::string label, const std::string& 
             oss << peer_id << " " << label << " recv chunk=" << n << " bytes total=" << metrics.total_recv_bytes;
             debug_log(oss.str());
         }
+        if constexpr (std::is_same_v<std::decay_t<SrcSocket>, net::tcp_socket<SpinLock>>) {
+            tls_sniffer.feed(buffer.data(), static_cast<std::size_t>(n));
+        }
         size_t offset = 0;
         while (offset < static_cast<size_t>(n)) {
             ssize_t sent         = co_await dst.send(buffer.data() + offset, static_cast<size_t>(n) - offset);
@@ -1680,32 +2048,34 @@ pipe_data(SrcSocket& src, DstSocket& dst, std::string label, const std::string& 
                 if constexpr (requires(SrcSocket& s) { s.close(); }) {
                     src.close();
                 }
-                if constexpr (requires(DstSocket& s) {
-                                  s.shutdown_tx();
-                                  s.tx_shutdown();
-                                  s.close();
-                              }) {
-                    if (!dst.tx_shutdown()) {
-                        debug_log(peer_id + " " + label + " forcing TX shutdown following send peer reset");
-                        dst.shutdown_tx();
-                        shutdown_applied = true;
-                    }
-                    dst.close();
-                } else if constexpr (requires(DstSocket& s) { s.close(); }) {
-                    dst.close();
-                }
                 goto PIPE_DONE;
             }
             metrics.send_ops++;
-            metrics.total_sent_bytes += static_cast<std::uint64_t>(sent);
-            if (static_cast<size_t>(sent) < static_cast<size_t>(n) - offset) {
+            size_t remain    = static_cast<size_t>(n) - offset;
+            size_t sent_size = static_cast<size_t>(sent);
+            if (sent_size < remain) {
                 metrics.partial_send_ops++;
                 std::ostringstream oss;
                 oss << peer_id << " " << label << " partial send=" << sent
                     << " remaining=" << (static_cast<size_t>(n) - offset - static_cast<size_t>(sent));
                 debug_log(oss.str());
+            } else if (sent_size > remain) {
+                metrics.send_overrun_ops++;
+                metrics.send_overrun_bytes += static_cast<std::uint64_t>(sent_size - remain);
+                std::ostringstream oss;
+                oss << peer_id << " " << label << " send overrun returned=" << sent_size << " remain=" << remain
+                    << " extra=" << (sent_size - remain);
+                debug_log(oss.str());
+                CO_WQ_LOG_ERROR("%s %s send overrun: returned=%zu remain=%zu extra=%zu",
+                                peer_id.c_str(),
+                                label.c_str(),
+                                static_cast<size_t>(sent_size),
+                                remain,
+                                static_cast<size_t>(sent_size - remain));
             }
-            offset += static_cast<size_t>(sent);
+            size_t accounted = std::min(remain, sent_size);
+            metrics.total_sent_bytes += static_cast<std::uint64_t>(accounted);
+            offset += accounted;
         }
     }
     if (metrics.termination_reason.empty()) {
@@ -1715,7 +2085,7 @@ pipe_data(SrcSocket& src, DstSocket& dst, std::string label, const std::string& 
 PIPE_DONE:
     metrics.finished            = true;
     metrics.request_shutdown_tx = metrics.request_shutdown_tx || request_shutdown_tx;
-    if (request_shutdown_tx) {
+    if (request_shutdown_tx && propagate_shutdown) {
         if constexpr (requires(DstSocket& s) {
                           s.tx_shutdown();
                           s.shutdown_tx();
@@ -1788,8 +2158,8 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
 
     RelayMetrics client_to_upstream_metrics;
     RelayMetrics upstream_to_client_metrics;
-    auto         c_to_u = pipe_data(client, upstream, "client->upstream", peer_id, client_to_upstream_metrics);
-    auto         u_to_c = pipe_data(upstream, client, "upstream->client", peer_id, upstream_to_client_metrics);
+    auto         c_to_u = pipe_data(client, upstream, "client->upstream", peer_id, client_to_upstream_metrics, false);
+    auto         u_to_c = pipe_data(upstream, client, "upstream->client", peer_id, upstream_to_client_metrics, true);
     co_await when_all(c_to_u, u_to_c);
 
     log_relay_summary(client_to_upstream_metrics, "CONNECT client->upstream", peer_id);
@@ -2135,6 +2505,19 @@ int main(int argc, char* argv[])
     bool                      log_truncate        = false;
     spdlog::level::level_enum requested_log_level = spdlog::level::info;
 
+    std::filesystem::path project_root;
+    std::filesystem::path cwd_path;
+    {
+        std::error_code cwd_ec;
+        cwd_path = std::filesystem::current_path(cwd_ec);
+        if (cwd_ec)
+            cwd_path.clear();
+        if (!cwd_path.empty())
+            project_root = find_project_root(cwd_path);
+        if (project_root.empty())
+            project_root = cwd_path;
+    }
+
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
         if (arg == "--host" && i + 1 < argc) {
@@ -2155,14 +2538,7 @@ int main(int argc, char* argv[])
     try {
         std::filesystem::path cli_log_path(log_file_path);
 
-        std::error_code cwd_ec;
-        auto            cwd = std::filesystem::current_path(cwd_ec);
-        if (cwd_ec)
-            cwd.clear();
-
-        auto project_root = cwd.empty() ? std::filesystem::path {} : find_project_root(cwd);
-        if (project_root.empty())
-            project_root = cwd;
+        auto cwd = cwd_path;
 
         std::filesystem::path resolved = cli_log_path;
         if (!resolved.is_absolute()) {
@@ -2200,6 +2576,8 @@ int main(int argc, char* argv[])
     if (log_configured) {
         CO_WQ_LOG_INFO("[proxy] logging to %s (truncate=%d)", log_file_path.c_str(), log_truncate ? 1 : 0);
     }
+
+    TlsKeyLogRegistry::instance().configure(project_root);
 
 #if defined(_WIN32)
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);

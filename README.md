@@ -271,7 +271,7 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
 
 ### Proxy 稳定性测试工具
 
-为帮助定位代理偶发卡顿或丢包问题，仓库提供两个独立的压力/探测工具：
+为帮助定位代理偶发卡顿或丢包问题，仓库提供三个互补的 Python 辅助工具：
 
 1. **Python 脚本（推荐快速联调）**：使用标准库通过代理发送原始 HTTP/CONNECT 请求，不依赖 co_wq 运行时，可独立暴露代理实现的竞态。
 
@@ -298,7 +298,34 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
 
   脚本会根据 URL 的 scheme 自动选择 HTTP 或 HTTPS 请求流程；同一轮测试可混合多个类型并同时串联若干 CONNECT 目标。
 
-  脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。
+  脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。失败样本现在会额外标注发起请求时的本地端口（例如 `local:13987`），方便和代理日志或抓包记录进行交叉比对。
+
+2. **抓包辅助脚本**：`tools/capture_proxy.py` 基于 Python 调用 Wireshark `dumpcap`，用于捕获代理本地端口及目标服务器流量，默认行为等同于旧版 `capture_proxy.bat`。
+
+     ```powershell
+     # 列出接口编号： dumpcap -D
+     python tools/capture_proxy.py 7 180
+     ```
+
+     - 位置参数依次为 `dumpcap` 可识别的接口（编号或名称）与抓包时长（秒，默认 120）；
+     - 脚本会解析 `www.baidu.com` 的 IPv4 地址并构造 BPF 过滤表达式：
+       $$tcp\;port\;18100\;\lor\;\left(tcp\;port\;443\;\land\;\bigvee_i host_i\right)$$
+     - 抓包文件输出到 `logs/proxy_capture_YYYYMMDD_HHMMSS.pcapng`；可通过 `--output` 指定文件名；
+     - 若系统未安装 dnspython，脚本会退回标准库 `socket.getaddrinfo` 解析；
+     - 如未能解析目标主机，会退化为仅监听本地代理端口并给出提示。
+
+    可使用 `--target` 修改解析目标，或通过 `--dumpcap` 显式指定 `dumpcap.exe` 路径（默认尝试环境变量及 `C:/Program Files/Wireshark/dumpcap.exe`）。若在 Windows 控制台看到中文接口名乱码，可追加 `--encoding gbk`（或其他合适编码）让脚本以指定编码解码 `dumpcap` 输出。
+
+  3. **抓包分析脚本**：`tools/analyze_capture.py` 借助 `tshark` 解析 `pcap/pcapng` 中的 TCP 元数据，生成包含连接状态、收发字节统计及 RST/FIN 事件的文本报告，帮助快速定位异常会话。
+
+    ```powershell
+    # 默认分析所有 TCP 数据包，并在同目录生成 capture_analysis_*.log
+    python tools/analyze_capture.py logs/proxy_capture_20251006_215716.pcapng
+    ```
+
+    - 默认的显示过滤器为 `tcp`，可通过 `--display-filter` 传入自定义 Wireshark display filter；
+    - 报告包含连接持续时间、双向字节数、SYN/FIN/RST 计数，并优先列出携带 RST 的会话；
+    - 若未显式指定 `--output`，会在抓包文件所在目录下生成 `capture_analysis_YYYYMMDD_HHMMSS.log`。
 
   ### WebSocket Echo 示例
 

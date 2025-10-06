@@ -67,6 +67,7 @@ class RequestResult:
     status_code: Optional[int]
     latency_ms: float
     target_name: str
+    local_port: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -108,10 +109,14 @@ class AggregateStats:
         else:
             self.other_errors += 1
         if len(self.failure_samples) < 10:
+            port_info = f" [local:{result.local_port}]" if result.local_port is not None else ""
             if result.status_code is not None:
-                sample = f"{result.target_name} -> {result.reason} ({result.status_code}): {result.detail}"
+                sample = (
+                    f"{result.target_name}{port_info} -> {result.reason} "
+                    f"({result.status_code}): {result.detail}"
+                )
             else:
-                sample = f"{result.target_name} -> {result.reason}: {result.detail}"
+                sample = f"{result.target_name}{port_info} -> {result.reason}: {result.detail}"
             self.failure_samples.append(sample)
 
 
@@ -224,10 +229,11 @@ async def perform_http_request(cfg: RequestConfig, target: UrlTarget) -> Request
     loop = asyncio.get_running_loop()
     start = loop.time()
     target_name = target.original
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+    reader: Optional[asyncio.StreamReader] = None
+    writer: Optional[asyncio.StreamWriter] = None
     status_line: Optional[str] = None
     status_code: Optional[int] = None
+    local_port: Optional[int] = None
     try:
         connect_host = cfg.proxy_host if cfg.use_proxy else target.host
         connect_port = cfg.proxy_port if cfg.use_proxy else target.port
@@ -235,12 +241,34 @@ async def perform_http_request(cfg: RequestConfig, target: UrlTarget) -> Request
             asyncio.open_connection(connect_host, connect_port),
             timeout=cfg.timeout,
         )
+        sockname = writer.get_extra_info("sockname") if writer else None
+        if isinstance(sockname, tuple) and len(sockname) >= 2:
+            try:
+                local_port = int(sockname[1])
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                local_port = None
     except asyncio.TimeoutError:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "timeout", "connect timeout", None, latency, target_name)
+        return RequestResult(
+            False,
+            "timeout",
+            "connect timeout",
+            None,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except OSError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "connect_error", str(exc), None, latency, target_name)
+        return RequestResult(
+            False,
+            "connect_error",
+            str(exc),
+            None,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
 
     try:
         host_header = _format_host_header(target.host, target.port, 80)
@@ -269,26 +297,75 @@ async def perform_http_request(cfg: RequestConfig, target: UrlTarget) -> Request
         status_code = int(parts[1])
         latency = (loop.time() - start) * 1000.0
         if 200 <= status_code < 400:
-            return RequestResult(True, "success", status_line, status_code, latency, target_name)
-        return RequestResult(False, "http_error", status_line, status_code, latency, target_name)
+            return RequestResult(
+                True,
+                "success",
+                status_line,
+                status_code,
+                latency,
+                target_name,
+                local_port=local_port,
+            )
+        return RequestResult(
+            False,
+            "http_error",
+            status_line,
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except asyncio.TimeoutError:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "timeout", "operation timed out", status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "timeout",
+            "operation timed out",
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except ValueError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "http_error", str(exc), status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "http_error",
+            str(exc),
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except ConnectionError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "recv_error", str(exc), status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "recv_error",
+            str(exc),
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except OSError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "recv_error", str(exc), status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "recv_error",
+            str(exc),
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:  # pragma: no cover - best effort cleanup
-            pass
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # pragma: no cover - best effort cleanup
+                pass
 
 
 async def perform_https_request(cfg: RequestConfig, target: UrlTarget) -> RequestResult:
@@ -298,7 +375,7 @@ async def perform_https_request(cfg: RequestConfig, target: UrlTarget) -> Reques
     start = loop.time()
     target_name = target.original
 
-    def sync_request() -> Tuple[bool, str, str, Optional[int]]:
+    def sync_request() -> Tuple[bool, str, str, Optional[int], Optional[int]]:
         context = ssl.create_default_context()
         if cfg.use_proxy:
             conn = HTTPSConnection(cfg.proxy_host, cfg.proxy_port, timeout=cfg.timeout, context=context)
@@ -314,36 +391,59 @@ async def perform_https_request(cfg: RequestConfig, target: UrlTarget) -> Reques
         }
         if cfg.use_proxy:
             headers["Proxy-Connection"] = "close"
+
+        local_port: Optional[int] = None
+
+        def capture_local_port() -> None:
+            nonlocal local_port
+            sock = getattr(conn, "sock", None)
+            if sock is None:
+                return
+            try:
+                sockname = sock.getsockname()
+            except OSError:
+                return
+            if isinstance(sockname, tuple) and len(sockname) >= 2:
+                try:
+                    local_port = int(sockname[1])
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    local_port = None
         try:
             conn.request("GET", target.path, headers=headers)
+            capture_local_port()
             response = conn.getresponse()
+            capture_local_port()
             detail = f"{response.status} {response.reason}"
             status_code = response.status
             response.read()
             if 200 <= status_code < 400:
-                return True, "success", detail, status_code
-            return False, "http_error", detail, status_code
+                return True, "success", detail, status_code, local_port
+            return False, "http_error", detail, status_code, local_port
         except socket.timeout:
-            return False, "timeout", "operation timed out", None
+            capture_local_port()
+            return False, "timeout", "operation timed out", None, local_port
         except ssl.SSLError as exc:
             message = str(exc) or exc.__class__.__name__
-            return False, "tls_error", message, None
+            capture_local_port()
+            return False, "tls_error", message, None, local_port
         except HTTPException as exc:
             message = str(exc) or exc.__class__.__name__
-            return False, "http_error", message, None
+            capture_local_port()
+            return False, "http_error", message, None, local_port
         except OSError as exc:
             reason = _classify_os_error(exc)
             message = str(exc) or exc.__class__.__name__
-            return False, reason, message, None
+            capture_local_port()
+            return False, reason, message, None, local_port
         finally:
             try:
                 conn.close()
             except Exception:  # pragma: no cover - best effort cleanup
                 pass
 
-    success, reason, detail, status_code = await asyncio.to_thread(sync_request)
+    success, reason, detail, status_code, local_port = await asyncio.to_thread(sync_request)
     latency = (loop.time() - start) * 1000.0
-    return RequestResult(success, reason, detail, status_code, latency, target_name)
+    return RequestResult(success, reason, detail, status_code, latency, target_name, local_port=local_port)
 
 
 async def perform_connect_request(cfg: RequestConfig, target: ConnectTarget) -> RequestResult:
@@ -352,20 +452,43 @@ async def perform_connect_request(cfg: RequestConfig, target: ConnectTarget) -> 
     loop = asyncio.get_running_loop()
     start = loop.time()
     target_name = target.original
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
+    reader: Optional[asyncio.StreamReader] = None
+    writer: Optional[asyncio.StreamWriter] = None
     status_code: Optional[int] = None
+    local_port: Optional[int] = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(cfg.proxy_host, cfg.proxy_port),
             timeout=cfg.timeout,
         )
+        sockname = writer.get_extra_info("sockname") if writer else None
+        if isinstance(sockname, tuple) and len(sockname) >= 2:
+            try:
+                local_port = int(sockname[1])
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                local_port = None
     except asyncio.TimeoutError:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "timeout", "connect timeout", None, latency, target_name)
+        return RequestResult(
+            False,
+            "timeout",
+            "connect timeout",
+            None,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except OSError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "connect_error", str(exc), None, latency, target_name)
+        return RequestResult(
+            False,
+            "connect_error",
+            str(exc),
+            None,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
 
     try:
         host_field = target.host
@@ -392,26 +515,75 @@ async def perform_connect_request(cfg: RequestConfig, target: ConnectTarget) -> 
         status_code = int(parts[1])
         latency = (loop.time() - start) * 1000.0
         if 200 <= status_code < 300:
-            return RequestResult(True, "success", status_line, status_code, latency, target_name)
-        return RequestResult(False, "http_error", status_line, status_code, latency, target_name)
+            return RequestResult(
+                True,
+                "success",
+                status_line,
+                status_code,
+                latency,
+                target_name,
+                local_port=local_port,
+            )
+        return RequestResult(
+            False,
+            "http_error",
+            status_line,
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except asyncio.TimeoutError:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "timeout", "operation timed out", status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "timeout",
+            "operation timed out",
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except ValueError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "http_error", str(exc), status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "http_error",
+            str(exc),
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except ConnectionError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "recv_error", str(exc), status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "recv_error",
+            str(exc),
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     except OSError as exc:
         latency = (loop.time() - start) * 1000.0
-        return RequestResult(False, "recv_error", str(exc), status_code, latency, target_name)
+        return RequestResult(
+            False,
+            "recv_error",
+            str(exc),
+            status_code,
+            latency,
+            target_name,
+            local_port=local_port,
+        )
     finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:  # pragma: no cover
-            pass
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # pragma: no cover - best effort cleanup
+                pass
 
 
 async def run_probe(
