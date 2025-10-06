@@ -36,8 +36,8 @@ public:
     static constexpr int k_accept_fatal = net::k_accept_fatal;
 
     /** @brief 创建 TCP 监听 socket 并注册至 Reactor。 */
-    explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor)
-        : base(exec, reactor, AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor, int family = AF_INET)
+        : base(exec, reactor, family, SOCK_STREAM, IPPROTO_TCP)
     {
     }
 
@@ -49,25 +49,46 @@ public:
      * @param backlog listen backlog，默认 128。
      * @throws std::runtime_error 绑定或监听失败时抛出。
      */
-    void bind_listen(const std::string& host, uint16_t port, int backlog = 128)
+    void bind_listen(const std::string& host, uint16_t port, int backlog = 128, bool dual_stack = false)
     {
-        sockaddr_in addr {};
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(port);
-        if (host.empty() || host == "0.0.0.0")
-            addr.sin_addr.s_addr = INADDR_ANY;
-        else if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0)
-            throw std::runtime_error("InetPton failed");
-        BOOL opt = TRUE;
-        setsockopt(static_cast<SOCKET>(this->native_handle()),
-                   SOL_SOCKET,
-                   SO_REUSEADDR,
-                   reinterpret_cast<const char*>(&opt),
-                   sizeof(opt));
-        if (::bind(static_cast<SOCKET>(this->native_handle()), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr))
-            == SOCKET_ERROR)
-            throw std::runtime_error("bind failed");
-        if (::listen(static_cast<SOCKET>(this->native_handle()), backlog) == SOCKET_ERROR)
+        SOCKET sock  = static_cast<SOCKET>(this->native_handle());
+        BOOL   reuse = TRUE;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+        if (this->family() == AF_INET6) {
+            std::string view = host;
+            if (!view.empty() && view.front() == '[' && view.back() == ']')
+                view = view.substr(1, view.size() - 2);
+
+            sockaddr_in6 addr6 {};
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_port   = htons(port);
+            if (view.empty() || view == "::" || view == "*") {
+                IN6_ADDR any    = IN6ADDR_ANY_INIT;
+                addr6.sin6_addr = any;
+            } else {
+                if (InetPtonA(AF_INET6, view.c_str(), &addr6.sin6_addr) <= 0)
+                    throw std::runtime_error("InetPton failed");
+            }
+
+            BOOL v6only = dual_stack ? FALSE : TRUE;
+            setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&v6only), sizeof(v6only));
+
+            if (::bind(sock, reinterpret_cast<const sockaddr*>(&addr6), sizeof(addr6)) == SOCKET_ERROR)
+                throw std::runtime_error("bind failed");
+        } else {
+            sockaddr_in addr {};
+            addr.sin_family = AF_INET;
+            addr.sin_port   = htons(port);
+            if (host.empty() || host == "0.0.0.0" || host == "*")
+                addr.sin_addr.s_addr = INADDR_ANY;
+            else if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0)
+                throw std::runtime_error("InetPton failed");
+            if (::bind(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+                throw std::runtime_error("bind failed");
+        }
+
+        if (::listen(sock, backlog) == SOCKET_ERROR)
             throw std::runtime_error("listen failed");
     }
 

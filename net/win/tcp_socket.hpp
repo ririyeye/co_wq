@@ -61,6 +61,7 @@ public:
     using base::callback_queue;
     using base::close;
     using base::exec;
+    using base::family;
     using base::mark_rx_eof;
     using base::mark_tx_shutdown;
     using base::native_handle;
@@ -71,6 +72,8 @@ public:
     using base::shutdown_tx;
     using base::socket_handle;
     using base::tx_shutdown;
+
+    bool dual_stack() const noexcept { return _dual_stack; }
 
     static void
     log_waiter_state(const char* tag, const io_waiter_base* waiter, [[maybe_unused]] const char* detail = nullptr)
@@ -98,15 +101,20 @@ public:
      * @brief ConnectEx Awaiter，负责协程化的 TCP 建连。
      */
     struct connect_awaiter : io_waiter_base {
-        tcp_socket&    sock;
-        std::string    host;
-        uint16_t       port;
-        int            ret { -1 };
-        iocp_ovl       ovl {};
-        LPFN_CONNECTEX _connectex { nullptr };
-        sockaddr_in    addr {};
-        bool           issued { false };
-        std::uint32_t  ovl_generation { 0 };
+        tcp_socket&      sock;
+        std::string      host;
+        uint16_t         port;
+        int              ret { -1 };
+        iocp_ovl         ovl {};
+        LPFN_CONNECTEX   _connectex { nullptr };
+        sockaddr_storage remote {};
+        int              remote_len { 0 };
+        bool             remote_ready { false };
+        bool             issued { false };
+        std::uint32_t    ovl_generation { 0 };
+        int              family { AF_INET };
+        bool             dual_stack { false };
+
         connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p)
         {
             ZeroMemory(&ovl, sizeof(ovl));
@@ -117,6 +125,8 @@ public:
             this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
             this->set_debug_name("tcp_socket::connect");
+            family     = sock.family();
+            dual_stack = sock.dual_stack();
             log_waiter_state("connect ctor", this, host.c_str());
         }
         ~connect_awaiter()
@@ -168,44 +178,135 @@ public:
             }
             return true;
         }
+
+        static std::string strip_brackets(const std::string& input)
+        {
+            if (input.size() >= 2 && input.front() == '[' && input.back() == ']')
+                return input.substr(1, input.size() - 2);
+            return input;
+        }
+
+        bool prepare_remote()
+        {
+            std::string node = strip_brackets(host);
+            if (node.empty()) {
+                ret = -WSAEINVAL;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] empty host provided port=%u\n", static_cast<unsigned>(port));
+                return false;
+            }
+
+            ADDRINFOA hints {};
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            hints.ai_family   = family;
+            if (family == AF_INET6 && dual_stack)
+                hints.ai_family = AF_UNSPEC;
+
+            char service[16] {};
+            _snprintf_s(service, sizeof(service), _TRUNCATE, "%u", static_cast<unsigned>(port));
+
+            ADDRINFOA* result = nullptr;
+            int        rc     = ::getaddrinfo(node.c_str(), service, &hints, &result);
+            if (rc != 0 || !result) {
+                ret = rc ? -rc : -1;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] getaddrinfo failed host=%s port=%u rc=%d\n",
+                               node.c_str(),
+                               static_cast<unsigned>(port),
+                               rc);
+                if (result)
+                    ::freeaddrinfo(result);
+                return false;
+            }
+
+            std::unique_ptr<ADDRINFOA, decltype(&::freeaddrinfo)> guard(result, ::freeaddrinfo);
+            for (auto* ai = result; ai; ai = ai->ai_next) {
+                if (ai->ai_family == family) {
+                    remote_len = static_cast<int>(ai->ai_addrlen);
+                    if (remote_len > static_cast<int>(sizeof(remote)))
+                        continue;
+                    std::memcpy(&remote, ai->ai_addr, static_cast<size_t>(remote_len));
+                    remote_ready = true;
+                    break;
+                }
+                if (family == AF_INET6 && dual_stack && ai->ai_family == AF_INET) {
+                    auto* v4 = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
+                    auto* v6 = reinterpret_cast<sockaddr_in6*>(&remote);
+                    ZeroMemory(v6, sizeof(sockaddr_in6));
+                    v6->sin6_family    = AF_INET6;
+                    v6->sin6_port      = v4->sin_port;
+                    unsigned char* dst = reinterpret_cast<unsigned char*>(&v6->sin6_addr);
+                    dst[10]            = 0xFF;
+                    dst[11]            = 0xFF;
+                    std::memcpy(dst + 12, &v4->sin_addr, sizeof(v4->sin_addr));
+                    remote_len   = static_cast<int>(sizeof(sockaddr_in6));
+                    remote_ready = true;
+                    break;
+                }
+            }
+
+            if (!remote_ready) {
+                ret = -WSAEAFNOSUPPORT;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] no compatible address host=%s port=%u\n",
+                               node.c_str(),
+                               static_cast<unsigned>(port));
+            }
+            return remote_ready;
+        }
+
+        bool bind_local()
+        {
+            if (family == AF_INET) {
+                sockaddr_in local {};
+                local.sin_family      = AF_INET;
+                local.sin_addr.s_addr = INADDR_ANY;
+                local.sin_port        = 0;
+                if (::bind(sock.socket_handle(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    ret     = err ? -static_cast<int>(err) : -1;
+                    CO_WQ_CBQ_WARN("[tcp_socket::connect] bind IPv4 failed host=%s port=%u err=%d\n",
+                                   host.c_str(),
+                                   static_cast<unsigned>(port),
+                                   err);
+                    return false;
+                }
+                return true;
+            }
+
+            sockaddr_in6 local6 {};
+            local6.sin6_family = AF_INET6;
+            local6.sin6_port   = 0;
+            IN6_ADDR any       = IN6ADDR_ANY_INIT;
+            local6.sin6_addr   = any;
+            if (::bind(sock.socket_handle(), reinterpret_cast<sockaddr*>(&local6), sizeof(local6)) == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                ret     = err ? -static_cast<int>(err) : -1;
+                CO_WQ_CBQ_WARN("[tcp_socket::connect] bind IPv6 failed host=%s port=%u err=%d\n",
+                               host.c_str(),
+                               static_cast<unsigned>(port),
+                               err);
+                return false;
+            }
+            return true;
+        }
+
         bool await_ready() noexcept
         {
             INIT_LIST_HEAD(&this->ws_node);
-            addr.sin_family = AF_INET;
-            addr.sin_port   = htons(port);
-            if (InetPtonA(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-                int err = WSAGetLastError();
-                ret     = err ? -static_cast<int>(err) : -1;
-                CO_WQ_CBQ_WARN("[tcp_socket::connect] InetPtonA failed host=%s port=%u err=%d\n",
-                               host.c_str(),
-                               static_cast<unsigned>(port),
-                               err);
+            if (!prepare_remote())
                 return true;
-            }
             if (!load_connectex()) {
                 return true;
             }
-            sockaddr_in local {};
-            local.sin_family      = AF_INET;
-            local.sin_addr.s_addr = INADDR_ANY;
-            local.sin_port        = 0;
-            if (::bind(sock.socket_handle(), reinterpret_cast<sockaddr*>(&local), sizeof(local)) == SOCKET_ERROR) {
-                int err = WSAGetLastError();
-                ret     = err ? -static_cast<int>(err) : -1;
-                CO_WQ_CBQ_WARN("[tcp_socket::connect] bind failed host=%s port=%u err=%d\n",
-                               host.c_str(),
-                               static_cast<unsigned>(port),
-                               err);
+            if (!bind_local())
                 return true;
-            }
             this->func = &io_waiter_base::resume_cb;
             ovl.cancelled.store(false, std::memory_order_release);
             ovl.waiter     = this;
             ovl_generation = ovl.generation.fetch_add(1) + 1;
             ovl.generation.store(ovl_generation, std::memory_order_release);
             BOOL ok = _connectex(sock.socket_handle(),
-                                 reinterpret_cast<sockaddr*>(&addr),
-                                 sizeof(addr),
+                                 reinterpret_cast<sockaddr*>(&remote),
+                                 static_cast<int>(remote_len),
                                  nullptr,
                                  0,
                                  nullptr,
@@ -314,8 +415,8 @@ public:
             DWORD  recvd = 0;
             ovl.waiter   = this;
             ovl.cancelled.store(false, std::memory_order_release);
-            this->func   = &recv_awaiter::completion_cb;
-            int r        = WSARecv(socket_handle(), &wbuf, 1, &recvd, &flags, &ovl, nullptr);
+            this->func = &recv_awaiter::completion_cb;
+            int r      = WSARecv(socket_handle(), &wbuf, 1, &recvd, &flags, &ovl, nullptr);
             if (r == 0) {
                 nread        = static_cast<ssize_t>(recvd);
                 result_ready = true;
@@ -355,7 +456,7 @@ public:
         {
             if (finished)
                 return;
-            finished   = true;
+            finished = true;
             ovl.cancelled.store(true, std::memory_order_release);
             ovl.waiter = nullptr;
             this->func = &io_waiter_base::resume_cb;
@@ -432,8 +533,8 @@ public:
             DWORD  got   = 0;
             ovl.waiter   = this;
             ovl.cancelled.store(false, std::memory_order_release);
-            this->func   = &recv_all_awaiter::drive_cb;
-            int r        = WSARecv(socket_handle(), &wbuf, 1, &got, &flags, &ovl, nullptr);
+            this->func = &recv_all_awaiter::drive_cb;
+            int r      = WSARecv(socket_handle(), &wbuf, 1, &got, &flags, &ovl, nullptr);
             if (r == 0) {
                 if (got == 0) {
                     this->owner.mark_rx_eof();
@@ -496,7 +597,7 @@ public:
         {
             if (finished)
                 return;
-            finished   = true;
+            finished = true;
             ovl.cancelled.store(true, std::memory_order_release);
             ovl.waiter = nullptr;
             serial_slot_awaiter<recv_all_awaiter, tcp_socket>::release(this);
@@ -606,7 +707,7 @@ public:
             DWORD flags    = 0;
             ovl.waiter     = this;
             ovl.cancelled.store(false, std::memory_order_release);
-            this->func     = &send_awaiter::drive_cb;
+            this->func = &send_awaiter::drive_cb;
             if (!use_vec) {
                 size_t remain = len - sent;
                 if (remain == 0) {
@@ -699,7 +800,7 @@ public:
         {
             if (finished)
                 return;
-            finished   = true;
+            finished = true;
             ovl.cancelled.store(true, std::memory_order_release);
             ovl.waiter = nullptr;
             serial_slot_awaiter<send_awaiter, tcp_socket>::release(this);
@@ -727,11 +828,45 @@ public:
 
 private:
     friend class fd_workqueue<lock, Reactor>;
-    explicit tcp_socket(workqueue<lock>& exec, Reactor<lock>& reactor)
-        : base(exec, reactor, AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    explicit tcp_socket(workqueue<lock>& exec,
+                        Reactor<lock>&   reactor,
+                        int              fam               = AF_INET,
+                        bool             enable_dual_stack = false)
+        : base(exec, reactor, fam, SOCK_STREAM, IPPROTO_TCP), _dual_stack(fam == AF_INET6 ? enable_dual_stack : false)
     {
+        if (fam == AF_INET6) {
+            BOOL v6only = _dual_stack ? FALSE : TRUE;
+            if (setsockopt(this->socket_handle(),
+                           IPPROTO_IPV6,
+                           IPV6_V6ONLY,
+                           reinterpret_cast<const char*>(&v6only),
+                           sizeof(v6only))
+                == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                CO_WQ_CBQ_WARN("[tcp_socket] IPV6_V6ONLY setsockopt failed err=%d\n", err);
+            }
+        }
     }
-    tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : base(static_cast<SOCKET>(fd), exec, reactor) { }
+    tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : base(static_cast<SOCKET>(fd), exec, reactor)
+    {
+        if (family() == AF_INET6) {
+            _dual_stack = query_dual_stack_flag();
+        }
+    }
+
+    bool query_dual_stack_flag() const
+    {
+        if (family() != AF_INET6)
+            return false;
+        DWORD v6only = 1;
+        int   len    = static_cast<int>(sizeof(v6only));
+        if (getsockopt(this->socket_handle(), IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&v6only), &len)
+            == SOCKET_ERROR)
+            return false;
+        return v6only == 0;
+    }
+
+    bool _dual_stack { false };
 };
 
 template <lockable lock>

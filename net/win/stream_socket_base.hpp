@@ -48,6 +48,7 @@ public:
         , _reactor(o._reactor)
         , _sock(std::exchange(o._sock, INVALID_SOCKET))
         , _closed(std::exchange(o._closed, false))
+        , _family(o._family)
         , _cbq(_exec)
     {
         serial_queue_init(_send_q);
@@ -76,6 +77,7 @@ public:
             _reactor = o._reactor;
             _sock    = std::exchange(o._sock, INVALID_SOCKET);
             _closed  = std::exchange(o._closed, false);
+            _family  = o._family;
             std::destroy_at(&_cbq);
             std::construct_at(&_cbq, _exec);
             serial_queue_init(_send_q);
@@ -118,6 +120,8 @@ public:
     /** @brief 每个 socket 绑定的回调路由队列。 */
     callback_wq<lock>& callback_queue() { return _cbq; }
 
+    int family() const noexcept { return _family; }
+
     /** @brief 是否已关闭。 */
     bool closed() const noexcept { return _closed; }
 
@@ -131,7 +135,7 @@ protected:
      * @param protocol 协议号。
      */
     socket_core(workqueue<lock>& exec, Reactor<lock>& reactor, int family, int type, int protocol = 0)
-        : _exec(exec), _reactor(&reactor), _cbq(exec)
+        : _exec(exec), _reactor(&reactor), _family(family), _cbq(exec)
     {
         CO_WQ_CBQ_TRACE(
             "[socket_core] ctor this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p family=%d type=%d protocol=%d\n",
@@ -164,6 +168,7 @@ protected:
                         _cbq.context(),
                         static_cast<void*>(_reactor),
                         static_cast<void*>(&_exec));
+        determine_family();
         init_socket();
     }
 
@@ -222,7 +227,8 @@ private:
     /** @brief 根据指定协议参数创建新 SOCKET，并执行初始化。 */
     void create_socket(int family, int type, int protocol)
     {
-        _sock = ::socket(family, type, protocol);
+        _family = family;
+        _sock   = ::socket(family, type, protocol);
         if (_sock == INVALID_SOCKET)
             throw std::runtime_error("socket failed");
         CO_WQ_CBQ_TRACE("[socket_core] create_socket this=%p sock=%llu family=%d type=%d protocol=%d\n",
@@ -259,10 +265,21 @@ private:
         ::ioctlsocket(_sock, FIONBIO, &mode);
     }
 
+    void determine_family()
+    {
+        sockaddr_storage local {};
+        int              len = static_cast<int>(sizeof(local));
+        if (::getsockname(_sock, reinterpret_cast<sockaddr*>(&local), &len) == 0)
+            _family = local.ss_family;
+        else
+            _family = AF_INET;
+    }
+
     workqueue<lock>&  _exec;
     Reactor<lock>*    _reactor { nullptr };
     SOCKET            _sock { INVALID_SOCKET };
     bool              _closed { false };
+    int               _family { AF_INET };
     lock              _io_serial_lock;
     serial_queue      _send_q;
     serial_queue      _recv_q;

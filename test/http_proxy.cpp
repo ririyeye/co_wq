@@ -401,6 +401,61 @@ bool parse_port(const std::string& str, uint16_t& out)
     return true;
 }
 
+bool split_host_port(const std::string& input, uint16_t default_port, std::string& host_out, uint16_t& port_out)
+{
+    if (input.empty())
+        return false;
+
+    std::string host;
+    std::string port_str;
+
+    if (input.front() == '[') {
+        auto close = input.find(']');
+        if (close == std::string::npos)
+            return false;
+        host        = input.substr(1, close - 1);
+        size_t next = close + 1;
+        if (next < input.size()) {
+            if (input[next] != ':')
+                return false;
+            port_str = input.substr(next + 1);
+        }
+    } else {
+        auto colon = input.find(':');
+        if (colon != std::string::npos) {
+            if (input.find(':', colon + 1) != std::string::npos)
+                return false; // IPv6 literal must be bracketed
+            host     = input.substr(0, colon);
+            port_str = input.substr(colon + 1);
+        } else {
+            host = input;
+        }
+    }
+
+    if (host.empty())
+        return false;
+
+    uint16_t port_value = default_port;
+    if (!port_str.empty()) {
+        if (!parse_port(port_str, port_value))
+            return false;
+    }
+
+    host_out = host;
+    port_out = port_value;
+    return true;
+}
+
+std::string format_host_for_log(const std::string& host)
+{
+    if (host.find(':') != std::string::npos) {
+        std::ostringstream oss;
+        oss << '[' << host << ']';
+        return oss.str();
+    }
+    return host;
+}
+
 struct UrlParts {
     std::string host;
     uint16_t    port { 80 };
@@ -428,19 +483,14 @@ std::optional<UrlParts> parse_http_url(const std::string& url)
     if (authority.empty())
         return std::nullopt;
     UrlParts parts;
-    auto     colon_pos = authority.find(':');
     debug_check_string_integrity("parse_http_url.authority", authority);
-    if (colon_pos != std::string::npos) {
-        parts.host = authority.substr(0, colon_pos);
-        uint16_t port { 0 };
-        auto     port_str = authority.substr(colon_pos + 1);
-        debug_check_string_integrity("parse_http_url.port", port_str);
-        if (!parse_port(port_str, port))
-            return std::nullopt;
-        parts.port = port;
-    } else {
-        parts.host = authority;
-    }
+    std::string host_value;
+    uint16_t    port_value = 80;
+    if (!split_host_port(authority, 80, host_value, port_value))
+        return std::nullopt;
+    debug_check_string_integrity("parse_http_url.host", host_value);
+    parts.host = std::move(host_value);
+    parts.port = port_value;
     if (parts.host.empty())
         return std::nullopt;
     parts.path = std::move(path);
@@ -458,24 +508,13 @@ std::optional<ConnectTarget> parse_connect_target(const std::string& target)
     if (target.empty())
         return std::nullopt;
     debug_check_string_integrity("parse_connect_target", target);
-    auto          colon_pos = target.find(':');
+    std::string   host;
+    uint16_t      port = 443;
     ConnectTarget ct;
-    if (colon_pos == std::string::npos) {
-        ct.host = target;
-        ct.port = 443;
-    } else {
-        ct.host = target.substr(0, colon_pos);
-        if (ct.host.empty())
-            return std::nullopt;
-        uint16_t port { 0 };
-        auto     port_str = target.substr(colon_pos + 1);
-        debug_check_string_integrity("parse_connect_target.port", port_str);
-        if (!parse_port(port_str, port))
-            return std::nullopt;
-        ct.port = port;
-    }
-    if (ct.host.empty())
+    if (!split_host_port(target, 443, host, port))
         return std::nullopt;
+    ct.host = std::move(host);
+    ct.port = port;
     return ct;
 }
 
@@ -506,60 +545,23 @@ extern "C" void wq_debug_null_func(co_wq::worknode* node)
 }
 #endif
 
+net::tcp_socket<SpinLock> make_upstream_socket(net::fd_workqueue<SpinLock>& fdwq)
+{
+    static std::atomic_bool warned { false };
+    try {
+        return fdwq.make_tcp_socket(AF_INET6, true);
+    } catch (const std::exception& ex) {
+        if (!warned.exchange(true)) {
+            CO_WQ_LOG_WARN("[proxy] dual-stack upstream socket unavailable, falling back to IPv4: %s", ex.what());
+        }
+    }
+    return fdwq.make_tcp_socket(AF_INET, false);
+}
+
 Task<int, Work_Promise<SpinLock, int>>
 connect_upstream(net::tcp_socket<SpinLock>& socket, const std::string& host, uint16_t port)
 {
-    struct addrinfo hints {};
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    struct addrinfo* result   = nullptr;
-    std::string      port_str = std::to_string(port);
-    int              rc       = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result);
-    if (rc != 0 || result == nullptr) {
-        if (result)
-            ::freeaddrinfo(result);
-        co_return -1;
-    }
-
-    int ret = -1;
-#if !defined(_WIN32)
-    struct StaticEndpoint {
-        sockaddr_storage addr {};
-        socklen_t        len { 0 };
-        bool             build(sockaddr_storage& storage, socklen_t& out_len) const
-        {
-            std::memcpy(&storage, &addr, len);
-            out_len = len;
-            return true;
-        }
-    };
-#endif
-
-    for (auto* ai = result; ai != nullptr; ai = ai->ai_next) {
-        if (ai->ai_family != AF_INET)
-            continue;
-#if defined(_WIN32)
-        auto* in = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
-        char  ip_buf[INET_ADDRSTRLEN] {};
-        if (::inet_ntop(AF_INET, &in->sin_addr, ip_buf, sizeof(ip_buf)) == nullptr)
-            continue;
-        ret = co_await socket.connect(ip_buf, static_cast<uint16_t>(ntohs(in->sin_port)));
-#else
-        StaticEndpoint endpoint;
-        endpoint.len = static_cast<socklen_t>(ai->ai_addrlen);
-        if (endpoint.len > static_cast<socklen_t>(sizeof(endpoint.addr)))
-            endpoint.len = static_cast<socklen_t>(sizeof(endpoint.addr));
-        std::memcpy(&endpoint.addr, ai->ai_addr, endpoint.len);
-        ret = co_await socket.connect_with(endpoint);
-#endif
-        if (ret == 0)
-            break;
-    }
-
-    ::freeaddrinfo(result);
-    co_return ret;
+    co_return co_await socket.connect(host, port);
 }
 
 // 构造最小化的 HTTP/1.1 错误/控制响应。
@@ -698,6 +700,16 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
     request.append(std::to_string(ctx.http_minor));
     request.append("\r\n");
 
+    auto append_host_literal = [](std::string& dest, const std::string& host) {
+        if (host.find(':') != std::string::npos) {
+            dest.push_back('[');
+            dest.append(host);
+            dest.push_back(']');
+        } else {
+            dest.append(host);
+        }
+    };
+
     bool has_host_header = false;
     for (const auto& entry : ctx.header_sequence) {
         std::string lower = to_lower(entry.name);
@@ -716,7 +728,7 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
     }
     if (!has_host_header) {
         request.append("Host: ");
-        request.append(parts.host);
+        append_host_literal(request, parts.host);
         if (parts.port != 80) {
             request.push_back(':');
             request.append(std::to_string(parts.port));
@@ -777,10 +789,10 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
                                                         const ConnectTarget&         target,
                                                         const std::string&           peer_id)
 {
-    auto upstream = fdwq.make_tcp_socket();
+    auto upstream = make_upstream_socket(fdwq);
     {
         std::ostringstream oss;
-        oss << peer_id << " CONNECT dialing " << target.host << ':' << target.port;
+        oss << peer_id << " CONNECT dialing " << format_host_for_log(target.host) << ':' << target.port;
         auto msg = oss.str();
         debug_log(msg);
     }
@@ -824,10 +836,11 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
                                                              const UrlParts&              parts,
                                                              const std::string&           peer_id)
 {
-    auto upstream = fdwq.make_tcp_socket();
+    auto upstream = make_upstream_socket(fdwq);
     {
         std::ostringstream oss;
-        oss << peer_id << " " << ctx.method << " " << parts.host << ':' << parts.port << parts.path;
+        oss << peer_id << " " << ctx.method << " " << format_host_for_log(parts.host) << ':' << parts.port
+            << parts.path;
         auto msg = oss.str();
         debug_log(msg);
     }
@@ -996,12 +1009,42 @@ handle_proxy_connection(net::fd_workqueue<SpinLock>& fdwq, net::tcp_socket<SpinL
 Task<void, Work_Promise<SpinLock, void>>
 proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_t port)
 {
-    net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor());
+    auto analyze_listen_host = [](const std::string& input) {
+        struct Config {
+            int         family { AF_INET };
+            bool        dual_stack { false };
+            std::string bind_host;
+        } cfg;
+        std::string host = input;
+        if (host.empty())
+            host = "";
+        std::string view = host;
+        if (!view.empty() && view.front() == '[' && view.back() == ']')
+            view = view.substr(1, view.size() - 2);
+        bool host_unspecified = view.empty() || view == "0.0.0.0" || view == "*" || view == "::";
+        bool host_ipv6        = view.find(':') != std::string::npos;
+        if (host_unspecified) {
+            cfg.family     = AF_INET6;
+            cfg.dual_stack = true;
+            cfg.bind_host  = "::";
+        } else if (host_ipv6) {
+            cfg.family    = AF_INET6;
+            cfg.bind_host = host;
+        } else {
+            cfg.family    = AF_INET;
+            cfg.bind_host = host;
+        }
+        return cfg;
+    };
+
+    auto                        listen_cfg = analyze_listen_host(host);
+    net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor(), listen_cfg.family);
     try {
-        listener.bind_listen(host, port, 128);
+        listener.bind_listen(listen_cfg.bind_host, port, 128, listen_cfg.dual_stack);
     } catch (const std::exception& ex) {
         std::ostringstream oss;
-        oss << "[proxy] failed to bind " << host << ':' << port << ": " << ex.what();
+        oss << "[proxy] failed to bind " << (listen_cfg.bind_host.empty() ? host : listen_cfg.bind_host) << ':' << port
+            << ": " << ex.what();
 #if defined(_WIN32)
         int wsa_err = WSAGetLastError();
         if (wsa_err != 0) {
@@ -1022,10 +1065,19 @@ proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_
     }
     g_listener_fd.store(listener.native_handle(), std::memory_order_release);
 
-    CO_WQ_LOG_INFO("[proxy] listening on %s:%u", host.c_str(), static_cast<unsigned>(port));
+    std::string log_host = listen_cfg.bind_host.empty() ? host : listen_cfg.bind_host;
+    std::string log_suffix;
+    if (listen_cfg.dual_stack && listen_cfg.family == AF_INET6)
+        log_suffix = " (dual-stack)";
+    auto formatted_host = format_host_for_log(log_host);
+
+    CO_WQ_LOG_INFO("[proxy] listening on %s:%u%s",
+                   formatted_host.c_str(),
+                   static_cast<unsigned>(port),
+                   log_suffix.c_str());
     {
         std::ostringstream oss;
-        oss << "proxy listening on " << host << ':' << port;
+        oss << "proxy listening on " << formatted_host << ':' << port << log_suffix;
         auto msg = oss.str();
         debug_log(msg);
     }

@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#if !defined(_WIN32)
+
 #include "callback_wq.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
@@ -39,6 +41,7 @@ public:
         , _reactor(o._reactor)
         , _fd(std::exchange(o._fd, -1))
         , _closed(std::exchange(o._closed, false))
+        , _family(o._family)
         , _cbq(_exec)
     {
         serial_queue_init(_send_q);
@@ -51,6 +54,7 @@ public:
             _reactor = o._reactor;
             _fd      = std::exchange(o._fd, -1);
             _closed  = std::exchange(o._closed, false);
+            _family  = o._family;
             std::destroy_at(&_cbq);
             std::construct_at(&_cbq, _exec);
             serial_queue_init(_send_q);
@@ -76,10 +80,12 @@ public:
     serial_queue& recv_queue() { return _recv_q; }
     /** @brief 是否已关闭。 */
     bool closed() const noexcept { return _closed; }
+    /** @brief 返回 socket 地址族。 */
+    int family() const noexcept { return _family; }
 
 protected:
     socket_core(workqueue<lock>& exec, Reactor<lock>& reactor, int domain, int type, int protocol = 0)
-        : _exec(exec), _reactor(&reactor), _cbq(exec)
+        : _exec(exec), _reactor(&reactor), _family(domain), _cbq(exec)
     {
         _fd = ::socket(domain, type | SOCK_CLOEXEC, protocol);
         if (_fd < 0)
@@ -91,6 +97,7 @@ protected:
     {
         if (_fd < 0)
             throw std::runtime_error("invalid fd");
+        determine_family();
         init_fd();
     }
 
@@ -186,10 +193,21 @@ private:
     Reactor<lock>*    _reactor { nullptr };
     int               _fd { -1 };
     bool              _closed { false };
+    int               _family { AF_INET };
     lock              _io_serial_lock;
     serial_queue      _send_q;
     serial_queue      _recv_q;
     callback_wq<lock> _cbq;
+
+    void determine_family()
+    {
+        sockaddr_storage local {};
+        socklen_t        len = sizeof(local);
+        if (::getsockname(_fd, reinterpret_cast<sockaddr*>(&local), &len) == 0)
+            _family = local.ss_family;
+        else
+            _family = AF_INET;
+    }
 };
 
 /**
@@ -638,3 +656,9 @@ protected:
 };
 
 } // namespace co_wq::net::detail
+
+#else
+
+// This header is unused on non-Linux platforms.
+
+#endif // !_WIN32

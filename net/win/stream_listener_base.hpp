@@ -53,7 +53,11 @@ public:
     stream_listener_base& operator=(const stream_listener_base&) = delete;
 
     stream_listener_base(stream_listener_base&& o) noexcept
-        : _exec(o._exec), _reactor(o._reactor), _sock(std::exchange(o._sock, INVALID_SOCKET)), _acceptex(o._acceptex)
+        : _exec(o._exec)
+        , _reactor(o._reactor)
+        , _sock(std::exchange(o._sock, INVALID_SOCKET))
+        , _family(o._family)
+        , _acceptex(o._acceptex)
     {
     }
 
@@ -64,6 +68,7 @@ public:
             _exec     = o._exec;
             _reactor  = o._reactor;
             _sock     = std::exchange(o._sock, INVALID_SOCKET);
+            _family   = o._family;
             _acceptex = o._acceptex;
         }
         return *this;
@@ -91,7 +96,9 @@ public:
     }
 
     /** @brief 返回监听 socket 的原生句柄（int 形式）。 */
-    int native_handle() const { return static_cast<int>(_sock); }
+    int    native_handle() const { return static_cast<int>(_sock); }
+    int    family() const noexcept { return _family; }
+    size_t addr_len() const noexcept { return _family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in); }
     /** @brief 访问绑定的执行器。 */
     workqueue<lock>& exec() { return _exec; }
     /** @brief 返回关联的 Reactor 指针，可能为空。 */
@@ -115,17 +122,19 @@ public:
          * @brief 构造 Awaiter，预先分配地址缓冲区。
          * @param o 所属监听器实例。
          */
-        explicit accept_awaiter(stream_listener_base& o) : owner(o), addrbuf((sizeof(sockaddr_in) + 16) * 2)
+        explicit accept_awaiter(stream_listener_base& o) : owner(o)
         {
             ZeroMemory(&ovl, sizeof(ovl));
             ovl.waiter = this;
             this->set_debug_name("tcp_listener::accept");
+            auto addr_bytes = owner.addr_len() + 16;
+            addrbuf.resize(static_cast<size_t>(addr_bytes) * 2);
         }
         /** @brief 若 AcceptEx 能立即完成则返回 true，否则挂起等待 IOCP 完成。 */
         bool await_ready() noexcept
         {
             INIT_LIST_HEAD(&this->ws_node);
-            SOCKET child = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            SOCKET child = ::socket(owner._family, SOCK_STREAM, IPPROTO_TCP);
             if (child == INVALID_SOCKET) {
                 newfd = accept_fatal();
                 return true;
@@ -205,7 +214,7 @@ protected:
      * @param protocol 协议号（如 IPPROTO_TCP）。
      */
     stream_listener_base(workqueue<lock>& exec, Reactor<lock>& reactor, int family, int type, int protocol = 0)
-        : _exec(exec), _reactor(&reactor)
+        : _exec(exec), _reactor(&reactor), _family(family)
     {
         _sock = ::socket(family, type, protocol);
         if (_sock == INVALID_SOCKET)
@@ -243,6 +252,7 @@ protected:
     workqueue<lock>& _exec;
     Reactor<lock>*   _reactor { nullptr };
     SOCKET           _sock { INVALID_SOCKET };
+    int              _family { AF_INET };
     LPFN_ACCEPTEX    _acceptex { nullptr };
 };
 

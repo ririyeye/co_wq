@@ -83,7 +83,10 @@ public:
     explicit fd_workqueue(workqueue<lock>& base) : _base(base), _reactor(base) { }
     workqueue<lock>&          base() { return _base; }
     Reactor<lock>&            reactor() { return _reactor; }
-    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
+    tcp_socket<lock, Reactor> make_tcp_socket(int family = AF_INET, bool dual_stack = false)
+    {
+        return tcp_socket<lock, Reactor>(_base, _reactor, family, dual_stack);
+    }
     tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
 #if defined(USING_SSL)
     tls_socket<lock, Reactor> make_tls_socket(tls_context ctx, tls_mode mode)
@@ -165,7 +168,10 @@ public:
         return fd;
     }
     Reactor<lock>&            reactor() { return _reactor; }
-    tcp_socket<lock, Reactor> make_tcp_socket() { return tcp_socket<lock, Reactor>(_base, _reactor); }
+    tcp_socket<lock, Reactor> make_tcp_socket(int family = AF_INET, bool dual_stack = false)
+    {
+        return tcp_socket<lock, Reactor>(_base, _reactor, family, dual_stack);
+    }
     tcp_socket<lock, Reactor> adopt_tcp_socket(int fd) { return tcp_socket<lock, Reactor>(fd, _base, _reactor); }
 #if defined(USING_SSL)
     tls_socket<lock, Reactor> make_tls_socket(tls_context ctx, tls_mode mode)

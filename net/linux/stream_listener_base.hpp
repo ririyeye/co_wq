@@ -42,7 +42,8 @@ public:
     stream_listener_base(const stream_listener_base&)            = delete;
     stream_listener_base& operator=(const stream_listener_base&) = delete;
 
-    stream_listener_base(stream_listener_base&& o) noexcept : _exec(o._exec), _reactor(o._reactor), _fd(o._fd)
+    stream_listener_base(stream_listener_base&& o) noexcept
+        : _exec(o._exec), _reactor(o._reactor), _fd(o._fd), _family(o._family)
     {
         o._fd = -1;
     }
@@ -53,6 +54,7 @@ public:
             _exec    = o._exec;
             _reactor = o._reactor;
             _fd      = o._fd;
+            _family  = o._family;
             o._fd    = -1;
         }
         return *this;
@@ -80,6 +82,7 @@ public:
     int native_handle() const { return _fd; }
     /** @brief 返回绑定的工作队列。 */
     workqueue<lock>& exec() { return _exec; }
+    int              family() const noexcept { return _family; }
     /** @brief 返回关联的 reactor。 */
     Reactor<lock>* reactor() { return _reactor; }
 
@@ -131,7 +134,7 @@ protected:
      * @brief 直接创建新的监听 socket。
      */
     stream_listener_base(workqueue<lock>& exec, Reactor<lock>& reactor, int domain, int type, int protocol = 0)
-        : _exec(exec), _reactor(&reactor)
+        : _exec(exec), _reactor(&reactor), _family(domain)
     {
         _fd = ::socket(domain, type | SOCK_CLOEXEC, protocol);
         if (_fd < 0)
@@ -153,6 +156,7 @@ protected:
     workqueue<lock>& _exec;
     Reactor<lock>*   _reactor { nullptr };
     int              _fd { -1 };
+    int              _family { AF_INET };
 };
 
 } // namespace co_wq::net::detail
