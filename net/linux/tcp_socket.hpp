@@ -123,12 +123,36 @@ public:
         }
     };
 
+    struct raw_endpoint {
+        sockaddr_storage address {};
+        socklen_t        length { 0 };
+
+        [[nodiscard]] bool build(sockaddr_storage& storage, socklen_t& len) const noexcept
+        {
+            if (length == 0 || length > sizeof(storage))
+                return false;
+            std::memcpy(&storage, &address, length);
+            len = length;
+            return true;
+        }
+    };
+
     /**
      * @brief 发起异步连接。
      */
     auto connect(const std::string& host, uint16_t port)
     {
         return this->connect_with(dns_endpoint { *this, host, port, dual_stack() });
+    }
+
+    auto connect(const sockaddr* addr, socklen_t len)
+    {
+        raw_endpoint endpoint;
+        if (addr && len > 0 && len <= sizeof(endpoint.address)) {
+            std::memcpy(&endpoint.address, addr, len);
+            endpoint.length = len;
+        }
+        return this->connect_with(std::move(endpoint));
     }
 
 private:

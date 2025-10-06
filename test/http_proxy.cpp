@@ -1405,7 +1405,7 @@ Task<int, Work_Promise<SpinLock, int>> connect_upstream(net::tcp_socket<SpinLock
         }
 
         last_rc = co_await socket.connect(reinterpret_cast<const sockaddr*>(&plan.snapshot.candidate.addr),
-                                          plan.snapshot.candidate.len);
+                                          static_cast<socklen_t>(plan.snapshot.candidate.len));
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
         auto stats   = record_upstream_outcome(endpoint_key, plan.snapshot.candidate.stats_key, last_rc == 0, elapsed);
