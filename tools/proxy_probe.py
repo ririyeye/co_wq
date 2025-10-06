@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import dataclasses
 import errno
 import json
@@ -18,7 +19,7 @@ import sys
 import time
 from http.client import HTTPException, HTTPSConnection
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 from urllib.parse import urlparse
 
 
@@ -39,11 +40,20 @@ class ConnectTarget:
 
 
 @dataclasses.dataclass
+class ProbeTask:
+    kind: str  # "http", "https", or "connect"
+    target: UrlTarget | ConnectTarget
+
+    @property
+    def original(self) -> str:
+        return self.target.original
+
+
+@dataclasses.dataclass
 class RequestConfig:
     proxy_host: str
     proxy_port: int
     timeout: float
-    mode: str
     user_agent: str
     verbose: bool
     use_proxy: bool
@@ -136,6 +146,9 @@ def load_lines(path: Path) -> List[str]:
 def parse_url_target(url: str) -> UrlTarget:
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
+    if not scheme:
+        parsed = urlparse(f"http://{url}")
+        scheme = "http"
     if scheme not in {"http", "https"}:
         raise ValueError(f"only http:// or https:// URLs are supported, got: {url}")
     if not parsed.hostname:
@@ -403,28 +416,19 @@ async def perform_connect_request(cfg: RequestConfig, target: ConnectTarget) -> 
 
 async def run_probe(
     cfg: RequestConfig,
-    http_targets: Sequence[UrlTarget],
-    https_targets: Sequence[UrlTarget],
-    connect_targets: Sequence[ConnectTarget],
+    tasks: Sequence[ProbeTask],
     per_target_count: int,
     concurrency: int,
 ) -> Tuple[AggregateStats, List[PerTargetStats]]:
-    if cfg.mode == "http":
-        targets: Sequence[UrlTarget | ConnectTarget] = http_targets
-    elif cfg.mode == "https":
-        targets = https_targets
-    else:
-        targets = connect_targets
-
-    if not targets:
+    if not tasks:
         raise RuntimeError("no targets to probe")
 
-    total_requests = len(targets) * per_target_count
+    total_requests = len(tasks) * per_target_count
     stats = AggregateStats()
-    per_target_stats = [PerTargetStats() for _ in targets]
+    per_target_stats = [PerTargetStats() for _ in tasks]
 
     queue: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
-    for idx, _ in enumerate(targets):
+    for idx, _ in enumerate(tasks):
         for rep in range(per_target_count):
             queue.put_nowait((idx, rep))
 
@@ -454,16 +458,18 @@ async def run_probe(
                 target_index, repetition = await queue.get()
             except asyncio.CancelledError:
                 break
-            target = targets[target_index]
+            task = tasks[target_index]
             if cfg.verbose:
-                print(f"[worker {worker_id}] ({target_index}:{repetition}) {target.original}")
+                print(f"[worker {worker_id}] ({target_index}:{repetition}) {task.original}")
             try:
-                if cfg.mode == "http":
-                    result = await perform_http_request(cfg, target)  # type: ignore[arg-type]
-                elif cfg.mode == "https":
-                    result = await perform_https_request(cfg, target)  # type: ignore[arg-type]
+                if task.kind == "http":
+                    result = await perform_http_request(cfg, cast(UrlTarget, task.target))
+                elif task.kind == "https":
+                    result = await perform_https_request(cfg, cast(UrlTarget, task.target))
                 else:
-                    result = await perform_connect_request(cfg, target)  # type: ignore[arg-type]
+                    if not cfg.use_proxy:
+                        raise RuntimeError("CONNECT requests require proxy mode")
+                    result = await perform_connect_request(cfg, cast(ConnectTarget, task.target))
                 stats.record(result)
                 per_target_stats[target_index].record(result)
                 async with progress_lock:
@@ -555,7 +561,6 @@ def apply_config_overrides(
 
     set_if_default("proxy_host", ("proxy", "host"), ("proxy_host",))
     set_if_default("proxy_port", ("proxy", "port"), ("proxy_port",), transform=int)
-    set_if_default("mode", ("mode",), transform=lambda v: str(v).lower())
     set_if_default("timeout", ("timeout",), transform=float)
     set_if_default("user_agent", ("user_agent",))
     set_if_default("count", ("count",), transform=int)
@@ -573,6 +578,14 @@ def apply_config_overrides(
     extend_list("url", ("urls",))
     extend_list("target", ("targets",), ("connect_targets",))
 
+    deprecated_mode = _get_config_value(config, ("mode",))
+    if deprecated_mode is not None:
+        print(
+            "[warning] configuration field 'mode' is deprecated and ignored;"
+            " provide URLs/targets directly instead.",
+            file=sys.stderr,
+        )
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Probe co_wq HTTP proxy stability using raw Python requests")
@@ -580,7 +593,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-host", default="127.0.0.1", help="proxy host (default: 127.0.0.1)")
     parser.add_argument("--proxy-port", type=int, default=8081, help="proxy port (default: 8081)")
     parser.add_argument("--timeout", type=float, default=5.0, help="per-request timeout in seconds (default: 5.0)")
-    parser.add_argument("--mode", choices=["http", "https", "connect"], default="http", help="test mode")
     parser.add_argument("--url", action="append", default=[], help="HTTP(S) URL to request (repeatable)")
     parser.add_argument("--urls-file", type=Path, help="file with HTTP(S) URLs (one per line)")
     parser.add_argument("--target", action="append", default=[], help="CONNECT target host:port (repeatable)")
@@ -628,9 +640,7 @@ def print_summary(
     cfg: RequestConfig,
     stats: AggregateStats,
     per_target: List[PerTargetStats],
-    http_targets: Sequence[UrlTarget],
-    https_targets: Sequence[UrlTarget],
-    connect_targets: Sequence[ConnectTarget],
+    tasks: Sequence[ProbeTask],
     count: int,
 ) -> None:
     if stats.attempts == 0:
@@ -639,28 +649,34 @@ def print_summary(
     success_rate = 100.0 * stats.successes / stats.attempts
     timeout_rate = 100.0 * stats.timeouts / stats.attempts
     avg_latency = stats.total_latency_ms / stats.attempts if stats.attempts else 0.0
-    if cfg.mode == "http":
-        target_count = len(http_targets)
-    elif cfg.mode == "https":
-        target_count = len(https_targets)
-    else:
-        target_count = len(connect_targets)
+    type_counts = collections.Counter(task.kind for task in tasks)
+    target_count = len(tasks)
 
     title = "Proxy Probe Summary" if cfg.use_proxy else "Direct Request Summary"
     print(f"\n=== {title} ===")
-    print(f"Mode: {cfg.mode.upper()}")
+    kind_labels = {
+        "http": "HTTP",
+        "https": "HTTPS",
+        "connect": "CONNECT",
+    }
+    breakdown = []
+    for kind in ("http", "https", "connect"):
+        if type_counts[kind]:
+            breakdown.append(f"{kind_labels[kind]}={type_counts[kind]} targets")
+    if breakdown:
+        print("Targets:" + " ".join(f" {item}" for item in breakdown))
     if cfg.use_proxy:
         print(f"Proxy: {cfg.proxy_host}:{cfg.proxy_port}")
     else:
         print("Proxy: (direct connection)")
-    print(f"Targets: {target_count} x {count} = {target_count * count} requests")
+    print(f"Requests: {target_count} x {count} = {target_count * count} attempts")
     print(f"Success: {stats.successes} ({success_rate:.2f}%)")
     print(f"Timeouts: {stats.timeouts} ({timeout_rate:.2f}%)")
     print(f"Connect errors: {stats.connect_errors}")
     print(f"Send errors: {stats.send_errors}")
     print(f"Recv errors: {stats.recv_errors}")
     print(f"HTTP errors: {stats.http_errors}")
-    if cfg.mode == "https":
+    if type_counts["https"]:
         print(f"TLS errors: {stats.tls_errors}")
     print(f"Other errors: {stats.other_errors}")
     print(f"Average latency: {avg_latency:.2f} ms, max latency: {stats.max_latency_ms:.2f} ms")
@@ -678,14 +694,11 @@ def print_summary(
         problematic.sort(key=lambda pair: pair[1].failures + pair[1].timeouts, reverse=True)
         print("\nWorst targets:")
         for idx, entry in problematic[:5]:
-            if cfg.mode == "http":
-                name = http_targets[idx].original
-            elif cfg.mode == "https":
-                name = https_targets[idx].original
-            else:
-                name = connect_targets[idx].original
+            task = tasks[idx]
+            name = task.original
+            kind_label = kind_labels.get(task.kind, task.kind.upper())
             success_ratio = 100.0 * entry.successes / entry.attempts if entry.attempts else 0.0
-            summary_bits = [f"{entry.successes}/{entry.attempts} success ({success_ratio:.1f}%)"]
+            summary_bits = [f"{entry.successes}/{entry.attempts} success ({success_ratio:.1f}%)", f"type={kind_label}"]
             if entry.timeouts:
                 summary_bits.append(f"timeouts={entry.timeouts}")
             if entry.failures:
@@ -702,58 +715,39 @@ async def async_main(args: argparse.Namespace) -> int:
         return 2
 
     http_targets, https_targets, connect_targets = load_targets(args)
-    if args.mode == "http" and not http_targets:
-        print("No HTTP URLs specified", file=sys.stderr)
-        return 2
-    if args.mode == "https" and not https_targets:
-        print("No HTTPS URLs specified", file=sys.stderr)
-        return 2
-    if args.mode == "connect" and not connect_targets:
-        print("No CONNECT targets specified", file=sys.stderr)
+    tasks: List[ProbeTask] = []
+    tasks.extend(ProbeTask("http", target) for target in http_targets)
+    tasks.extend(ProbeTask("https", target) for target in https_targets)
+    tasks.extend(ProbeTask("connect", target) for target in connect_targets)
+    if not tasks:
+        print("No targets specified", file=sys.stderr)
         return 2
 
     cfg = RequestConfig(
         proxy_host=args.proxy_host,
         proxy_port=args.proxy_port,
         timeout=args.timeout,
-        mode=args.mode,
         user_agent=args.user_agent,
         verbose=args.verbose,
         use_proxy=True,
     )
 
-    stats, per_target = await run_probe(
-        cfg,
-        http_targets,
-        https_targets,
-        connect_targets,
-        args.count,
-        args.concurrency,
-    )
-    print_summary(cfg, stats, per_target, http_targets, https_targets, connect_targets, args.count)
+    stats, per_target = await run_probe(cfg, tasks, args.count, args.concurrency)
+    print_summary(cfg, stats, per_target, tasks, args.count)
 
     if args.compare_direct:
-        if args.mode == "connect":
-            print("\n[warning] Direct comparison is not available for CONNECT mode.")
+        direct_tasks = [task for task in tasks if task.kind != "connect"]
+        if not direct_tasks:
+            print("\n[warning] Direct comparison is only available for HTTP/HTTPS targets.")
         else:
             direct_cfg = dataclasses.replace(cfg, use_proxy=False)
             direct_stats, direct_per_target = await run_probe(
                 direct_cfg,
-                http_targets,
-                https_targets,
-                connect_targets,
+                direct_tasks,
                 args.count,
                 args.concurrency,
             )
-            print_summary(
-                direct_cfg,
-                direct_stats,
-                direct_per_target,
-                http_targets,
-                https_targets,
-                connect_targets,
-                args.count,
-            )
+            print_summary(direct_cfg, direct_stats, direct_per_target, direct_tasks, args.count)
     return 0 if stats.successes > 0 else 1
 
 

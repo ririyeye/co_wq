@@ -3,7 +3,6 @@
         "host": "192.168.30.32",
         "port": 18100
     },
-    "mode": "https",
     "timeout": 5.0,
     "count": 10,
     "concurrency": 4,

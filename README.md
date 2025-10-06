@@ -259,6 +259,8 @@ curl --proxy http://127.0.0.1:18080 http://example.com
 curl --proxy http://127.0.0.1:18080 https://example.com --proxytunnel
 ```
 
+> ⚠️ 当前实现的 CONNECT 隧道在长时间的 HTTPS 回源（尤其是大响应体或慢速服务器）场景下仍存在偶发截断问题。若用于排查代理稳定性，请优先关注 HTTP 目标；HTTPS 用例建议配合抓包/日志确认结果，并关注后续修复进展。
+
 程序默认开启调试日志（输出到 `stderr`），包含时间戳、线程 ID 以及关键事件，例如“收到请求”“上游连接结果”“CONNECT 隧道关闭”等。可使用标准重定向将日志落地：
 
 ```bash
@@ -280,8 +282,7 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
 
   主要参数：
 
-  - `--mode http|https|connect`：切换常规 HTTP GET、HTTPS GET（经 CONNECT+TLS）或 CONNECT 隧道握手；
-  - `--url/--urls-file`：HTTP/HTTPS 目标列表（`https://` 仅在 HTTPS 模式下使用，支持文件批量导入）；
+  - `--url/--urls-file`：HTTP/HTTPS 目标列表（可混合；未指定 scheme 时默认补全为 `http://`，支持文件批量导入）；
   - `--target/--targets-file`：CONNECT 目标（`host:port`）；
   - `--count` / `--concurrency`：每个目标的发送次数与并发工作协程；
   - `--timeout`：单次请求超时时间（秒）。
@@ -294,6 +295,8 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
    ```
 
    命令行参数仍可覆盖配置文件中的字段，例如添加额外的 `--url` 或调整 `--concurrency`。
+
+  脚本会根据 URL 的 scheme 自动选择 HTTP 或 HTTPS 请求流程；同一轮测试可混合多个类型并同时串联若干 CONNECT 目标。
 
   脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。
 

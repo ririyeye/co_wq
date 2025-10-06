@@ -37,12 +37,12 @@ goto :cleanup
 :args_done
 
 if /I "%MODE%"=="full" (
-	set "CONFIG_FLAGS=--USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_SSL=y --USING_USB=y --USING_EXAMPLE=y"
+	set "CONFIG_FLAGS=--USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_SSL=y --USING_USB=y --MSVC_ITERATOR_DEBUG=y --USING_EXAMPLE=y"
 ) else (
-	set "CONFIG_FLAGS=--USING_NET=n --USE_BUNDLED_LLHTTP=n --USING_SSL=n --USING_USB=n --USING_EXAMPLE=n"
+	set "CONFIG_FLAGS=--USING_NET=n --USE_BUNDLED_LLHTTP=n --USING_SSL=n --USING_USB=n --MSVC_ITERATOR_DEBUG=n --USING_EXAMPLE=n"
 )
 
-xmake.exe f -y -vD %CONFIG_FLAGS% -m releasedbg -o build -P .
+xmake.exe f -y -vD %CONFIG_FLAGS% -m debug -o build -P .
 xmake.exe project -k compile_commands -P .
 xmake.exe -vD -P .
 xmake.exe install -o install -P .

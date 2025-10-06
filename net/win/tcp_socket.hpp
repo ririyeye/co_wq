@@ -114,6 +114,8 @@ public:
         std::uint32_t    ovl_generation { 0 };
         int              family { AF_INET };
         bool             dual_stack { false };
+        int              selected_family { AF_UNSPEC };
+        bool             pre_resolved { false };
 
         connect_awaiter(tcp_socket& s, std::string h, uint16_t p) : sock(s), host(std::move(h)), port(p)
         {
@@ -127,6 +129,30 @@ public:
             this->set_debug_name("tcp_socket::connect");
             family     = sock.family();
             dual_stack = sock.dual_stack();
+            log_waiter_state("connect ctor", this, host.c_str());
+        }
+        connect_awaiter(tcp_socket& s, const sockaddr* addr, int len) : sock(s)
+        {
+            ZeroMemory(&ovl, sizeof(ovl));
+            ovl.cancelled.store(true, std::memory_order_relaxed);
+            ovl.waiter = this;
+            auto& cbq  = sock.callback_queue();
+            this->store_route_guard(cbq.retain_guard());
+            this->route_ctx  = cbq.context();
+            this->route_post = &callback_wq<lock>::post_adapter;
+            this->set_debug_name("tcp_socket::connect");
+            family       = sock.family();
+            dual_stack   = sock.dual_stack();
+            pre_resolved = true;
+            remote_ready = (addr != nullptr && len > 0);
+            remote_len   = remote_ready ? len : 0;
+            if (remote_ready) {
+                if (remote_len > static_cast<int>(sizeof(remote)))
+                    remote_len = static_cast<int>(sizeof(remote));
+                std::memcpy(&remote, addr, static_cast<size_t>(remote_len));
+            }
+            host = format_pre_resolved(addr, len);
+            port = extract_port(addr, len);
             log_waiter_state("connect ctor", this, host.c_str());
         }
         ~connect_awaiter()
@@ -150,6 +176,45 @@ public:
                                static_cast<void*>(this));
             }
             log_waiter_state("connect dtor", this, issued ? "issued" : "not-issued");
+        }
+        static uint16_t extract_port(const sockaddr* addr, int len)
+        {
+            if (!addr || len <= 0)
+                return 0;
+            if (addr->sa_family == AF_INET) {
+                const auto* in = reinterpret_cast<const sockaddr_in*>(addr);
+                return ntohs(in->sin_port);
+            }
+            if (addr->sa_family == AF_INET6) {
+                const auto* in6 = reinterpret_cast<const sockaddr_in6*>(addr);
+                return ntohs(in6->sin6_port);
+            }
+            return 0;
+        }
+        static std::string format_pre_resolved(const sockaddr* addr, int len)
+        {
+            if (!addr || len <= 0)
+                return {};
+            char host_buf[NI_MAXHOST] = {};
+            char serv_buf[NI_MAXSERV] = {};
+            if (::getnameinfo(addr,
+                              len,
+                              host_buf,
+                              sizeof(host_buf),
+                              serv_buf,
+                              sizeof(serv_buf),
+                              NI_NUMERICHOST | NI_NUMERICSERV)
+                == 0) {
+                std::string host_str(host_buf);
+                if (addr->sa_family == AF_INET6)
+                    host_str = '[' + host_str + ']';
+                if (serv_buf[0] != '\0') {
+                    host_str.push_back(':');
+                    host_str.append(serv_buf);
+                }
+                return host_str;
+            }
+            return {};
         }
         bool load_connectex()
         {
@@ -188,6 +253,8 @@ public:
 
         bool prepare_remote()
         {
+            if (pre_resolved)
+                return remote_ready;
             std::string node = strip_brackets(host);
             if (node.empty()) {
                 ret = -WSAEINVAL;
@@ -219,18 +286,27 @@ public:
             }
 
             std::unique_ptr<ADDRINFOA, decltype(&::freeaddrinfo)> guard(result, ::freeaddrinfo);
+            struct candidate_entry {
+                sockaddr_storage addr {};
+                int              len { 0 };
+                int              family { AF_UNSPEC };
+            };
+            std::vector<candidate_entry> primary;
+            std::vector<candidate_entry> fallback;
+            primary.reserve(4);
+            fallback.reserve(4);
             for (auto* ai = result; ai; ai = ai->ai_next) {
+                candidate_entry entry;
                 if (ai->ai_family == family) {
-                    remote_len = static_cast<int>(ai->ai_addrlen);
-                    if (remote_len > static_cast<int>(sizeof(remote)))
+                    if (ai->ai_addrlen > sizeof(entry.addr))
                         continue;
-                    std::memcpy(&remote, ai->ai_addr, static_cast<size_t>(remote_len));
-                    remote_ready = true;
-                    break;
-                }
-                if (family == AF_INET6 && dual_stack && ai->ai_family == AF_INET) {
+                    std::memcpy(&entry.addr, ai->ai_addr, static_cast<size_t>(ai->ai_addrlen));
+                    entry.len    = static_cast<int>(ai->ai_addrlen);
+                    entry.family = ai->ai_family;
+                    primary.push_back(entry);
+                } else if (family == AF_INET6 && dual_stack && ai->ai_family == AF_INET) {
                     auto* v4 = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
-                    auto* v6 = reinterpret_cast<sockaddr_in6*>(&remote);
+                    auto* v6 = reinterpret_cast<sockaddr_in6*>(&entry.addr);
                     ZeroMemory(v6, sizeof(sockaddr_in6));
                     v6->sin6_family    = AF_INET6;
                     v6->sin6_port      = v4->sin_port;
@@ -238,17 +314,29 @@ public:
                     dst[10]            = 0xFF;
                     dst[11]            = 0xFF;
                     std::memcpy(dst + 12, &v4->sin_addr, sizeof(v4->sin_addr));
-                    remote_len   = static_cast<int>(sizeof(sockaddr_in6));
-                    remote_ready = true;
-                    break;
+                    entry.len    = static_cast<int>(sizeof(sockaddr_in6));
+                    entry.family = AF_INET;
+                    fallback.push_back(entry);
                 }
             }
 
-            if (!remote_ready) {
+            auto* source_vector = &primary;
+            if (source_vector->empty())
+                source_vector = &fallback;
+
+            if (source_vector->empty()) {
                 ret = -WSAEAFNOSUPPORT;
                 CO_WQ_CBQ_WARN("[tcp_socket::connect] no compatible address host=%s port=%u\n",
                                node.c_str(),
                                static_cast<unsigned>(port));
+            } else {
+                static std::atomic_uint32_t round_robin { 0 };
+                std::uint32_t               index  = round_robin.fetch_add(1, std::memory_order_relaxed);
+                const auto&                 chosen = (*source_vector)[index % source_vector->size()];
+                remote                             = chosen.addr;
+                remote_len                         = chosen.len;
+                remote_ready                       = true;
+                selected_family                    = chosen.family;
             }
             return remote_ready;
         }
@@ -373,6 +461,7 @@ public:
 
     /** @brief 创建 Connect Awaiter。 */
     connect_awaiter connect(const std::string& host, uint16_t port) { return connect_awaiter(*this, host, port); }
+    connect_awaiter connect(const sockaddr* addr, int len) { return connect_awaiter(*this, addr, len); }
 
     /**
      * @brief 单次接收 Awaiter：读取任意字节即返回。
@@ -430,7 +519,7 @@ public:
                 inflight = true;
                 return;
             }
-            nread        = -1;
+            nread        = err ? -static_cast<ssize_t>(err) : -1;
             result_ready = true;
             finish();
         }
@@ -446,7 +535,8 @@ public:
                 if (transferred == 0)
                     self->owner.mark_rx_eof();
             } else {
-                self->nread = -1;
+                int err     = WSAGetLastError();
+                self->nread = err ? -static_cast<ssize_t>(err) : -1;
             }
             self->result_ready = true;
             self->inflight     = false;
@@ -481,7 +571,8 @@ public:
                     if (transferred == 0)
                         this->owner.mark_rx_eof();
                 } else {
-                    nread = -1;
+                    int err = WSAGetLastError();
+                    nread   = err ? -static_cast<ssize_t>(err) : -1;
                 }
                 result_ready = true;
             }
@@ -554,7 +645,7 @@ public:
                 return;
             }
             if (recvd == 0)
-                err = -1;
+                err = e ? -static_cast<ssize_t>(e) : -1;
             finish();
         }
         void drive()
@@ -589,8 +680,10 @@ public:
                 self->drive();
                 return;
             }
-            if (self->recvd == 0)
-                self->err = -1;
+            if (self->recvd == 0) {
+                int e     = WSAGetLastError();
+                self->err = e ? -static_cast<ssize_t>(e) : -1;
+            }
             self->finish();
         }
         void finish()
@@ -755,7 +848,7 @@ public:
             if (e == WSAECONNRESET || e == WSAENOTCONN)
                 this->owner.mark_tx_shutdown();
             if (sent == 0)
-                err = -1;
+                err = e ? -static_cast<ssize_t>(e) : -1;
             finish();
         }
         void drive()
@@ -792,8 +885,10 @@ public:
                 self->drive();
                 return;
             }
-            if (self->sent == 0)
-                self->err = -1;
+            if (self->sent == 0) {
+                int e     = WSAGetLastError();
+                self->err = e ? -static_cast<ssize_t>(e) : -1;
+            }
             self->finish();
         }
         void finish()

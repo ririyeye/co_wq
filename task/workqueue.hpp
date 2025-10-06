@@ -5,9 +5,13 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
+
 
 #ifndef CO_WQ_ENABLE_LOGGING
 #define CO_WQ_ENABLE_LOGGING 1
@@ -23,6 +27,7 @@
 
 #if CO_WQ_ENABLE_LOGGING
 #include <fmt/printf.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
@@ -31,6 +36,11 @@
 #endif
 
 namespace co_wq::log {
+inline const char* default_pattern()
+{
+    return "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v";
+}
+
 inline std::shared_ptr<spdlog::logger>& logger_storage()
 {
     static std::shared_ptr<spdlog::logger> storage;
@@ -56,7 +66,7 @@ inline spdlog::logger* ensure_logger()
         } else {
             auto created = spdlog::stdout_color_mt(CO_WQ_LOGGER_NAME);
             created->set_level(spdlog::level::info);
-            created->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
+            created->set_pattern(default_pattern());
             spdlog::set_default_logger(created);
             storage = std::move(created);
         }
@@ -85,6 +95,63 @@ inline void set_level(spdlog::level::level_enum level)
     if (auto* logger = ensure_logger()) {
         logger->set_level(level);
     }
+}
+
+inline std::shared_ptr<spdlog::logger>
+configure_file_logging(const std::string&        file_path,
+                       bool                      truncate          = false,
+                       bool                      mirror_to_console = true,
+                       spdlog::level::level_enum logger_level      = spdlog::level::trace,
+                       spdlog::level::level_enum console_level     = spdlog::level::info,
+                       spdlog::level::level_enum file_level        = spdlog::level::trace)
+{
+    bool sink_truncate = truncate;
+    try {
+        std::filesystem::path path(file_path);
+        std::error_code       ec;
+        bool                  exists     = std::filesystem::exists(path, ec);
+        bool                  ensure_bom = truncate || !exists;
+        if (!ensure_bom && exists) {
+            std::error_code size_ec;
+            auto            size = std::filesystem::file_size(path, size_ec);
+            if (size_ec || size == 0) {
+                ensure_bom = true;
+            }
+        }
+        if (ensure_bom) {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (file) {
+                static constexpr unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+                file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+                sink_truncate = false;
+            }
+        }
+    } catch (...) {
+        sink_truncate = truncate;
+    }
+
+    std::vector<spdlog::sink_ptr> sinks;
+    sinks.reserve(mirror_to_console ? 2U : 1U);
+
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(file_path, sink_truncate);
+    file_sink->set_pattern(default_pattern());
+    file_sink->set_level(file_level);
+    sinks.emplace_back(std::move(file_sink));
+
+    if (mirror_to_console) {
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        console_sink->set_pattern(default_pattern());
+        console_sink->set_level(console_level);
+        sinks.emplace_back(std::move(console_sink));
+    }
+
+    auto logger = std::make_shared<spdlog::logger>(CO_WQ_LOGGER_NAME, sinks.begin(), sinks.end());
+    logger->set_level(logger_level);
+    logger->set_pattern(default_pattern());
+    logger->flush_on(spdlog::level::info);
+    spdlog::set_default_logger(logger);
+    set_logger(logger);
+    return logger;
 }
 
 template <typename... Args> inline void log_message(spdlog::level::level_enum level, const char* fmt, Args&&... args)
