@@ -1,5 +1,4 @@
 #include "syswork.hpp"
-#include <iostream>
 #include <string>
 
 #if defined(USING_NET) && !defined(_WIN32)
@@ -23,10 +22,9 @@ struct UdsOptions {
 
 static void print_usage(const char* prog)
 {
-    std::cout << "Usage: " << prog
-              << " [--server|--client|--both] [--path PATH] [--message MSG] [--max-conn N]\n";
-    std::cout << "\nBy default both server and client run together once.\n";
-    std::cout << "Pass a path starting with '@' to use Linux abstract namespace.\n";
+    CO_WQ_LOG_INFO("Usage: %s [--server|--client|--both] [--path PATH] [--message MSG] [--max-conn N]", prog);
+    CO_WQ_LOG_INFO("By default both server and client run together once.");
+    CO_WQ_LOG_INFO("Pass a path starting with '@' to use Linux abstract namespace.");
 }
 
 static UdsOptions parse_args(int argc, char* argv[])
@@ -36,17 +34,17 @@ static UdsOptions parse_args(int argc, char* argv[])
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--server") {
-            opt.run_server   = true;
-            opt.run_client   = false;
-            mode_explicit    = true;
+            opt.run_server = true;
+            opt.run_client = false;
+            mode_explicit  = true;
         } else if (a == "--client") {
-            opt.run_server   = false;
-            opt.run_client   = true;
-            mode_explicit    = true;
+            opt.run_server = false;
+            opt.run_client = true;
+            mode_explicit  = true;
         } else if (a == "--both") {
-            opt.run_server   = true;
-            opt.run_client   = true;
-            mode_explicit    = true;
+            opt.run_server = true;
+            opt.run_client = true;
+            mode_explicit  = true;
         } else if (a == "--path" && i + 1 < argc) {
             opt.path = argv[++i];
         } else if (a == "--message" && i + 1 < argc) {
@@ -79,7 +77,7 @@ uds_server(net::fd_workqueue<SpinLock>& fdwq, const std::string path, int max_co
 {
     net::unix_listener<SpinLock> lst(fdwq.base(), fdwq.reactor());
     lst.bind_listen(path, 16);
-    std::cout << "[uds server] listening on " << path << "\n";
+    CO_WQ_LOG_INFO("[uds server] listening on %s", path.c_str());
     int accepted = 0;
     while (max_conn <= 0 || accepted < max_conn) {
         int fd = co_await lst.accept();
@@ -91,7 +89,7 @@ uds_server(net::fd_workqueue<SpinLock>& fdwq, const std::string path, int max_co
         post_to(task, fdwq.base());
     }
     lst.close();
-    std::cout << "[uds server] exit\n";
+    CO_WQ_LOG_INFO("[uds server] exit");
     co_return;
 }
 
@@ -100,18 +98,18 @@ uds_client(net::fd_workqueue<SpinLock>& fdwq, const std::string path, const std:
 {
     auto sock = fdwq.make_unix_socket();
     if (co_await sock.connect(path) != 0) {
-        std::cout << "[uds client] connect failed: " << std::strerror(errno) << "\n";
+        CO_WQ_LOG_ERROR("[uds client] connect failed: %s", std::strerror(errno));
         co_return;
     }
-    std::cout << "[uds client] connected to " << path << "\n";
+    CO_WQ_LOG_INFO("[uds client] connected to %s", path.c_str());
     co_await sock.send_all(message.data(), message.size());
     sock.shutdown_tx();
-    char buffer[512];
+    char    buffer[512];
     ssize_t n = co_await sock.recv(buffer, sizeof(buffer));
     if (n > 0)
-        std::cout << "[uds client] reply: " << std::string_view(buffer, (size_t)n) << "\n";
+        CO_WQ_LOG_INFO("[uds client] reply: %.*s", static_cast<int>(n), buffer);
     else
-        std::cout << "[uds client] no reply (" << n << ")\n";
+        CO_WQ_LOG_WARN("[uds client] no reply (%lld)", static_cast<long long>(n));
     co_return;
 }
 
@@ -119,11 +117,11 @@ int main(int argc, char* argv[])
 {
     auto options = parse_args(argc, argv);
     if (!options.run_server && !options.run_client) {
-        std::cout << "Nothing to do. Use --server, --client or --both.\n";
+        CO_WQ_LOG_INFO("Nothing to do. Use --server, --client or --both.");
         return 0;
     }
-    auto&                       wq = get_sys_workqueue(0);
-    net::fd_workqueue<SpinLock> fdwq(wq);
+    auto&                                    wq = get_sys_workqueue(0);
+    net::fd_workqueue<SpinLock>              fdwq(wq);
     Task<void, Work_Promise<SpinLock, void>> server_task { nullptr };
     Task<void, Work_Promise<SpinLock, void>> client_task { nullptr };
     if (options.run_server)
@@ -139,9 +137,9 @@ int main(int argc, char* argv[])
 
     std::atomic_bool finished { false };
     if (chosen && chosen->get()) {
-        auto& promise          = chosen->get().promise();
-        promise.mUserData      = &finished;
-        promise.mOnCompleted   = [](Promise_base& pb) {
+        auto& promise        = chosen->get().promise();
+        promise.mUserData    = &finished;
+        promise.mOnCompleted = [](Promise_base& pb) {
             auto* flag = static_cast<std::atomic_bool*>(pb.mUserData);
             if (flag)
                 flag->store(true, std::memory_order_release);
@@ -156,14 +154,14 @@ int main(int argc, char* argv[])
     if (chosen)
         sys_wait_until(finished);
     else
-        std::cout << "No tasks scheduled.\n";
+        CO_WQ_LOG_INFO("No tasks scheduled.");
     return 0;
 }
 
 #else
 int main()
 {
-    std::cout << "co_uds disabled (requires Linux + USING_NET)\n";
+    CO_WQ_LOG_WARN("co_uds disabled (requires Linux + USING_NET)");
     return 0;
 }
 #endif

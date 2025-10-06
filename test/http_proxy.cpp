@@ -17,18 +17,13 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-#include <iomanip>
-#include <iostream>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -93,32 +88,33 @@ extern "C" void wq_debug_check_func_addr(std::uintptr_t addr)
         return; // resolved symbol looks valid, skip noise
 
     if (has_symbol) {
-        std::fprintf(stderr,
-                     "[proxy] wq_debug_check_func_addr suspicious func=%p (%s+0x%llx) frames=%u reason=%s\n",
-                     reinterpret_cast<void*>(addr),
-                     func_symbol->Name,
-                     static_cast<unsigned long long>(displacement),
-                     frames,
-                     reason ? reason : "?");
+        CO_WQ_LOG_WARN("[proxy] wq_debug_check_func_addr suspicious func=%p (%s+0x%llx) frames=%u reason=%s",
+                       reinterpret_cast<void*>(addr),
+                       func_symbol->Name,
+                       static_cast<unsigned long long>(displacement),
+                       frames,
+                       reason ? reason : "?");
     } else {
-        std::fprintf(stderr,
-                     "[proxy] wq_debug_check_func_addr suspicious func=%p frames=%u reason=%s\n",
-                     reinterpret_cast<void*>(addr),
-                     frames,
-                     reason ? reason : "?");
+        CO_WQ_LOG_WARN("[proxy] wq_debug_check_func_addr suspicious func=%p frames=%u reason=%s",
+                       reinterpret_cast<void*>(addr),
+                       frames,
+                       reason ? reason : "?");
     }
     for (USHORT i = 0; i < frames; ++i) {
-        auto* frame_addr = stack[i];
-        std::fprintf(stderr, "  [%u] %p", static_cast<unsigned>(i), frame_addr);
+        auto*                              frame_addr = stack[i];
         DWORD64                            frame_disp = 0;
         alignas(SYMBOL_INFO) unsigned char symbol_buffer[sizeof(SYMBOL_INFO) + max_name_len];
         auto*                              symbol_info = reinterpret_cast<PSYMBOL_INFO>(symbol_buffer);
         symbol_info->SizeOfStruct                      = sizeof(SYMBOL_INFO);
         symbol_info->MaxNameLen                        = max_name_len;
         if (SymFromAddr(process, reinterpret_cast<DWORD64>(frame_addr), &frame_disp, symbol_info)) {
-            std::fprintf(stderr, " (%s+0x%llx)\n", symbol_info->Name, static_cast<unsigned long long>(frame_disp));
+            CO_WQ_LOG_WARN("  [%u] %p (%s+0x%llx)",
+                           static_cast<unsigned>(i),
+                           frame_addr,
+                           symbol_info->Name,
+                           static_cast<unsigned long long>(frame_disp));
         } else {
-            std::fprintf(stderr, "\n");
+            CO_WQ_LOG_WARN("  [%u] %p", static_cast<unsigned>(i), frame_addr);
         }
     }
 }
@@ -133,7 +129,7 @@ LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
     auto* record = info ? info->ExceptionRecord : nullptr;
     DWORD code   = record ? record->ExceptionCode : 0;
     void* addr   = record ? record->ExceptionAddress : nullptr;
-    std::fprintf(stderr, "[proxy] unhandled exception code=0x%08lx addr=%p", static_cast<unsigned long>(code), addr);
+    CO_WQ_LOG_ERROR("[proxy] unhandled exception code=0x%08lx addr=%p", static_cast<unsigned long>(code), addr);
     auto ensure_dbghelp_initialized = [] {
         static std::once_flag initialized;
         std::call_once(initialized, [] {
@@ -141,7 +137,7 @@ LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
             SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS);
             if (!SymInitialize(process, nullptr, TRUE)) {
                 DWORD err = GetLastError();
-                std::fprintf(stderr, "\n[proxy] SymInitialize failed: %lu\n", static_cast<unsigned long>(err));
+                CO_WQ_LOG_ERROR("[proxy] SymInitialize failed: %lu", static_cast<unsigned long>(err));
             }
         });
     };
@@ -158,17 +154,16 @@ LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
         line_info.SizeOfStruct  = sizeof(line_info);
         DWORD line_displacement = 0;
         if (SymGetLineFromAddr64(process_handle, reinterpret_cast<DWORD64>(addr), &line_displacement, &line_info)) {
-            std::fprintf(stderr,
-                         " (%s+0x%llx) %s:%lu\n",
-                         symbol_info->Name,
-                         static_cast<unsigned long long>(displacement),
-                         line_info.FileName ? line_info.FileName : "<unknown>",
-                         static_cast<unsigned long>(line_info.LineNumber));
+            CO_WQ_LOG_ERROR("  location: %s+0x%llx %s:%lu",
+                            symbol_info->Name,
+                            static_cast<unsigned long long>(displacement),
+                            line_info.FileName ? line_info.FileName : "<unknown>",
+                            static_cast<unsigned long>(line_info.LineNumber));
         } else {
-            std::fprintf(stderr, " (%s+0x%llx)\n", symbol_info->Name, static_cast<unsigned long long>(displacement));
+            CO_WQ_LOG_ERROR("  location: %s+0x%llx", symbol_info->Name, static_cast<unsigned long long>(displacement));
         }
     } else {
-        std::fprintf(stderr, "\n");
+        CO_WQ_LOG_ERROR("  location: <unknown>");
     }
     if (info && info->ContextRecord) {
         ensure_dbghelp_initialized();
@@ -181,11 +176,11 @@ LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
         frame.AddrStack.Offset = context_copy.Rsp;
         frame.AddrStack.Mode   = AddrModeFlat;
 
-        HANDLE thread_handle  = GetCurrentThread();
-        HANDLE process_handle = GetCurrentProcess();
+        HANDLE thread_handle        = GetCurrentThread();
+        HANDLE process_handle_stack = GetCurrentProcess();
         for (USHORT i = 0;; ++i) {
             BOOL ok = StackWalk64(IMAGE_FILE_MACHINE_AMD64,
-                                  process_handle,
+                                  process_handle_stack,
                                   thread_handle,
                                   &frame,
                                   &context_copy,
@@ -198,32 +193,29 @@ LONG WINAPI proxy_exception_filter(EXCEPTION_POINTERS* info)
             DWORD64 frame_addr = frame.AddrPC.Offset;
             if (frame_addr == 0)
                 break;
-            std::fprintf(stderr, "  frame[%u] = %p", static_cast<unsigned>(i), reinterpret_cast<void*>(frame_addr));
-            DWORD64                            frame_disp   = 0;
-            constexpr DWORD                    max_name_len = 256;
+            CO_WQ_LOG_ERROR("  frame[%u] = %p", static_cast<unsigned>(i), reinterpret_cast<void*>(frame_addr));
+            DWORD64                            frame_disp = 0;
             alignas(SYMBOL_INFO) unsigned char frame_symbol_buffer[sizeof(SYMBOL_INFO) + max_name_len];
             auto*                              frame_symbol_info = reinterpret_cast<PSYMBOL_INFO>(frame_symbol_buffer);
             frame_symbol_info->SizeOfStruct                      = sizeof(SYMBOL_INFO);
             frame_symbol_info->MaxNameLen                        = max_name_len;
-            if (SymFromAddr(process_handle, frame_addr, &frame_disp, frame_symbol_info)) {
+            if (SymFromAddr(process_handle_stack, frame_addr, &frame_disp, frame_symbol_info)) {
                 IMAGEHLP_LINE64 line_info {};
                 line_info.SizeOfStruct = sizeof(line_info);
                 DWORD line_disp        = 0;
-                if (SymGetLineFromAddr64(process_handle, frame_addr, &line_disp, &line_info)) {
-                    std::fprintf(stderr,
-                                 " (%s+0x%llx) %s:%lu\n",
-                                 frame_symbol_info->Name,
-                                 static_cast<unsigned long long>(frame_disp),
-                                 line_info.FileName ? line_info.FileName : "<unknown>",
-                                 static_cast<unsigned long>(line_info.LineNumber));
+                if (SymGetLineFromAddr64(process_handle_stack, frame_addr, &line_disp, &line_info)) {
+                    CO_WQ_LOG_ERROR("    -> (%s+0x%llx) %s:%lu",
+                                    frame_symbol_info->Name,
+                                    static_cast<unsigned long long>(frame_disp),
+                                    line_info.FileName ? line_info.FileName : "<unknown>",
+                                    static_cast<unsigned long>(line_info.LineNumber));
                 } else {
-                    std::fprintf(stderr,
-                                 " (%s+0x%llx)\n",
-                                 frame_symbol_info->Name,
-                                 static_cast<unsigned long long>(frame_disp));
+                    CO_WQ_LOG_ERROR("    -> (%s+0x%llx)",
+                                    frame_symbol_info->Name,
+                                    static_cast<unsigned long long>(frame_disp));
                 }
             } else {
-                std::fprintf(stderr, "\n");
+                CO_WQ_LOG_ERROR("    -> <no symbol>");
             }
         }
     }
@@ -244,21 +236,10 @@ template <typename Str> void debug_log(Str&& message_input)
 
     std::string message(std::forward<Str>(message_input));
 
-    using clock = std::chrono::system_clock;
-    auto    now = clock::now();
-    auto    tt  = clock::to_time_t(now);
-    std::tm tm_buf {};
-#if defined(_WIN32)
-    localtime_s(&tm_buf, &tt);
-#else
-    localtime_r(&tt, &tm_buf);
-#endif
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
     std::ostringstream oss;
-    oss << std::put_time(&tm_buf, "%F %T") << '.' << std::setw(3) << std::setfill('0') << ms.count();
-    oss << " [" << std::this_thread::get_id() << "] " << message;
-    std::clog << oss.str() << std::endl;
+    oss << "[proxy] " << message;
+    auto formatted = oss.str();
+    CO_WQ_LOG_DEBUG("%s", formatted.c_str());
 }
 
 std::string format_peer_id(int fd)
@@ -372,24 +353,22 @@ void debug_check_string_integrity(const char* label, const std::string& value)
     }
 
     if (suspicious_ptr || suspicious_buf) {
-        std::fprintf(stderr,
-                     "[proxy] string integrity alert: %s data=%p size=%zu cap=%zu ptr_bad=%d buf_bad=%d\n",
-                     label,
-                     static_cast<const void*>(data),
-                     static_cast<size_t>(size),
-                     static_cast<size_t>(cap),
-                     suspicious_ptr ? 1 : 0,
-                     suspicious_buf ? 1 : 0);
+        CO_WQ_LOG_WARN("[proxy] string integrity alert: %s data=%p size=%zu cap=%zu ptr_bad=%d buf_bad=%d",
+                       label,
+                       static_cast<const void*>(data),
+                       static_cast<size_t>(size),
+                       static_cast<size_t>(cap),
+                       suspicious_ptr ? 1 : 0,
+                       suspicious_buf ? 1 : 0);
 #if defined(_WIN32)
         __debugbreak();
 #endif
     } else if (g_debug_logging.load(std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[proxy] string ok: %s data=%p size=%zu cap=%zu\n",
-                     label,
-                     static_cast<const void*>(data),
-                     static_cast<size_t>(size),
-                     static_cast<size_t>(cap));
+        CO_WQ_LOG_DEBUG("[proxy] string ok: %s data=%p size=%zu cap=%zu",
+                        label,
+                        static_cast<const void*>(data),
+                        static_cast<size_t>(size),
+                        static_cast<size_t>(cap));
     }
 }
 
@@ -503,27 +482,26 @@ std::optional<ConnectTarget> parse_connect_target(const std::string& target)
 #if defined(_WIN32)
 extern "C" void wq_debug_null_func(co_wq::worknode* node)
 {
-    std::fprintf(stderr, "[proxy] wq_debug_null_func fired: node=%p\n", static_cast<void*>(node));
+    CO_WQ_LOG_WARN("[proxy] wq_debug_null_func fired: node=%p", static_cast<void*>(node));
     if (node != nullptr) {
         auto* waiter            = reinterpret_cast<co_wq::net::io_waiter_base*>(node);
         bool  looks_like_waiter = waiter->debug_magic == co_wq::net::io_waiter_base::debug_magic_value;
         if (looks_like_waiter) {
-            std::fprintf(stderr,
-                         "  debug_name=%s h=%p callback_enqueued=%s route_post=%p route_ctx=%p\n",
-                         waiter->debug_name ? waiter->debug_name : "<null>",
-                         waiter->h ? waiter->h.address() : nullptr,
-                         waiter->callback_enqueued.load(std::memory_order_relaxed) ? "true" : "false",
-                         reinterpret_cast<void*>(waiter->route_post),
-                         waiter->route_ctx);
+            CO_WQ_LOG_WARN("  debug_name=%s h=%p callback_enqueued=%s route_post=%p route_ctx=%p",
+                           waiter->debug_name ? waiter->debug_name : "<null>",
+                           waiter->h ? waiter->h.address() : nullptr,
+                           waiter->callback_enqueued.load(std::memory_order_relaxed) ? "true" : "false",
+                           reinterpret_cast<void*>(waiter->route_post),
+                           waiter->route_ctx);
         } else {
-            std::fprintf(stderr, "  node is not recognized as io_waiter_base (debug_magic mismatch)\n");
+            CO_WQ_LOG_WARN("  node is not recognized as io_waiter_base (debug_magic mismatch)");
         }
     }
     void*           stack[32] {};
     constexpr DWORD capacity = static_cast<DWORD>(std::size(stack));
     USHORT          frames   = CaptureStackBackTrace(0, capacity, stack, nullptr);
     for (USHORT i = 0; i < frames; ++i) {
-        std::fprintf(stderr, "  stack[%u]=%p\n", static_cast<unsigned>(i), stack[i]);
+        CO_WQ_LOG_WARN("  stack[%u]=%p", static_cast<unsigned>(i), stack[i]);
     }
 }
 #endif
@@ -783,11 +761,13 @@ pipe_data(SrcSocket& src, DstSocket& dst, std::string label, const std::string& 
             }
             offset += static_cast<size_t>(sent);
         }
+#if 0
         {
             std::ostringstream oss;
             oss << peer_id << " " << label << " forwarded " << n << " bytes";
             debug_log(oss.str());
         }
+#endif
     }
 }
 
@@ -972,7 +952,7 @@ handle_proxy_connection(net::fd_workqueue<SpinLock>& fdwq, net::tcp_socket<SpinL
         oss << peer_id << " request parse error: " << error_reason;
         auto msg = oss.str();
         debug_log(msg);
-        std::cerr << "[proxy] parse error: " << error_reason << "\n";
+        CO_WQ_LOG_ERROR("[proxy] parse error: %s", error_reason.c_str());
         std::string response = build_http_response(400, "Bad Request", "Failed to parse request\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
@@ -1034,7 +1014,7 @@ proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_
         }
 #endif
         auto msg = oss.str();
-        std::cerr << msg << '\n';
+        CO_WQ_LOG_ERROR("%s", msg.c_str());
         debug_log(msg);
         listener.close();
         g_listener_fd.store(-1, std::memory_order_release);
@@ -1042,7 +1022,7 @@ proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_
     }
     g_listener_fd.store(listener.native_handle(), std::memory_order_release);
 
-    std::cout << "[proxy] listening on " << host << ':' << port << "\n";
+    CO_WQ_LOG_INFO("[proxy] listening on %s:%u", host.c_str(), static_cast<unsigned>(port));
     {
         std::ostringstream oss;
         oss << "proxy listening on " << host << ':' << port;
@@ -1053,7 +1033,7 @@ proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_
     while (!g_stop.load(std::memory_order_acquire)) {
         int fd = co_await listener.accept();
         if (fd == net::k_accept_fatal) {
-            std::cerr << "[proxy] accept fatal error, exiting\n";
+            CO_WQ_LOG_ERROR("[proxy] accept fatal error, exiting");
             break;
         }
         if (fd < 0)
@@ -1093,6 +1073,7 @@ int main(int argc, char* argv[])
             port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if (arg == "--verbose" || arg == "--debug-log") {
             g_debug_logging.store(true, std::memory_order_relaxed);
+            co_wq::log::set_level(spdlog::level::debug);
         }
     }
 
@@ -1100,7 +1081,7 @@ int main(int argc, char* argv[])
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     SetUnhandledExceptionFilter(proxy_exception_filter);
     HMODULE self_module = ::GetModuleHandleW(nullptr);
-    std::fprintf(stderr, "[proxy] module base=%p\n", static_cast<void*>(self_module));
+    CO_WQ_LOG_INFO("[proxy] module base=%p", static_cast<void*>(self_module));
 #else
     std::signal(SIGINT, sigint_handler);
 #endif

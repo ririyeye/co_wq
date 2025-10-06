@@ -20,13 +20,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
-#include <iostream>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <string_view>
-#include <vector>
 
 using namespace co_wq;
 using namespace co_wq::net;
@@ -58,8 +54,8 @@ UsbOptions parse_args(int argc, char* argv[])
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
         if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: co_usb [--no-list] [--vid HEX] [--pid HEX] [--interface NUM] [--detach] [--timeout "
-                         "MS] [--debug LEVEL]\n";
+            CO_WQ_LOG_INFO("Usage: co_usb [--no-list] [--vid HEX] [--pid HEX] [--interface NUM] [--detach] [--timeout "
+                           "MS] [--debug LEVEL]");
             std::exit(0);
         } else if (arg == "--no-list") {
             opts.enumerate = false;
@@ -76,7 +72,7 @@ UsbOptions parse_args(int argc, char* argv[])
         } else if (arg == "--debug" && i + 1 < argc) {
             opts.debug_level = std::stoi(argv[++i]);
         } else {
-            std::cerr << "Unknown argument: " << arg << "\n";
+            CO_WQ_LOG_ERROR("Unknown argument: %.*s", static_cast<int>(arg.size()), arg.data());
             std::exit(1);
         }
     }
@@ -89,11 +85,13 @@ void print_device_info(libusb_device* dev)
     if (libusb_get_device_descriptor(dev, &desc) != 0)
         return;
 
-    std::cout << "Bus " << std::setw(3) << std::setfill('0') << static_cast<int>(libusb_get_bus_number(dev))
-              << " Device " << std::setw(3) << static_cast<int>(libusb_get_device_address(dev)) << " ID " << std::hex
-              << std::setw(4) << std::setfill('0') << desc.idVendor << ':' << std::setw(4) << desc.idProduct << std::dec
-              << std::setfill(' ') << " class=" << static_cast<int>(desc.bDeviceClass)
-              << " max-packet=" << static_cast<int>(desc.bMaxPacketSize0) << '\n';
+    CO_WQ_LOG_INFO("Bus %03d Device %03d ID %04x:%04x class=%d max-packet=%d",
+                   static_cast<int>(libusb_get_bus_number(dev)),
+                   static_cast<int>(libusb_get_device_address(dev)),
+                   static_cast<unsigned int>(desc.idVendor),
+                   static_cast<unsigned int>(desc.idProduct),
+                   static_cast<int>(desc.bDeviceClass),
+                   static_cast<int>(desc.bMaxPacketSize0));
 }
 
 Task<void, Work_Promise<SpinLock, void>> usb_demo(workqueue<SpinLock>& exec, usb_context& ctx, const UsbOptions& opts)
@@ -105,9 +103,9 @@ Task<void, Work_Promise<SpinLock, void>> usb_demo(workqueue<SpinLock>& exec, usb
         libusb_device** list  = nullptr;
         ssize_t         count = libusb_get_device_list(ctx.native_handle(), &list);
         if (count < 0) {
-            std::cerr << "[usb] libusb_get_device_list failed: " << libusb_error_name(static_cast<int>(count)) << '\n';
+            CO_WQ_LOG_ERROR("[usb] libusb_get_device_list failed: %s", libusb_error_name(static_cast<int>(count)));
         } else {
-            std::cout << "[usb] detected " << count << " devices" << '\n';
+            CO_WQ_LOG_INFO("[usb] detected %lld devices", static_cast<long long>(count));
             for (ssize_t i = 0; i < count; ++i)
                 print_device_info(list[i]);
         }
@@ -119,15 +117,15 @@ Task<void, Work_Promise<SpinLock, void>> usb_demo(workqueue<SpinLock>& exec, usb
         co_return;
     }
 
-    std::cout << std::hex << std::showbase;
-    std::cout << "[usb] opening device " << static_cast<int>(*opts.vid) << ':' << static_cast<int>(*opts.pid) << '\n';
-    std::cout << std::dec << std::noshowbase;
+    CO_WQ_LOG_INFO("[usb] opening device 0x%04x:0x%04x",
+                   static_cast<unsigned int>(*opts.vid),
+                   static_cast<unsigned int>(*opts.pid));
 
     std::optional<usb_device<SpinLock>> device_holder;
     try {
         device_holder.emplace(usb_device<SpinLock>::open(exec, ctx, *opts.vid, *opts.pid));
     } catch (const std::exception& ex) {
-        std::cerr << "[usb] failed to open VID:PID device: " << ex.what() << '\n';
+        CO_WQ_LOG_ERROR("[usb] failed to open VID:PID device: %s", ex.what());
         co_return;
     }
 
@@ -141,20 +139,20 @@ Task<void, Work_Promise<SpinLock, void>> usb_demo(workqueue<SpinLock>& exec, usb
                 if (device.kernel_driver_active(if_num)) {
                     int rc = device.detach_kernel_driver(if_num);
                     if (rc != 0)
-                        std::cerr << "[usb] detach_kernel_driver failed: " << libusb_error_name(rc) << '\n';
+                        CO_WQ_LOG_ERROR("[usb] detach_kernel_driver failed: %s", libusb_error_name(rc));
                     else
-                        std::cout << "[usb] detached kernel driver from interface " << if_num << '\n';
+                        CO_WQ_LOG_INFO("[usb] detached kernel driver from interface %d", if_num);
                 }
             } catch (const usb_error& ex) {
-                std::cerr << "[usb] " << ex.what() << '\n';
+                CO_WQ_LOG_ERROR("[usb] %s", ex.what());
             }
         }
         int rc = device.claim_interface(if_num);
         if (rc != 0) {
-            std::cerr << "[usb] claim_interface failed: " << libusb_error_name(rc) << '\n';
+            CO_WQ_LOG_ERROR("[usb] claim_interface failed: %s", libusb_error_name(rc));
         } else {
             interface_claimed = true;
-            std::cout << "[usb] claimed interface " << if_num << '\n';
+            CO_WQ_LOG_INFO("[usb] claimed interface %d", if_num);
         }
     }
 
@@ -171,18 +169,18 @@ Task<void, Work_Promise<SpinLock, void>> usb_demo(workqueue<SpinLock>& exec, usb
                                               static_cast<uint16_t>(descriptor.size()),
                                               opts.timeout_ms);
     if (rc < 0) {
-        std::cerr << "[usb] control_transfer failed: " << libusb_error_name(rc) << '\n';
+        CO_WQ_LOG_ERROR("[usb] control_transfer failed: %s", libusb_error_name(rc));
     } else {
-        std::cout << "[usb] device descriptor length=" << rc << '\n';
+        CO_WQ_LOG_INFO("[usb] device descriptor length=%d", rc);
     }
 
     if (interface_claimed) {
         int if_num = *opts.interface_number;
         int rel    = device.release_interface(if_num);
         if (rel != 0)
-            std::cerr << "[usb] release_interface failed: " << libusb_error_name(rel) << '\n';
+            CO_WQ_LOG_ERROR("[usb] release_interface failed: %s", libusb_error_name(rel));
         else
-            std::cout << "[usb] released interface " << if_num << '\n';
+            CO_WQ_LOG_INFO("[usb] released interface %d", if_num);
     }
 
     co_return;

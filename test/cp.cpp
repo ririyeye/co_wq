@@ -4,7 +4,6 @@
 #include "syswork.hpp"
 #include <atomic>
 #include <cstring>
-#include <iostream>
 #include <sys/stat.h>
 #include <vector>
 
@@ -38,7 +37,7 @@ file_copy_task(net::fd_workqueue<SpinLock>& fdwq, const char* src, const char* d
         while (off < (size_t)n) {
             ssize_t wn = co_await df.write(buf.data() + off, (size_t)n - off);
             if (wn <= 0) {
-                std::cerr << "write error\n";
+                CO_WQ_LOG_ERROR("write error");
                 co_return total;
             }
             off += (size_t)wn;
@@ -52,11 +51,11 @@ file_copy_task(net::fd_workqueue<SpinLock>& fdwq, const char* src, const char* d
 int main(int argc, char** argv)
 {
 #ifndef USING_NET
-    std::cout << "USING_NET not enabled (define it to build this test)\n";
+    CO_WQ_LOG_WARN("USING_NET not enabled (define it to build this test)");
     return 0;
 #else
     if (argc < 3) {
-        std::cout << "usage: co_cp <src> <dst>\n";
+        CO_WQ_LOG_INFO("usage: co_cp <src> <dst>");
         return 0;
     }
     auto&                       wq = get_sys_workqueue(0);
@@ -73,7 +72,7 @@ int main(int argc, char** argv)
     post_to(tk, wq);
     sys_wait_until(finished);
     size_t copied = coro.promise().result();
-    std::cout << "copied bytes: " << copied << "\n";
+    CO_WQ_LOG_INFO("copied bytes: %zu", copied);
     return 0;
 #endif
 }

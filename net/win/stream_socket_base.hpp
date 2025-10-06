@@ -12,7 +12,6 @@
 #include "io_waiter.hpp"
 #include "workqueue.hpp"
 #include <cstdint>
-#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -55,8 +54,7 @@ public:
         serial_queue_init(_recv_q);
         void* new_state = _cbq.context();
         void* old_state = o._cbq.context();
-        std::fprintf(
-            stderr,
+        CO_WQ_CBQ_TRACE(
             "[socket_core] move_ctor this=%p from=%p sock=%llu cbq=%p state_new=%p state_old=%p reactor=%p exec=%p\n",
             static_cast<void*>(this),
             static_cast<void*>(&o),
@@ -82,15 +80,14 @@ public:
             std::construct_at(&_cbq, _exec);
             serial_queue_init(_send_q);
             serial_queue_init(_recv_q);
-            std::fprintf(stderr,
-                         "[socket_core] move_assign this=%p from=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
-                         static_cast<void*>(this),
-                         static_cast<void*>(&o),
-                         static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                         static_cast<void*>(&_cbq),
-                         _cbq.context(),
-                         static_cast<void*>(_reactor),
-                         static_cast<void*>(&_exec));
+            CO_WQ_CBQ_TRACE("[socket_core] move_assign this=%p from=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
+                            static_cast<void*>(this),
+                            static_cast<void*>(&o),
+                            static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                            static_cast<void*>(&_cbq),
+                            _cbq.context(),
+                            static_cast<void*>(_reactor),
+                            static_cast<void*>(&_exec));
         }
         return *this;
     }
@@ -136,8 +133,7 @@ protected:
     socket_core(workqueue<lock>& exec, Reactor<lock>& reactor, int family, int type, int protocol = 0)
         : _exec(exec), _reactor(&reactor), _cbq(exec)
     {
-        std::fprintf(
-            stderr,
+        CO_WQ_CBQ_TRACE(
             "[socket_core] ctor this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p family=%d type=%d protocol=%d\n",
             static_cast<void*>(this),
             static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
@@ -161,14 +157,13 @@ protected:
     {
         if (_sock == INVALID_SOCKET)
             throw std::runtime_error("invalid socket handle");
-        std::fprintf(stderr,
-                     "[socket_core] adopt_ctor this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
-                     static_cast<void*>(this),
-                     static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                     static_cast<void*>(&_cbq),
-                     _cbq.context(),
-                     static_cast<void*>(_reactor),
-                     static_cast<void*>(&_exec));
+        CO_WQ_CBQ_TRACE("[socket_core] adopt_ctor this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
+                        static_cast<void*>(this),
+                        static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                        static_cast<void*>(&_cbq),
+                        _cbq.context(),
+                        static_cast<void*>(_reactor),
+                        static_cast<void*>(&_exec));
         init_socket();
     }
 
@@ -181,31 +176,28 @@ protected:
     void close_socket()
     {
         if (_sock != INVALID_SOCKET) {
-            std::fprintf(stderr,
-                         "[socket_core] close_socket this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
-                         static_cast<void*>(this),
-                         static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                         static_cast<void*>(&_cbq),
-                         _cbq.context(),
-                         static_cast<void*>(_reactor),
-                         static_cast<void*>(&_exec));
+            CO_WQ_CBQ_TRACE("[socket_core] close_socket this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
+                            static_cast<void*>(this),
+                            static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                            static_cast<void*>(&_cbq),
+                            _cbq.context(),
+                            static_cast<void*>(_reactor),
+                            static_cast<void*>(&_exec));
             _closed            = true;
             HANDLE sock_handle = reinterpret_cast<HANDLE>(_sock);
             if (sock_handle) {
                 BOOL  cancel_ok  = ::CancelIoEx(sock_handle, nullptr);
                 DWORD cancel_err = cancel_ok ? ERROR_SUCCESS : ::GetLastError();
                 if (!cancel_ok && cancel_err != ERROR_NOT_FOUND && cancel_err != ERROR_INVALID_HANDLE) {
-                    std::fprintf(stderr,
-                                 "[socket_core] close_socket CancelIoEx failed this=%p sock=%llu err=%lu\n",
-                                 static_cast<void*>(this),
-                                 static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                                 static_cast<unsigned long>(cancel_err));
+                    CO_WQ_CBQ_WARN("[socket_core] close_socket CancelIoEx failed this=%p sock=%llu err=%lu\n",
+                                   static_cast<void*>(this),
+                                   static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                                   static_cast<unsigned long>(cancel_err));
                 } else {
-                    std::fprintf(stderr,
-                                 "[socket_core] close_socket CancelIoEx status this=%p sock=%llu err=%lu\n",
-                                 static_cast<void*>(this),
-                                 static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                                 static_cast<unsigned long>(cancel_err));
+                    CO_WQ_CBQ_TRACE("[socket_core] close_socket CancelIoEx status this=%p sock=%llu err=%lu\n",
+                                    static_cast<void*>(this),
+                                    static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                                    static_cast<unsigned long>(cancel_err));
                 }
             }
             if (_reactor) {
@@ -218,12 +210,11 @@ protected:
             serial_collect_waiters(_io_serial_lock, { &_send_q, &_recv_q }, pending);
             serial_post_pending(_exec, pending);
             _sock = INVALID_SOCKET;
-            std::fprintf(stderr,
-                         "[socket_core] close_socket done this=%p cbq=%p state=%p pending_empty=%d\n",
-                         static_cast<void*>(this),
-                         static_cast<void*>(&_cbq),
-                         _cbq.context(),
-                         list_empty(&pending) ? 1 : 0);
+            CO_WQ_CBQ_TRACE("[socket_core] close_socket done this=%p cbq=%p state=%p pending_empty=%d\n",
+                            static_cast<void*>(this),
+                            static_cast<void*>(&_cbq),
+                            _cbq.context(),
+                            list_empty(&pending) ? 1 : 0);
         }
     }
 
@@ -234,13 +225,12 @@ private:
         _sock = ::socket(family, type, protocol);
         if (_sock == INVALID_SOCKET)
             throw std::runtime_error("socket failed");
-        std::fprintf(stderr,
-                     "[socket_core] create_socket this=%p sock=%llu family=%d type=%d protocol=%d\n",
-                     static_cast<void*>(this),
-                     static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                     family,
-                     type,
-                     protocol);
+        CO_WQ_CBQ_TRACE("[socket_core] create_socket this=%p sock=%llu family=%d type=%d protocol=%d\n",
+                        static_cast<void*>(this),
+                        static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                        family,
+                        type,
+                        protocol);
         init_socket();
     }
 
@@ -253,14 +243,13 @@ private:
         serial_queue_init(_send_q);
         serial_queue_init(_recv_q);
         _closed = false;
-        std::fprintf(stderr,
-                     "[socket_core] init_socket this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
-                     static_cast<void*>(this),
-                     static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
-                     static_cast<void*>(&_cbq),
-                     _cbq.context(),
-                     static_cast<void*>(_reactor),
-                     static_cast<void*>(&_exec));
+        CO_WQ_CBQ_TRACE("[socket_core] init_socket this=%p sock=%llu cbq=%p state=%p reactor=%p exec=%p\n",
+                        static_cast<void*>(this),
+                        static_cast<unsigned long long>(static_cast<std::uintptr_t>(_sock)),
+                        static_cast<void*>(&_cbq),
+                        _cbq.context(),
+                        static_cast<void*>(_reactor),
+                        static_cast<void*>(&_exec));
     }
 
     /** @brief 调用 `ioctlsocket` 将 SOCKET 切换为非阻塞模式。 */

@@ -5,26 +5,162 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <memory>
+#include <string>
+#include <utility>
+
+#ifndef CO_WQ_ENABLE_LOGGING
+#define CO_WQ_ENABLE_LOGGING 1
+#endif
 
 #ifndef CO_WQ_ENABLE_CALLBACK_WQ_TRACE
-#define CO_WQ_ENABLE_CALLBACK_WQ_TRACE 0
+#define CO_WQ_ENABLE_CALLBACK_WQ_TRACE 1
 #endif
 
 #ifndef CO_WQ_ENABLE_CALLBACK_WQ_WARN
 #define CO_WQ_ENABLE_CALLBACK_WQ_WARN 1
 #endif
 
+#if CO_WQ_ENABLE_LOGGING
+#include <fmt/printf.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+
+#ifndef CO_WQ_LOGGER_NAME
+#define CO_WQ_LOGGER_NAME "co_wq"
+#endif
+
+namespace co_wq::log {
+inline std::shared_ptr<spdlog::logger>& logger_storage()
+{
+    static std::shared_ptr<spdlog::logger> storage;
+    return storage;
+}
+
+inline void trim_trailing_newlines(std::string& message)
+{
+    while (!message.empty() && (message.back() == '\n' || message.back() == '\r')) {
+        message.pop_back();
+    }
+}
+
+inline spdlog::logger* ensure_logger()
+{
+    auto& storage = logger_storage();
+    if (!storage) {
+        if (auto default_logger = spdlog::default_logger()) {
+            storage = default_logger;
+        } else if (auto named = spdlog::get(CO_WQ_LOGGER_NAME)) {
+            storage = named;
+            spdlog::set_default_logger(storage);
+        } else {
+            auto created = spdlog::stdout_color_mt(CO_WQ_LOGGER_NAME);
+            created->set_level(spdlog::level::info);
+            created->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
+            spdlog::set_default_logger(created);
+            storage = std::move(created);
+        }
+    }
+    return storage.get();
+}
+
+inline std::shared_ptr<spdlog::logger> get_logger()
+{
+    ensure_logger();
+    return logger_storage();
+}
+
+inline void set_logger(std::shared_ptr<spdlog::logger> logger)
+{
+    logger_storage() = std::move(logger);
+    if (logger_storage()) {
+        spdlog::set_default_logger(logger_storage());
+    } else {
+        spdlog::set_default_logger(nullptr);
+    }
+}
+
+inline void set_level(spdlog::level::level_enum level)
+{
+    if (auto* logger = ensure_logger()) {
+        logger->set_level(level);
+    }
+}
+
+template <typename... Args> inline void log_message(spdlog::level::level_enum level, const char* fmt, Args&&... args)
+{
+    if (auto* logger = ensure_logger()) {
+        if (!logger->should_log(level))
+            return;
+        auto message = fmt::sprintf(fmt, std::forward<Args>(args)...);
+        trim_trailing_newlines(message);
+        logger->log(level, message);
+    } else {
+        (void)fmt;
+        if constexpr (sizeof...(Args) > 0) {
+            ((void)args, ...);
+        }
+    }
+}
+
+template <typename... Args> inline void log_trace(const char* fmt, Args&&... args)
+{
+    log_message(spdlog::level::trace, fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void log_debug(const char* fmt, Args&&... args)
+{
+    log_message(spdlog::level::debug, fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void log_info(const char* fmt, Args&&... args)
+{
+    log_message(spdlog::level::info, fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void log_warn(const char* fmt, Args&&... args)
+{
+    log_message(spdlog::level::warn, fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void log_error(const char* fmt, Args&&... args)
+{
+    log_message(spdlog::level::err, fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args> inline void log_critical(const char* fmt, Args&&... args)
+{
+    log_message(spdlog::level::critical, fmt, std::forward<Args>(args)...);
+}
+} // namespace co_wq::log
+
+#define CO_WQ_LOG_TRACE(...)    ::co_wq::log::log_trace(__VA_ARGS__)
+#define CO_WQ_LOG_DEBUG(...)    ::co_wq::log::log_debug(__VA_ARGS__)
+#define CO_WQ_LOG_INFO(...)     ::co_wq::log::log_info(__VA_ARGS__)
+#define CO_WQ_LOG_WARN(...)     ::co_wq::log::log_warn(__VA_ARGS__)
+#define CO_WQ_LOG_ERROR(...)    ::co_wq::log::log_error(__VA_ARGS__)
+#define CO_WQ_LOG_CRITICAL(...) ::co_wq::log::log_critical(__VA_ARGS__)
+
+#if CO_WQ_ENABLE_CALLBACK_WQ_WARN
+#define CO_WQ_CBQ_WARN(...) ::co_wq::log::log_warn(__VA_ARGS__)
+#else
+#define CO_WQ_CBQ_WARN(...) ((void)0)
+#endif
+
 #if CO_WQ_ENABLE_CALLBACK_WQ_TRACE
-#define CO_WQ_CBQ_TRACE(...) std::fprintf(stderr, __VA_ARGS__)
+#define CO_WQ_CBQ_TRACE(...) ::co_wq::log::log_trace(__VA_ARGS__)
 #else
 #define CO_WQ_CBQ_TRACE(...) ((void)0)
 #endif
-
-#if CO_WQ_ENABLE_CALLBACK_WQ_WARN
-#define CO_WQ_CBQ_WARN(...) std::fprintf(stderr, __VA_ARGS__)
 #else
-#define CO_WQ_CBQ_WARN(...) ((void)0)
+#define CO_WQ_LOG_TRACE(...)    ((void)0)
+#define CO_WQ_LOG_DEBUG(...)    ((void)0)
+#define CO_WQ_LOG_INFO(...)     ((void)0)
+#define CO_WQ_LOG_WARN(...)     ((void)0)
+#define CO_WQ_LOG_ERROR(...)    ((void)0)
+#define CO_WQ_LOG_CRITICAL(...) ((void)0)
+#define CO_WQ_CBQ_WARN(...)     ((void)0)
+#define CO_WQ_CBQ_TRACE(...)    ((void)0)
 #endif
 
 // 可选的调试 Hook（弱符号，C 链接）：应用可在自身代码中定义以捕获队列中函数指针地址

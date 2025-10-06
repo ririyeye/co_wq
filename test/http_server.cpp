@@ -15,7 +15,6 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -215,7 +214,7 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
     if constexpr (requires(Socket& s) { s.handshake(); }) {
         int hs = co_await sock.handshake();
         if (hs != 0) {
-            std::cerr << "[http] tls handshake failed, code=" << hs << "\n";
+            CO_WQ_LOG_ERROR("[http] tls handshake failed, code=%d", hs);
             sock.close();
             co_return;
         }
@@ -269,7 +268,7 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
     if (parse_error) {
         response_body = "Bad Request\n";
         response      = build_http_response(400, "Bad Request", response_body);
-        std::cerr << "[http] parse error: " << error_reason << "\n";
+        CO_WQ_LOG_ERROR("[http] parse error: %s", error_reason.c_str());
     } else {
         if (ctx.method == "GET" && (ctx.url == "/" || ctx.url == "/index" || ctx.url == "/index.html")) {
             response_body = "Hello from co_wq HTTP server!\n";
@@ -332,12 +331,12 @@ Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>
     listener.bind_listen(host, port, 128);
     g_listener_fd.store(listener.native_handle(), std::memory_order_release);
 
-    std::cout << "[http] listening on " << host << ':' << port << "\n";
+    CO_WQ_LOG_INFO("[http] listening on %s:%u", host.c_str(), static_cast<unsigned>(port));
 
     while (!g_stop.load(std::memory_order_acquire)) {
         int fd = co_await listener.accept();
         if (fd == net::k_accept_fatal) {
-            std::cerr << "[http] accept fatal error, shutting down\n";
+            CO_WQ_LOG_ERROR("[http] accept fatal error, shutting down");
             break;
         }
         if (fd < 0)
@@ -349,7 +348,7 @@ Task<void, Work_Promise<SpinLock, void>> http_server(net::fd_workqueue<SpinLock>
                 auto task     = handle_http_connection(std::move(tls_sock));
                 post_to(task, fdwq.base());
             } catch (const std::exception& ex) {
-                std::cerr << "[http] tls socket setup failed: " << ex.what() << "\n";
+                CO_WQ_LOG_ERROR("[http] tls socket setup failed: %s", ex.what());
             }
         } else
 #endif
@@ -404,15 +403,15 @@ int main(int argc, char* argv[])
     std::optional<net::tls_context> tls_ctx;
     if (use_tls) {
         if (cert_path.empty() || key_path.empty()) {
-            std::cerr << "[http] missing --cert/--key when TLS enabled\n";
+            CO_WQ_LOG_ERROR("[http] missing --cert/--key when TLS enabled");
             return 1;
         }
         try {
             tls_ctx.emplace(net::tls_context::make_server_with_pem(cert_path, key_path));
             tls_ctx_ptr = &(*tls_ctx);
-            std::cout << "[http] TLS enabled, cert=" << cert_path << "\n";
+            CO_WQ_LOG_INFO("[http] TLS enabled, cert=%s", cert_path.c_str());
         } catch (const std::exception& ex) {
-            std::cerr << "[http] failed to setup TLS: " << ex.what() << "\n";
+            CO_WQ_LOG_ERROR("[http] failed to setup TLS: %s", ex.what());
             return 1;
         }
     }

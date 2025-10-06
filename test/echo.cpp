@@ -1,7 +1,6 @@
 
 // echo.cpp
 #include "syswork.hpp"
-#include <iostream>
 
 #if defined(USING_NET)
 #include "fd_base.hpp"
@@ -100,8 +99,11 @@ echo_server(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port, 
     uint64_t bytes = g_bytes_echoed.load(std::memory_order_relaxed);
     uint64_t conns = g_conn_count.load(std::memory_order_relaxed);
     double   mbps  = sec > 0 ? (bytes / (1024.0 * 1024.0)) / sec : 0.0;
-    std::cout << "[server] connections=" << conns << " bytes=" << bytes << " elapsed(s)=" << sec
-              << " throughput(MiB/s)=" << mbps << "\n";
+    CO_WQ_LOG_INFO("[server] connections=%llu bytes=%llu elapsed(s)=%.3f throughput(MiB/s)=%.3f",
+                   static_cast<unsigned long long>(conns),
+                   static_cast<unsigned long long>(bytes),
+                   sec,
+                   mbps);
     co_return;
 }
 
@@ -111,21 +113,21 @@ echo_client(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port)
     auto sock = fdwq.make_tcp_socket();
     int  rc   = co_await sock.connect(host, port);
     if (rc != 0) {
-        std::cout << "connect failed\n";
+        CO_WQ_LOG_ERROR("connect failed");
         co_return;
     }
     char buf[256];
     while (true) {
         ssize_t n = co_await sock.recv(buf, sizeof(buf));
         if (n <= 0) {
-            std::cout << "recv end: " << n << "\n";
+            CO_WQ_LOG_INFO("recv end: %lld", static_cast<long long>(n));
             break;
         }
-        std::cout << "recv: " << std::string_view(buf, (size_t)n) << "\n";
+        CO_WQ_LOG_INFO("recv: %.*s", static_cast<int>(n), buf);
         ssize_t sent = co_await sock.send(buf, (size_t)n);
-        std::cout << "sent: " << sent << " bytes\n";
+        CO_WQ_LOG_INFO("sent: %lld bytes", static_cast<long long>(sent));
         if (sent <= 0) {
-            std::cout << "send error: " << sent << "\n";
+            CO_WQ_LOG_ERROR("send error: %lld", static_cast<long long>(sent));
             break;
         }
     }
@@ -145,9 +147,9 @@ struct EchoOptions {
 
 static void print_usage(const char* prog)
 {
-    std::cout << "Usage: " << prog
-              << " [--server|--client|--both] [--host HOST] [--port TCP_PORT] [--udp-server] [--udp-client] "
-                 "[--udp-port UDP_PORT] [--max-conn N]\n";
+    CO_WQ_LOG_INFO("Usage: %s [--server|--client|--both] [--host HOST] [--port TCP_PORT] [--udp-server] [--udp-client] "
+                   "[--udp-port UDP_PORT] [--max-conn N]",
+                   prog);
 }
 
 static EchoOptions parse_args(int argc, char* argv[])
@@ -215,10 +217,12 @@ int main(int argc, char* argv[])
             addr.sin_addr.s_addr = inet_addr(options.host.c_str());
             addr.sin_port        = htons(options.udp_port);
             if (::bind(usock.native_handle(), (sockaddr*)&addr, sizeof(addr)) != 0) {
-                std::cout << "UDP bind failed\n";
+                CO_WQ_LOG_ERROR("UDP bind failed");
                 co_return;
             }
-            std::cout << "[udp server] listening on " << options.host << ":" << options.udp_port << "\n";
+            CO_WQ_LOG_INFO("[udp server] listening on %s:%u",
+                           options.host.c_str(),
+                           static_cast<unsigned>(options.udp_port));
             char        buf[1500];
             sockaddr_in peer;
             socklen_t   plen = sizeof(peer);
@@ -236,7 +240,7 @@ int main(int argc, char* argv[])
             auto usock = fdwq.make_udp_socket();
             // 可选 connect (方便后面直接 recv)
             if (co_await usock.connect(options.host, options.udp_port) != 0) {
-                std::cout << "UDP connect failed (non-fatal, fallback to send_to)\n";
+                CO_WQ_LOG_WARN("UDP connect failed (non-fatal, fallback to send_to)");
             }
             sockaddr_in peer {};
             peer.sin_family      = AF_INET;
@@ -250,7 +254,7 @@ int main(int argc, char* argv[])
                 socklen_t   flen = sizeof(from);
                 ssize_t     rn   = co_await usock.recv_from(rbuf, sizeof(rbuf), &from, &flen);
                 if (rn > 0)
-                    std::cout << "[udp client] recv: " << std::string_view(rbuf, (size_t)rn) << "\n";
+                    CO_WQ_LOG_INFO("[udp client] recv: %.*s", static_cast<int>(rn), rbuf);
             }
             co_return;
         }();
@@ -291,7 +295,7 @@ int main(int argc, char* argv[])
 #else // USING_NET
 int main()
 {
-    std::cout << "co_echo disabled (requires Linux + USING_NET)\n";
+    CO_WQ_LOG_WARN("co_echo disabled (requires Linux + USING_NET)");
     return 0;
 }
 #endif

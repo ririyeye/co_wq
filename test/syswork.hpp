@@ -1,5 +1,6 @@
 #include "lock.hpp"
 #include "timer.hpp"
+#include "workqueue.hpp"
 #include <atomic>
 
 // 获取系统全局工作队列；threads 参数:
