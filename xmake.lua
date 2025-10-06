@@ -42,6 +42,12 @@ option("ENABLE_LOGGING")
     set_description("Enable spdlog/fmt logging for co_wq")
 option_end()
 
+option("MSVC_ITERATOR_DEBUG")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable MSVC iterator debug checks and disable vectorized algorithms")
+option_end()
+
 if get_config("USING_NET") then
     if get_config("USE_BUNDLED_LLHTTP") then
         add_requires("llhttp")
@@ -93,8 +99,10 @@ target("co_wq")
         if is_plat("windows") then
             add_links("Ws2_32")
             add_includedirs("net/win", {public = true})
-            -- add_defines("_ITERATOR_DEBUG_LEVEL=2")
-            add_defines("_DISABLE_VECTOR_ALGORITHMS")
+            if has_config("MSVC_ITERATOR_DEBUG") then
+                add_defines("_ITERATOR_DEBUG_LEVEL=2")
+                add_defines("_DISABLE_VECTOR_ALGORITHMS")
+            end
         else
             add_includedirs("net/linux", {public = true})
         end

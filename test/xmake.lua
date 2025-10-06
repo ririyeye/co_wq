@@ -24,10 +24,6 @@ target("co_http_proxy")
 
     add_files("http_proxy.cpp")
     add_files("syswork.cpp")
-    if is_plat("windows") then
-        -- add_defines("_ITERATOR_DEBUG_LEVEL=2")
-        add_defines("_DISABLE_VECTOR_ALGORITHMS")
-    end
 
 target_end()
 

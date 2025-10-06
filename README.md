@@ -62,6 +62,8 @@ PS> .\script\xmsvc.bat --core
 
 同样可通过 `--help` 查看模式说明。
 
+> 🔍 若需排查 MSVC STL 迭代器越界，可在配置阶段附加 `--MSVC_ITERATOR_DEBUG=y`，xmake 将定义 `_ITERATOR_DEBUG_LEVEL=2` 并关闭向量化算法以获得详细断言。默认关闭以保持发行性能。
+
 ### Windows（Wine + MSVC 工具链）
 参考 `script/xmk-wine-msvc.sh`：
 ```bash
@@ -106,6 +108,7 @@ PS> .\script\clean.bat
 | `USE_BUNDLED_LLHTTP` | `true` | 使用内置 `llhttp` 包处理 HTTP/WebSocket 升级（仅在 `USING_NET=y` 时生效） |
 | `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
 | `USING_EXAMPLE` | `false` | 构建 `test/` 目录下示例程序（需要配合 `USING_NET=y`） |
+| `MSVC_ITERATOR_DEBUG` | `false` | Windows/MSVC 专用，启用 `_ITERATOR_DEBUG_LEVEL=2` 并关闭向量化算法，便于定位 STL 迭代器越界 |
 
 最小化构建示例：
 
