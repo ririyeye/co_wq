@@ -56,25 +56,27 @@ public:
     using base::tx_shutdown;
 
     /**
-    bool dual_stack() const noexcept { return _dual_stack; }
+     * @brief 当前 socket 是否允许 IPv4/IPv6 双栈。
+     */
+    [[nodiscard]] bool dual_stack() const noexcept { return _dual_stack; }
 
-     * @brief IPv4 目标描述体，用于 connect awaiter。
+    /**
      * @brief 通用目标描述体，根据地址族/双栈配置解析目标。
-    struct ipv4_endpoint {
+     */
     struct dns_endpoint {
         const tcp_socket& sock;
         std::string       host;
         uint16_t          port;
         bool              allow_dual { false };
 
-        static std::string strip_brackets(const std::string& input)
+        [[nodiscard]] static std::string strip_brackets(const std::string& input)
         {
             if (input.size() >= 2 && input.front() == '[' && input.back() == ']')
                 return input.substr(1, input.size() - 2);
             return input;
         }
 
-        bool build(sockaddr_storage& storage, socklen_t& len) const
+        [[nodiscard]] bool build(sockaddr_storage& storage, socklen_t& len) const
         {
             std::string node = strip_brackets(host);
             if (node.empty())
@@ -108,8 +110,8 @@ public:
                     auto* v4 = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
                     auto* v6 = reinterpret_cast<sockaddr_in6*>(&storage);
                     std::memset(v6, 0, sizeof(sockaddr_in6));
-                    v6->sin6_family = AF_INET6;
-                    v6->sin6_port   = v4->sin_port;
+                    v6->sin6_family           = AF_INET6;
+                    v6->sin6_port             = v4->sin_port;
                     v6->sin6_addr.s6_addr[10] = 0xFF;
                     v6->sin6_addr.s6_addr[11] = 0xFF;
                     std::memcpy(&v6->sin6_addr.s6_addr[12], &v4->sin_addr, sizeof(v4->sin_addr));
