@@ -187,23 +187,33 @@ struct HttpProxyContext {
     }
 };
 
-std::string format_peer_id(int fd)
+std::string format_peer_id(uint64_t session_id)
 {
     std::ostringstream oss;
-    oss << "[client fd=" << fd << ']';
+    oss << '[' << session_id << ']';
     return oss.str();
 }
 
+struct PipeOutcome {
+    std::string label;
+    std::string status { "pending" };
+    bool        had_error { false };
+};
+
 template <typename SrcSocket, typename DstSocket>
 Task<void, Work_Promise<SpinLock, void>>
-pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string flow_desc)
+pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string flow_desc, PipeOutcome& outcome)
 {
     const char*            flow = flow_desc.empty() ? "stream" : flow_desc.c_str();
     std::array<char, 8192> buffer {};
+    outcome.label     = flow_desc;
+    outcome.status    = "pending";
+    outcome.had_error = false;
     while (true) {
         ssize_t n = co_await src.recv(buffer.data(), buffer.size());
         if (n == 0) {
             CO_WQ_LOG_DEBUG("[proxy] %s closed (EOF)", flow);
+            outcome.status = "eof";
             if (propagate_shutdown) {
                 if constexpr (requires(DstSocket& s) {
                                   s.tx_shutdown();
@@ -217,6 +227,8 @@ pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string f
         }
         if (n < 0) {
             CO_WQ_LOG_WARN("[proxy] %s recv error rc=%lld", flow, static_cast<long long>(n));
+            outcome.status    = std::string("recv_error rc=") + std::to_string(static_cast<long long>(n));
+            outcome.had_error = true;
             break;
         }
 
@@ -225,13 +237,19 @@ pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string f
             ssize_t sent = co_await dst.send(buffer.data() + offset, static_cast<size_t>(n) - offset);
             if (sent <= 0) {
                 CO_WQ_LOG_WARN("[proxy] %s send error rc=%lld", flow, static_cast<long long>(sent));
-                co_return;
+                outcome.status    = std::string("send_error rc=") + std::to_string(static_cast<long long>(sent));
+                outcome.had_error = true;
+                break;
             }
             offset += static_cast<size_t>(sent);
         }
+        if (outcome.had_error)
+            break;
     }
 
     CO_WQ_LOG_DEBUG("[proxy] %s forwarding finished", flow);
+    if (outcome.status == "pending")
+        outcome.status = "completed";
     co_return;
 }
 
@@ -498,6 +516,15 @@ int on_message_complete(llhttp_t* parser)
 std::atomic_bool               g_stop { false };
 std::atomic<net::os::fd_t>     g_listener_fd { net::os::invalid_fd() };
 std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
+std::atomic_int                g_active_sessions { 0 };
+std::atomic<uint64_t>          g_next_session_id { 1 };
+
+void on_connection_task_completed(co_wq::Promise_base& promise)
+{
+    if (auto* counter = static_cast<std::atomic_int*>(promise.mUserData)) {
+        counter->fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
 
 #if defined(_WIN32)
 static BOOL WINAPI console_ctrl_handler(DWORD type)
@@ -600,6 +627,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
         std::string response = build_http_response(502, "Bad Gateway", "Failed to connect upstream\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
+        CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=upstream_connect_failed rc=%d", peer_id.c_str(), rc);
         co_return;
     }
 
@@ -608,6 +636,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     if (co_await client.send_all(established.data(), established.size()) <= 0) {
         client.close();
         upstream.close();
+        CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=client_write_failed", peer_id.c_str());
         co_return;
     }
 
@@ -616,15 +645,28 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     configure_tcp_keepalive(client, peer_id, "client");
     configure_tcp_keepalive(upstream, peer_id, "upstream");
 
-    auto client_to_upstream = pipe_data(client, upstream, false, peer_id + " client->upstream");
-    auto upstream_to_client = pipe_data(upstream,
+    PipeOutcome client_to_upstream_outcome;
+    PipeOutcome upstream_to_client_outcome;
+    auto        client_to_upstream = pipe_data(client,
+                                        upstream,
+                                        false,
+                                        peer_id + " client->upstream",
+                                        client_to_upstream_outcome);
+    auto        upstream_to_client = pipe_data(upstream,
                                         client,
                                         true,
                                         peer_id + " upstream->client " + format_host_for_log(target.host) + ':'
-                                            + std::to_string(target.port));
+                                            + std::to_string(target.port),
+                                        upstream_to_client_outcome);
     co_await co_wq::when_all(client_to_upstream, upstream_to_client);
 
-    CO_WQ_LOG_INFO("[proxy] %s tunnel closed", peer_id.c_str());
+    bool        tunnel_error  = client_to_upstream_outcome.had_error || upstream_to_client_outcome.had_error;
+    std::string tunnel_status = tunnel_error ? "error" : "completed";
+    CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=%s client->upstream=%s upstream->client=%s",
+                   peer_id.c_str(),
+                   tunnel_status.c_str(),
+                   client_to_upstream_outcome.status.c_str(),
+                   upstream_to_client_outcome.status.c_str());
     client.close();
     upstream.close();
     co_return;
@@ -654,6 +696,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         std::string response = build_http_response(502, "Bad Gateway", "Failed to connect upstream\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
+        CO_WQ_LOG_INFO("[proxy] %s response closed status=upstream_connect_failed rc=%d", peer_id.c_str(), rc);
         co_return;
     }
 
@@ -663,6 +706,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
         upstream.close();
+        CO_WQ_LOG_INFO("[proxy] %s response closed status=upstream_send_failed", peer_id.c_str());
         co_return;
     }
 
@@ -671,16 +715,21 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
     configure_tcp_keepalive(client, peer_id, "client");
     configure_tcp_keepalive(upstream, peer_id, "upstream");
 
+    PipeOutcome response_outcome;
     co_await pipe_data(upstream,
                        client,
                        false,
                        peer_id + " upstream->client " + format_host_for_log(parts.host) + ':'
-                           + std::to_string(parts.port));
+                           + std::to_string(parts.port),
+                       response_outcome);
 
-    CO_WQ_LOG_INFO("[proxy] %s %s:%u response completed",
+    std::string response_status = response_outcome.had_error ? "error" : "completed";
+    CO_WQ_LOG_INFO("[proxy] %s %s:%u response closed status=%s upstream->client=%s",
                    peer_id.c_str(),
                    format_host_for_log(parts.host).c_str(),
-                   static_cast<unsigned>(parts.port));
+                   static_cast<unsigned>(parts.port),
+                   response_status.c_str(),
+                   response_outcome.status.c_str());
     client.close();
     upstream.close();
     co_return;
@@ -770,6 +819,7 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
             std::string response = build_http_response(400, "Bad Request", "Invalid CONNECT target\n");
             (void)co_await client.send_all(response.data(), response.size());
             client.close();
+            CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=invalid_connect_target", peer_id.c_str());
             co_return;
         }
         co_await handle_connect(client, fdwq, *target, peer_id);
@@ -866,10 +916,22 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
         }
         if (fd < 0)
             continue;
-        std::string peer_id = format_peer_id(fd);
+        uint64_t    session_id = g_next_session_id.fetch_add(1, std::memory_order_relaxed);
+        std::string peer_id    = format_peer_id(session_id);
         CO_WQ_LOG_DEBUG("[proxy] %s accepted (fd=%d)", peer_id.c_str(), fd);
         auto socket = fdwq.adopt_tcp_socket(fd);
         auto task   = handle_proxy_connection(fdwq, std::move(socket), std::move(peer_id));
+        if (auto coroutine = task.get()) {
+            auto& promise = coroutine.promise();
+            if (promise.mOnCompleted != nullptr) {
+                CO_WQ_LOG_WARN(
+                    "[proxy] connection task already has completion callback; skipping active session tracking");
+            } else {
+                promise.mUserData    = &g_active_sessions;
+                promise.mOnCompleted = &on_connection_task_completed;
+                g_active_sessions.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
         post_to(task, fdwq.base());
     }
 
@@ -877,6 +939,12 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
 
     listener.close();
     g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
+    if (int remaining = g_active_sessions.load(std::memory_order_acquire); remaining > 0) {
+        CO_WQ_LOG_INFO("[proxy] waiting for %d active session(s) to drain", remaining);
+    }
+    while (g_active_sessions.load(std::memory_order_acquire) > 0) {
+        co_await co_wq::delay_ms(get_sys_timer(), 10);
+    }
     co_return;
 }
 

@@ -5,7 +5,6 @@
 #include "io_waiter.hpp"
 #include "workqueue.hpp"
 
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -65,10 +64,6 @@ public:
     ~epoll_reactor()
     {
         _running.store(false, std::memory_order_relaxed);
-#if !defined(_WIN32)
-        if (_epfd != invalid_epoll_handle())
-            ::epoll_ctl(_epfd, EPOLL_CTL_ADD, -1, nullptr);
-#endif
         if (_thr.joinable())
             _thr.join();
         if (_epfd != invalid_epoll_handle()) {
