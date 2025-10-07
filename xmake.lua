@@ -98,14 +98,11 @@ target("co_wq")
         add_defines("USING_NET", {public = true})
         if is_plat("windows") then
             add_links("Ws2_32")
-            add_includedirs("net/win", {public = true})
             add_files("io/wepoll/wepoll.c")
             if has_config("MSVC_ITERATOR_DEBUG") then
                 add_defines("_ITERATOR_DEBUG_LEVEL=2")
                 add_defines("_DISABLE_VECTOR_ALGORITHMS")
             end
-        else
-            add_includedirs("net/linux", {public = true})
         end
         if get_config("USE_BUNDLED_LLHTTP") then
             add_packages("llhttp", {public = true})

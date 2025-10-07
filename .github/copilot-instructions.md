@@ -15,7 +15,7 @@
 ## 运行时执行模型
 - `co_wq::Task<T>` 使用 `promise_with_alloc` 统计分配；默认分配器见 `task/task.hpp` (`sys_taskalloc`)。
 - 惯例：创建任务后用 `post_to(task, workqueue)` 将协程绑定执行器并 detach；不要手动调用 `resume()`。
-- 异步 IO 通过 `fd_workqueue<Lock>` 聚合 reactor + socket/file 构造。TCP/UDP/unix socket 均在 `net/linux/` 或 `net/win/` 下与 `detail::stream_socket_base` 协作。
+- 异步 IO 通过 `fd_workqueue<Lock>` 聚合 reactor + socket/file 构造。TCP/UDP/unix socket 均直接使用 `net/` 根目录下的跨平台实现与 `detail::stream_socket_base` 协作。
 - 所有 IO awaiter继承 `io_waiter_base`，经 `post_via_route()`（或 `callback_wq`) 保证同一资源回调顺序。
 - 定时器：创建 `Timer_check_queue`（通常见 `test/syswork.cpp` 中的全局实例），使用 `post_delayed_work()` 或 `delay_ms()`；外部需要周期调用 `tick_update()` 或安排自唤醒。
 
@@ -23,7 +23,7 @@
 - `task/`：`workqueue.hpp` 定义 `worknode` intrusive list；调试状态可能调用 `wq_debug_check_func_addr` 弱符号。
 - `sync/`：`semaphore.hpp` / `timer.hpp` / `inotify.hpp` 等均返回自定义 awaiter，注意它们通过 `cancel_waiter` 处理超时。
 - `io/`：`io_serial.hpp` 提供串行化 helper；`callback_wq.hpp` 负责 per-owner FIFO 回调；`file_io.hpp` 采用 two-phase awaiter 模式。
-- `net/`：`net/linux/*` & `net/win/*` mirror API；`tls.hpp` 基于 OpenSSL 组合 TCP socket，实现 handshake + send/recv awaiter。
+- `net/`：跨平台 header 直接位于 `net/` 根目录，`tls.hpp` 基于 OpenSSL 组合 TCP socket，实现 handshake + send/recv awaiter。
 - `test/`：示例程序演示常用组合。`test/syswork.*` 暴露 `get_sys_workqueue`/`get_sys_timer` 供 demo 使用。
 
 ## 常见模式与注意事项

@@ -10,6 +10,8 @@
 #include <openssl/ssl.h>
 
 #include <cerrno>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -20,6 +22,8 @@ namespace co_wq::net {
 
 enum class tls_mode { Client, Server };
 enum class dtls_mode { Client, Server };
+
+using os::ssize_t;
 
 namespace detail {
 
@@ -85,6 +89,18 @@ namespace detail {
         default:
             return -ssl_err;
         }
+    }
+
+    inline int to_ssl_fd(os::fd_t fd)
+    {
+#if defined(_WIN32)
+        auto value = static_cast<std::uintptr_t>(fd);
+        if (value > static_cast<std::uintptr_t>(std::numeric_limits<int>::max()))
+            throw std::runtime_error("socket handle exceeds SSL fd range");
+        return static_cast<int>(value);
+#else
+        return static_cast<int>(fd);
+#endif
     }
 
 } // namespace detail
@@ -457,7 +473,7 @@ public:
     send_awaiter send_all(const void* buf, size_t len) { return send_awaiter(*this, buf, len, true); }
 
 protected:
-    int io_handle() const { return _transport.native_handle(); }
+    os::fd_t io_handle() const { return _transport.native_handle(); }
 
     void close_transport()
     {
@@ -520,7 +536,7 @@ public:
                tls_mode                    mode)
         : base_type(exec, reactor, std::move(tcp), std::move(ctx), "SSL_new failed")
     {
-        if (SSL_set_fd(this->ssl_handle(), this->underlying().native_handle()) != 1)
+        if (SSL_set_fd(this->ssl_handle(), detail::to_ssl_fd(this->underlying().native_handle())) != 1)
             throw std::runtime_error("SSL_set_fd failed");
         if (mode == tls_mode::Client)
             SSL_set_connect_state(this->ssl_handle());
@@ -553,7 +569,7 @@ public:
                 dtls_mode                   mode)
         : base_type(exec, reactor, std::move(udp), std::move(ctx), "SSL_new (dtls) failed")
     {
-        BIO* bio = BIO_new_dgram(this->underlying().native_handle(), BIO_NOCLOSE);
+        BIO* bio = BIO_new_dgram(detail::to_ssl_fd(this->underlying().native_handle()), BIO_NOCLOSE);
         if (!bio)
             throw std::runtime_error("BIO_new_dgram failed");
         SSL_set_bio(this->ssl_handle(), bio, bio);

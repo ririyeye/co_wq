@@ -40,7 +40,7 @@ inline std::string errno_message(int err)
 }
 
 std::atomic_bool               g_stop { false };
-std::atomic<int>               g_listener_fd { -1 };
+std::atomic<net::os::fd_t>     g_listener_fd { net::os::invalid_fd() };
 std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
 
 #if defined(_WIN32)
@@ -48,9 +48,9 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 {
     if (type == CTRL_C_EVENT) {
         g_stop.store(true, std::memory_order_release);
-        int fd = g_listener_fd.exchange(-1, std::memory_order_acq_rel);
-        if (fd != -1)
-            ::closesocket((SOCKET)fd);
+        auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
+        if (fd != net::os::invalid_fd())
+            net::os::close_fd(fd);
         if (auto* flag = g_finished_ptr.load(std::memory_order_acquire))
             flag->store(true, std::memory_order_release);
         return TRUE;
@@ -61,9 +61,9 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 void sigint_handler(int)
 {
     g_stop.store(true, std::memory_order_release);
-    int fd = g_listener_fd.exchange(-1, std::memory_order_acq_rel);
-    if (fd != -1)
-        ::close(fd);
+    auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
+    if (fd != net::os::invalid_fd())
+        net::os::close_fd(fd);
     if (auto* flag = g_finished_ptr.load(std::memory_order_acquire))
         flag->store(true, std::memory_order_release);
 }
@@ -202,7 +202,7 @@ Task<void, Work_Promise<SpinLock, void>> websocket_server(NetFdWorkqueue& fdwq,
     }
 
     listener.close();
-    g_listener_fd.store(-1, std::memory_order_release);
+    g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
     co_return;
 }
 

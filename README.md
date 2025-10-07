@@ -403,7 +403,7 @@ xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
 - `epoll_reactor<lock>` / `iocp_reactor<lock>`：平台化事件循环后端，分别封装 `epoll` 与 IOCP，实现 `add_fd/remove_fd/add_waiter[_custom]` 接口。
 
 ### 网络原语（`net/`）
-- `detail::stream_listener_base` / `detail::stream_socket_base` / `detail::datagram_socket_base`：Linux 网络监听/流式/数据报基类，统一封装 fd 生命周期、串行化 send/recv 与 reactor 交互，现已补充中文 Doxygen 注释，方便生成参考文档。
+- `detail::stream_listener_base` / `detail::stream_socket_base` / `detail::datagram_socket_base`：跨平台网络监听/流式/数据报基类，统一封装 fd 生命周期、串行化 send/recv 与 reactor 交互，现已补充中文 Doxygen 注释，方便生成参考文档。
 - `tcp_socket<lock, Reactor>`：非阻塞 TCP 封装，支持：
   - `connect(host, port)`：异步连接；
   - `recv(buf, len, full)` / `send(buf, len, full)`：单次或聚合收发；
@@ -412,11 +412,8 @@ xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
   - 状态查询 `rx_eof()`、`tx_shutdown()`。
 - `tcp_listener<lock, Reactor>`：监听/接受连接，提供 `bind_listen()` 与 `accept()` awaiter。
 - `udp_socket<lock, Reactor>`：支持 `send_to/recv_from`、可选 `connect()`。
-- `unix_socket<lock, Reactor>` / `unix_listener<lock, Reactor>`：协程化 Unix Domain Stream 套接字（Linux），
+- `unix_socket<lock, Reactor>` / `unix_listener<lock, Reactor>`：协程化 Unix Domain Stream 套接字（主要在类 Unix 平台可用），
   支持文件路径或以 `@` 开头的抽象命名空间，API 与 TCP 版本保持一致（`connect/recv/send`、`bind_listen/accept`）。
-- Windows 目录下提供 IOCP 版本，实现接口一致，便于跨平台编译：
-  - `net/win/tcp_listener.hpp` / `tcp_socket.hpp` 现补充了详尽的中文 Doxygen 注释，便于生成跨平台 API 文档；
-  - `tcp_socket::recv` 在缺省 Reactor 场景下会自动回退到工作队列投递，避免协程悬挂。
 
 ## 设计与最佳实践
 - **锁策略**：默认锁类型为 `SpinLock`，如需与多线程配合可传入自定义互斥量（需满足 `lockable` 概念）。

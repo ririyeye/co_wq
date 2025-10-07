@@ -26,7 +26,7 @@ using namespace co_wq;
 static std::atomic_bool                      g_stop { false };
 static std::atomic<uint64_t>                 g_conn_count { 0 };
 static std::atomic<uint64_t>                 g_bytes_echoed { 0 };
-static std::atomic<int>                      g_listener_fd { -1 }; // for forced close
+static std::atomic<net::os::fd_t>            g_listener_fd { net::os::invalid_fd() }; // for forced close
 static std::chrono::steady_clock::time_point g_server_start;
 
 using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
@@ -36,9 +36,9 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 {
     if (type == CTRL_C_EVENT) {
         g_stop.store(true, std::memory_order_release);
-        int fd = g_listener_fd.exchange(-1, std::memory_order_acq_rel);
-        if (fd != -1)
-            ::closesocket((SOCKET)fd);
+        auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
+        if (fd != net::os::invalid_fd())
+            net::os::close_fd(fd);
         return TRUE;
     }
     return FALSE;
@@ -47,9 +47,9 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 static void sigint_handler(int)
 {
     g_stop.store(true, std::memory_order_release);
-    int fd = g_listener_fd.exchange(-1, std::memory_order_acq_rel);
-    if (fd != -1)
-        ::close(fd);
+    auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
+    if (fd != net::os::invalid_fd())
+        net::os::close_fd(fd);
 }
 #endif
 
@@ -93,7 +93,7 @@ echo_server(NetFdWorkqueue& fdwq, std::string host, uint16_t port, int max_conn)
         post_to(t, fdwq.base());
     }
     lst.close(); // server exits after reaching max_conn (if specified)
-    g_listener_fd.store(-1, std::memory_order_release);
+    g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
     // Print statistics on unlimited mode exit via Ctrl+C or after finishing limited accepts.
     auto     dur   = std::chrono::steady_clock::now() - g_server_start;
     double   sec   = std::chrono::duration_cast<std::chrono::duration<double>>(dur).count();

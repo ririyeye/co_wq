@@ -49,7 +49,7 @@
    - 使用 Wireshark/Ettercap 在 Windows 主机抓取出口与入口流量，比较是否存在 FIN/RST 或 TLS Alert 导致提前结束。
    - 若抓包无明显异常，再在 Linux 机器抓包对照。
 4. **插桩排查**
-   - 在 Windows `net/win/tcp_socket.hpp` 的 `recv`/`send` 完成回调中记录 `bytes_transferred` 与 `status`。
+   - 在 Windows 环境下可直接查看统一的 `net/tcp_socket.hpp`，在 `recv`/`send` 完成回调中记录 `bytes_transferred` 与 `status`。
    - 检查 TLS awaiter：确认 `unwrap` 后剩余数据是否全部 push 到 `callback_wq`。
    - 在代理逻辑中为每条隧道维护 `expected_bytes` vs `forwarded_bytes` 计数。
 5. **Stress/Timeout 复测**
