@@ -13,7 +13,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-
 #ifndef MSG_DONTWAIT
 #define MSG_DONTWAIT 0
 #endif
@@ -385,11 +384,11 @@ inline int bind(fd_t fd, const sockaddr* addr, socklen_t len)
 #include <sys/uio.h>
 #include <unistd.h>
 
-
 namespace co_wq::net::os {
 
 using fd_t    = int;
 using ssize_t = ::ssize_t;
+using ::iovec;
 
 inline fd_t invalid_fd() noexcept
 {
