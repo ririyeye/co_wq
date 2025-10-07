@@ -4,26 +4,31 @@
  */
 #pragma once
 
-#if !defined(_WIN32)
-
+#include "../os_compat.hpp"
 #include "callback_wq.hpp"
 #include "io_serial.hpp"
 #include "io_waiter.hpp"
+
+#if defined(_WIN32)
+#include "../../io/wepoll/wepoll.h"
+#else
+#include <sys/epoll.h>
+#endif
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
-#include <fcntl.h>
 #include <memory>
 #include <optional>
 #include <stdexcept>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
 namespace co_wq::net::detail {
+
+using co_wq::lockable;
+using os::fd_t;
+using os::iovec;
+using os::ssize_t;
 
 /**
  * @brief 所有 socket 类型共享的基础核心类，负责 fd 生命周期与 reactor 登记。
@@ -39,7 +44,7 @@ public:
     socket_core(socket_core&& o) noexcept
         : _exec(o._exec)
         , _reactor(o._reactor)
-        , _fd(std::exchange(o._fd, -1))
+        , _fd(std::exchange(o._fd, os::invalid_fd()))
         , _closed(std::exchange(o._closed, false))
         , _family(o._family)
         , _cbq(_exec)
@@ -52,7 +57,7 @@ public:
         if (this != &o) {
             close_fd();
             _reactor = o._reactor;
-            _fd      = std::exchange(o._fd, -1);
+            _fd      = std::exchange(o._fd, os::invalid_fd());
             _closed  = std::exchange(o._closed, false);
             _family  = o._family;
             std::destroy_at(&_cbq);
@@ -65,7 +70,7 @@ public:
     ~socket_core() { close_fd(); }
 
     /** @brief 返回原生文件描述符。 */
-    int native_handle() const { return _fd; }
+    fd_t native_handle() const { return _fd; }
     /** @brief 获取关联执行器。 */
     workqueue<lock>& exec() { return _exec; }
     /** @brief 返回串行化所用锁实例。 */
@@ -87,15 +92,15 @@ protected:
     socket_core(workqueue<lock>& exec, Reactor<lock>& reactor, int domain, int type, int protocol = 0)
         : _exec(exec), _reactor(&reactor), _family(domain), _cbq(exec)
     {
-        _fd = ::socket(domain, type | SOCK_CLOEXEC, protocol);
-        if (_fd < 0)
+        _fd = os::create_socket(domain, type | SOCK_CLOEXEC, protocol);
+        if (_fd == os::invalid_fd())
             throw std::runtime_error("socket failed");
         init_fd();
     }
-    socket_core(int fd, workqueue<lock>& exec, Reactor<lock>& reactor)
+    socket_core(fd_t fd, workqueue<lock>& exec, Reactor<lock>& reactor)
         : _exec(exec), _reactor(&reactor), _fd(fd), _cbq(exec)
     {
-        if (_fd < 0)
+        if (_fd == os::invalid_fd())
             throw std::runtime_error("invalid fd");
         determine_family();
         init_fd();
@@ -106,7 +111,7 @@ protected:
      */
     void close_fd()
     {
-        if (_fd >= 0) {
+        if (_fd != os::invalid_fd()) {
             _closed = true;
             if (_reactor)
                 _reactor->remove_fd(_fd);
@@ -114,8 +119,8 @@ protected:
             INIT_LIST_HEAD(&pending);
             serial_collect_waiters(_io_serial_lock, { &_send_q, &_recv_q }, pending);
             serial_post_pending(_exec, pending);
-            ::close(_fd);
-            _fd = -1;
+            os::close_fd(_fd);
+            _fd = os::invalid_fd();
         }
     }
 
@@ -146,13 +151,13 @@ protected:
                 net::post_via_route(owner.exec(), *this);
                 return;
             }
-            int r = ::connect(owner.native_handle(), reinterpret_cast<sockaddr*>(&addr), len);
+            int r = os::connect(owner.native_handle(), reinterpret_cast<sockaddr*>(&addr), len);
             if (r == 0) {
                 ret = 0;
                 net::post_via_route(owner.exec(), *this);
                 return;
             }
-            if (r < 0 && errno != EINPROGRESS) {
+            if (r < 0 && errno != EINPROGRESS && errno != EWOULDBLOCK) {
                 ret = -1;
                 net::post_via_route(owner.exec(), *this);
                 return;
@@ -164,7 +169,7 @@ protected:
             if (ret == 0) {
                 int       err = 0;
                 socklen_t len = sizeof(err);
-                if (::getsockopt(owner.native_handle(), SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
+                if (os::getsockopt(owner.native_handle(), SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
                     return 0;
                 errno = err;
                 return -1;
@@ -176,22 +181,16 @@ protected:
 private:
     void init_fd()
     {
-        set_non_block();
+        os::set_non_block(_fd);
         _reactor->add_fd(_fd);
         serial_queue_init(_send_q);
         serial_queue_init(_recv_q);
         _closed = false;
     }
-    void set_non_block()
-    {
-        int flags = ::fcntl(_fd, F_GETFL, 0);
-        if (flags >= 0)
-            ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
-    }
 
     workqueue<lock>&  _exec;
     Reactor<lock>*    _reactor { nullptr };
-    int               _fd { -1 };
+    fd_t              _fd { os::invalid_fd() };
     bool              _closed { false };
     int               _family { AF_INET };
     lock              _io_serial_lock;
@@ -203,7 +202,7 @@ private:
     {
         sockaddr_storage local {};
         socklen_t        len = sizeof(local);
-        if (::getsockname(_fd, reinterpret_cast<sockaddr*>(&local), &len) == 0)
+        if (os::getsockname(_fd, reinterpret_cast<sockaddr*>(&local), &len) == 0)
             _family = local.ss_family;
         else
             _family = AF_INET;
@@ -239,8 +238,8 @@ public:
      */
     void shutdown_tx()
     {
-        if (this->native_handle() >= 0 && !_tx_shutdown) {
-            ::shutdown(this->native_handle(), SHUT_WR);
+        if (this->native_handle() != os::invalid_fd() && !_tx_shutdown) {
+            os::shutdown(this->native_handle(), SHUT_WR);
             _tx_shutdown = true;
         }
     }
@@ -289,7 +288,7 @@ public:
         {
             if (recvd >= len)
                 return 0;
-            ssize_t n = ::recv(this->owner.native_handle(), buf + recvd, len - recvd, MSG_DONTWAIT);
+            ssize_t n = os::recv(this->owner.native_handle(), buf + recvd, len - recvd, 0);
             if (n > 0) {
                 recvd += static_cast<size_t>(n);
                 if (!full)
@@ -334,7 +333,7 @@ public:
             this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
-        send_awaiter(Derived& s, const struct iovec* iov, int iovcnt, bool f)
+        send_awaiter(Derived& s, const iovec* iov, int iovcnt, bool f)
             : two_phase_drain_awaiter<send_awaiter, Derived>(s, s.send_queue()), full(f), use_vec(true)
         {
             vec.reserve(static_cast<size_t>(iovcnt));
@@ -369,10 +368,7 @@ public:
         {
             if (!use_vec) {
                 while (sent < len) {
-                    ssize_t n = ::send(this->owner.native_handle(),
-                                       buf + sent,
-                                       len - sent,
-                                       MSG_DONTWAIT | MSG_NOSIGNAL);
+                    ssize_t n = os::send(this->owner.native_handle(), buf + sent, len - sent, MSG_NOSIGNAL);
                     if (n > 0) {
                         sent += static_cast<size_t>(n);
                         if (sent == len)
@@ -391,7 +387,7 @@ public:
                 return 0;
             }
             while (!vec.empty()) {
-                ssize_t n = ::writev(this->owner.native_handle(), vec.data(), static_cast<int>(vec.size()));
+                ssize_t n = os::writev(this->owner.native_handle(), vec.data(), static_cast<int>(vec.size()));
                 if (n > 0) {
                     sent += static_cast<size_t>(n);
                     advance_iov(static_cast<size_t>(n));
@@ -428,12 +424,12 @@ public:
         return send_awaiter(static_cast<Derived&>(*this), buf, len, true);
     }
     /** @brief writev 版本的部分发送。 */
-    send_awaiter sendv(const struct iovec* iov, int iovcnt)
+    send_awaiter sendv(const iovec* iov, int iovcnt)
     {
         return send_awaiter(static_cast<Derived&>(*this), iov, iovcnt, false);
     }
     /** @brief writev 版本的全量发送。 */
-    send_awaiter send_all(const struct iovec* iov, int iovcnt)
+    send_awaiter send_all(const iovec* iov, int iovcnt)
     {
         return send_awaiter(static_cast<Derived&>(*this), iov, iovcnt, true);
     }
@@ -443,7 +439,7 @@ protected:
         : core(exec, reactor, domain, type, protocol)
     {
     }
-    stream_socket_base(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : core(fd, exec, reactor) { }
+    stream_socket_base(fd_t fd, workqueue<lock>& exec, Reactor<lock>& reactor) : core(fd, exec, reactor) { }
 
 private:
     bool _rx_eof { false };
@@ -504,7 +500,7 @@ public:
         {
             sockaddr*            sa      = out_addr ? reinterpret_cast<sockaddr*>(out_addr) : nullptr;
             address_length_type* len_ptr = out_len;
-            nread                        = ::recvfrom(this->owner.native_handle(), buf, len, MSG_DONTWAIT, sa, len_ptr);
+            nread                        = os::recvfrom(this->owner.native_handle(), buf, len, 0, sa, len_ptr);
             if (nread >= 0)
                 return 0;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -556,7 +552,7 @@ public:
             this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
-        send_awaiter(Derived& s, const struct iovec* iov, int iovcnt)
+        send_awaiter(Derived& s, const iovec* iov, int iovcnt)
             : two_phase_drain_awaiter<send_awaiter, Derived>(s, s.send_queue()), use_vec(true)
         {
             vec.reserve(static_cast<size_t>(iovcnt));
@@ -569,7 +565,7 @@ public:
             this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
         }
-        send_awaiter(Derived& s, const struct iovec* iov, int iovcnt, const address_type& d)
+        send_awaiter(Derived& s, const iovec* iov, int iovcnt, const address_type& d)
             : two_phase_drain_awaiter<send_awaiter, Derived>(s, s.send_queue())
             , use_vec(true)
             , dest(dest_info { d, Derived::address_length(d) })
@@ -592,25 +588,25 @@ public:
         {
             if (!use_vec) {
                 if (dest) {
-                    nsent = ::sendto(this->owner.native_handle(),
-                                     buf,
-                                     len,
-                                     MSG_DONTWAIT | MSG_NOSIGNAL,
-                                     reinterpret_cast<const sockaddr*>(&dest->addr),
-                                     dest->len);
+                    nsent = os::sendto(this->owner.native_handle(),
+                                       buf,
+                                       len,
+                                       MSG_NOSIGNAL,
+                                       reinterpret_cast<const sockaddr*>(&dest->addr),
+                                       dest->len);
                 } else {
-                    nsent = ::send(this->owner.native_handle(), buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                    nsent = os::send(this->owner.native_handle(), buf, len, MSG_NOSIGNAL);
                 }
             } else {
                 if (dest) {
-                    msghdr msg {};
-                    msg.msg_name    = &dest->addr;
-                    msg.msg_namelen = dest->len;
-                    msg.msg_iov     = vec.data();
-                    msg.msg_iovlen  = static_cast<size_t>(vec.size());
-                    nsent           = ::sendmsg(this->owner.native_handle(), &msg, MSG_DONTWAIT);
+                    nsent = os::sendto_vec(this->owner.native_handle(),
+                                           vec.data(),
+                                           static_cast<int>(vec.size()),
+                                           reinterpret_cast<const sockaddr*>(&dest->addr),
+                                           dest->len,
+                                           0);
                 } else {
-                    nsent = ::writev(this->owner.native_handle(), vec.data(), static_cast<int>(vec.size()));
+                    nsent = os::writev(this->owner.native_handle(), vec.data(), static_cast<int>(vec.size()));
                 }
             }
             if (nsent >= 0)
@@ -638,11 +634,8 @@ public:
     {
         return send_awaiter(static_cast<Derived&>(*this), buf, len, dest_addr);
     }
-    send_awaiter sendv(const struct iovec* iov, int iovcnt)
-    {
-        return send_awaiter(static_cast<Derived&>(*this), iov, iovcnt);
-    }
-    send_awaiter sendv_to(const struct iovec* iov, int iovcnt, const address_type& dest_addr)
+    send_awaiter sendv(const iovec* iov, int iovcnt) { return send_awaiter(static_cast<Derived&>(*this), iov, iovcnt); }
+    send_awaiter sendv_to(const iovec* iov, int iovcnt, const address_type& dest_addr)
     {
         return send_awaiter(static_cast<Derived&>(*this), iov, iovcnt, dest_addr);
     }
@@ -652,13 +645,7 @@ protected:
         : core(exec, reactor, domain, type, protocol)
     {
     }
-    datagram_socket_base(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : core(fd, exec, reactor) { }
+    datagram_socket_base(fd_t fd, workqueue<lock>& exec, Reactor<lock>& reactor) : core(fd, exec, reactor) { }
 };
 
 } // namespace co_wq::net::detail
-
-#else
-
-// This header is unused on non-Linux platforms.
-
-#endif // !_WIN32

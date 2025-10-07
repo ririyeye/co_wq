@@ -65,6 +65,8 @@ using namespace co_wq;
 
 namespace {
 
+using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
+
 #if defined(_WIN32)
 void ensure_dbghelp_initialized()
 {
@@ -1545,7 +1547,7 @@ extern "C" void wq_debug_null_func(co_wq::worknode* node)
 }
 #endif
 
-net::tcp_socket<SpinLock> make_upstream_socket(net::fd_workqueue<SpinLock>& fdwq)
+net::tcp_socket<SpinLock> make_upstream_socket(NetFdWorkqueue& fdwq)
 {
     static std::atomic_bool warned { false };
     try {
@@ -1655,10 +1657,8 @@ void configure_tcp_keepalive(net::tcp_socket<SpinLock>& socket, const std::strin
 #endif
 }
 
-Task<int, Work_Promise<SpinLock, int>> connect_upstream(net::tcp_socket<SpinLock>&   socket,
-                                                        net::fd_workqueue<SpinLock>& fdwq,
-                                                        const std::string&           host,
-                                                        uint16_t                     port)
+Task<int, Work_Promise<SpinLock, int>>
+connect_upstream(net::tcp_socket<SpinLock>& socket, NetFdWorkqueue& fdwq, const std::string& host, uint16_t port)
 {
     auto endpoint_key = make_endpoint_key(host, port);
     auto raw          = resolve_upstream_candidates(socket, host, port);
@@ -2116,10 +2116,10 @@ PIPE_DONE:
 }
 
 // 建立 CONNECT 隧道，将客户端/上游 sockets 互相转发，直到任一方关闭。
-Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock>&   client,
-                                                        net::fd_workqueue<SpinLock>& fdwq,
-                                                        const ConnectTarget&         target,
-                                                        const std::string&           peer_id)
+Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock>& client,
+                                                        NetFdWorkqueue&            fdwq,
+                                                        const ConnectTarget&       target,
+                                                        const std::string&         peer_id)
 {
     auto upstream = make_upstream_socket(fdwq);
     {
@@ -2173,11 +2173,11 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
 }
 
 // 处理常规 HTTP 请求：重新构造请求行/头部并回源，然后将响应回写给客户端。
-Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&            ctx,
-                                                             net::tcp_socket<SpinLock>&   client,
-                                                             net::fd_workqueue<SpinLock>& fdwq,
-                                                             const UrlParts&              parts,
-                                                             const std::string&           peer_id)
+Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&          ctx,
+                                                             net::tcp_socket<SpinLock>& client,
+                                                             NetFdWorkqueue&            fdwq,
+                                                             const UrlParts&            parts,
+                                                             const std::string&         peer_id)
 {
     auto upstream = make_upstream_socket(fdwq);
     {
@@ -2280,7 +2280,7 @@ RESPONSE_DONE:
 
 // 单个客户端连接生命周期：解析首个请求并根据方法调度处理逻辑。
 Task<void, Work_Promise<SpinLock, void>>
-handle_proxy_connection(net::fd_workqueue<SpinLock>& fdwq, net::tcp_socket<SpinLock> client, std::string peer_id)
+handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, std::string peer_id)
 {
     llhttp_settings_t settings;
     llhttp_settings_init(&settings);
@@ -2391,8 +2391,7 @@ handle_proxy_connection(net::fd_workqueue<SpinLock>& fdwq, net::tcp_socket<SpinL
 }
 
 // 监听入站代理端口并为每个连接派生协程处理。
-Task<void, Work_Promise<SpinLock, void>>
-proxy_server(net::fd_workqueue<SpinLock>& fdwq, const std::string& host, uint16_t port)
+Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, const std::string& host, uint16_t port)
 {
     auto analyze_listen_host = [](const std::string& input) {
         struct Config {
@@ -2590,8 +2589,8 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    auto&                       wq = get_sys_workqueue(0);
-    net::fd_workqueue<SpinLock> fdwq(wq);
+    auto&          wq = get_sys_workqueue(0);
+    NetFdWorkqueue fdwq(wq);
 
     {
         std::ostringstream oss;

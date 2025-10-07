@@ -43,4 +43,4 @@
 ## 调试与验证
 - 判断内存泄漏：查看 `task/sys_sta.malloc_cnt/free_cnt`（例如在 demo 中打印）。
 - Reactor 问题：确认 `fd_workqueue` 构造时 `add_fd` 成功；`epoll_reactor` 在析构时会移除 fd 并唤醒所有 waiter。
-- Windows 构建：确保 `script/xmk-wine-msvc.sh` 中的 `--sdk` 路径有效，必要时运行 `wineserver -k` 重启。
+- Windows 构建：确保 `script/xmsvc.bat` 中的 `--sdk` 路径有效，必要时运行 `wineserver -k` 重启。

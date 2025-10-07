@@ -1,6 +1,6 @@
 {
     "proxy": {
-        "host": "192.168.30.32",
+        "host": "127.0.0.1",
         "port": 18100
     },
     "timeout": 5.0,
@@ -20,8 +20,5 @@
         "http://www.ifeng.com/",
         "http://www.china.com.cn/",
         "http://news.sina.com.cn/"
-    ],
-    "targets": [
-        "www.google.com:443"
     ]
 }

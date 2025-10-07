@@ -1,32 +1,35 @@
 #pragma once
 
-#if !defined(_WIN32)
-
 /**
  * @file tcp_socket.hpp
  * @brief TCP socket 协程原语，提供 connect/send/recv Awaiter 与便捷封装。
  */
 
+#include "../os_compat.hpp"
 #include "epoll_reactor.hpp"
 #include "stream_socket_base.hpp"
 #include "worker.hpp"
-#include <arpa/inet.h>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
+
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <string>
 #include <sys/socket.h>
+#endif
 
 namespace co_wq::net {
 
-template <lockable lock, template <class> class Reactor> class fd_workqueue;
+template <co_wq::lockable lock, template <class> class Reactor> class fd_workqueue;
 
 /**
  * @brief 基于 `stream_socket_base` 的 TCP socket 实现。
  */
-template <lockable lock, template <class> class Reactor = epoll_reactor>
+template <co_wq::lockable lock, template <class> class Reactor = epoll_reactor>
 class tcp_socket : public detail::stream_socket_base<tcp_socket<lock, Reactor>, lock, Reactor> {
     using base = detail::stream_socket_base<tcp_socket<lock, Reactor>, lock, Reactor>;
 
@@ -165,7 +168,7 @@ private:
     {
         if (fam == AF_INET6) {
             int v6only = _dual_stack ? 0 : 1;
-            ::setsockopt(this->native_handle(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+            os::setsockopt(this->native_handle(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
         }
     }
     tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : base(fd, exec, reactor)
@@ -180,7 +183,7 @@ private:
             return false;
         int       v6only = 1;
         socklen_t len    = sizeof(v6only);
-        if (::getsockopt(this->native_handle(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len) != 0)
+        if (os::getsockopt(this->native_handle(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len) != 0)
             return false;
         return v6only == 0;
     }
@@ -193,7 +196,7 @@ private:
 /**
  * @brief 以 Task 形式封装 `tcp_socket::connect`。
  */
-template <lockable lock>
+template <co_wq::lockable lock>
 inline Task<int, Work_Promise<lock, int>> async_connect(tcp_socket<lock>& s, const std::string host, uint16_t port)
 {
     co_return co_await s.connect(host, port);
@@ -202,8 +205,9 @@ inline Task<int, Work_Promise<lock, int>> async_connect(tcp_socket<lock>& s, con
 /**
  * @brief 发送全部缓冲区数据，返回成功字节数。
  */
-template <lockable lock>
-inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_send_all(tcp_socket<lock>& s, const void* buf, size_t len)
+template <co_wq::lockable lock>
+inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>>
+async_send_all(tcp_socket<lock>& s, const void* buf, size_t len)
 {
     co_return co_await s.send_all(buf, len);
 }
@@ -211,9 +215,9 @@ inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_send_all(tcp_socket<lock
 /**
  * @brief writev 版本的全量发送。
  */
-template <lockable lock>
-inline Task<ssize_t, Work_Promise<lock, ssize_t>>
-async_sendv_all(tcp_socket<lock>& s, const struct iovec* iov, int iovcnt)
+template <co_wq::lockable lock>
+inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>>
+async_sendv_all(tcp_socket<lock>& s, const os::iovec* iov, int iovcnt)
 {
     co_return co_await s.send_all(iov, iovcnt);
 }
@@ -221,8 +225,8 @@ async_sendv_all(tcp_socket<lock>& s, const struct iovec* iov, int iovcnt)
 /**
  * @brief 读取部分数据（至少一次）。
  */
-template <lockable lock>
-inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_recv_some(tcp_socket<lock>& s, void* buf, size_t len)
+template <co_wq::lockable lock>
+inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>> async_recv_some(tcp_socket<lock>& s, void* buf, size_t len)
 {
     co_return co_await s.recv(buf, len);
 }
@@ -230,16 +234,10 @@ inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_recv_some(tcp_socket<loc
 /**
  * @brief 读取固定长度数据。
  */
-template <lockable lock>
-inline Task<ssize_t, Work_Promise<lock, ssize_t>> async_recv_all(tcp_socket<lock>& s, void* buf, size_t len)
+template <co_wq::lockable lock>
+inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>> async_recv_all(tcp_socket<lock>& s, void* buf, size_t len)
 {
     co_return co_await s.recv_all(buf, len);
 }
 
 } // namespace co_wq::net
-
-#else
-
-// This header is unused on Windows platforms.
-
-#endif // !_WIN32

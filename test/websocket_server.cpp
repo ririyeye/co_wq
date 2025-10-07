@@ -27,6 +27,8 @@
 
 using namespace co_wq;
 
+using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
+
 namespace {
 
 inline std::string errno_message(int err)
@@ -158,9 +160,9 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_webso
     co_return;
 }
 
-Task<void, Work_Promise<SpinLock, void>> websocket_server(net::fd_workqueue<SpinLock>& fdwq,
-                                                          std::string                  host,
-                                                          uint16_t                     port
+Task<void, Work_Promise<SpinLock, void>> websocket_server(NetFdWorkqueue& fdwq,
+                                                          std::string     host,
+                                                          uint16_t        port
 #if defined(USING_SSL)
                                                           ,
                                                           const net::tls_context* tls_ctx
@@ -235,8 +237,8 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    auto&                       wq = get_sys_workqueue(0);
-    net::fd_workqueue<SpinLock> fdwq(wq);
+    auto&          wq = get_sys_workqueue(0);
+    NetFdWorkqueue fdwq(wq);
 
     const net::tls_context* tls_ctx_ptr = nullptr;
 #if defined(USING_SSL)

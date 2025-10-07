@@ -5,14 +5,18 @@
  * @brief Linux 平台流式 listener 的 CRTP 基类，封装 socket 创建、关闭与异步 accept。
  */
 
+#include "../os_compat.hpp"
 #include "io_waiter.hpp"
 #include "workqueue.hpp"
 #include <cerrno>
-#include <fcntl.h>
 #include <stdexcept>
+
+
+#if defined(_WIN32)
+#include "../../io/wepoll/wepoll.h"
+#else
 #include <sys/epoll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#endif
 
 namespace co_wq::net::detail {
 
@@ -45,7 +49,7 @@ public:
     stream_listener_base(stream_listener_base&& o) noexcept
         : _exec(o._exec), _reactor(o._reactor), _fd(o._fd), _family(o._family)
     {
-        o._fd = -1;
+        o._fd = os::invalid_fd();
     }
     stream_listener_base& operator=(stream_listener_base&& o) noexcept
     {
@@ -55,7 +59,7 @@ public:
             _reactor = o._reactor;
             _fd      = o._fd;
             _family  = o._family;
-            o._fd    = -1;
+            o._fd    = os::invalid_fd();
         }
         return *this;
     }
@@ -70,16 +74,16 @@ public:
      */
     void close()
     {
-        if (_fd >= 0) {
+        if (_fd != os::invalid_fd()) {
             if (_reactor)
                 _reactor->remove_fd(_fd);
-            ::close(_fd);
-            _fd = -1;
+            os::close_fd(_fd);
+            _fd = os::invalid_fd();
         }
     }
 
     /** @brief 获取底层监听 fd。 */
-    int native_handle() const { return _fd; }
+    os::fd_t native_handle() const { return _fd; }
     /** @brief 返回绑定的工作队列。 */
     workqueue<lock>& exec() { return _exec; }
     int              family() const noexcept { return _family; }
@@ -115,9 +119,9 @@ public:
         {
             sockaddr_storage addr;
             socklen_t        alen = sizeof(addr);
-            int fd = ::accept4(lst._fd, reinterpret_cast<sockaddr*>(&addr), &alen, SOCK_CLOEXEC | SOCK_NONBLOCK);
-            if (fd >= 0)
-                return fd;
+            os::fd_t fd = os::accept(lst._fd, reinterpret_cast<sockaddr*>(&addr), &alen, SOCK_CLOEXEC | SOCK_NONBLOCK);
+            if (fd != os::invalid_fd())
+                return static_cast<int>(fd);
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return -1;
             return accept_fatal();
@@ -136,8 +140,8 @@ protected:
     stream_listener_base(workqueue<lock>& exec, Reactor<lock>& reactor, int domain, int type, int protocol = 0)
         : _exec(exec), _reactor(&reactor), _family(domain)
     {
-        _fd = ::socket(domain, type | SOCK_CLOEXEC, protocol);
-        if (_fd < 0)
+        _fd = os::create_socket(domain, type | SOCK_CLOEXEC, protocol);
+        if (_fd == os::invalid_fd())
             throw std::runtime_error("listener socket failed");
         set_non_block();
         _reactor->add_fd(_fd);
@@ -146,16 +150,11 @@ protected:
     /**
      * @brief 将监听 fd 设置为非阻塞。
      */
-    void set_non_block()
-    {
-        int flags = ::fcntl(_fd, F_GETFL, 0);
-        if (flags >= 0)
-            ::fcntl(_fd, F_SETFL, flags | O_NONBLOCK);
-    }
+    void set_non_block() { os::set_non_block(_fd); }
 
     workqueue<lock>& _exec;
     Reactor<lock>*   _reactor { nullptr };
-    int              _fd { -1 };
+    os::fd_t         _fd { os::invalid_fd() };
     int              _family { AF_INET };
 };
 

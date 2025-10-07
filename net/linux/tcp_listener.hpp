@@ -1,7 +1,5 @@
 #pragma once
 
-#if !defined(_WIN32)
-
 /**
  * @file tcp_listener.hpp
  * @brief 基于 `stream_listener_base` 的 TCP 监听器封装，提供协程化 accept。
@@ -12,8 +10,15 @@
 #include "stream_listener_base.hpp"
 #include "tcp_socket.hpp"
 #include "worker.hpp"
-#include <arpa/inet.h>
+#include <cstring>
+#include <stdexcept>
 #include <string>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 
 namespace co_wq::net {
 
@@ -43,9 +48,9 @@ public:
      */
     void bind_listen(const std::string& host, uint16_t port, int backlog = 128, bool dual_stack = false)
     {
-        int fd  = this->native_handle();
-        int opt = 1;
-        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+        os::fd_t fd  = this->native_handle();
+        int      opt = 1;
+        os::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
         if (this->family() == AF_INET6) {
             std::string view = host;
@@ -56,14 +61,14 @@ public:
             addr6.sin6_family = AF_INET6;
             addr6.sin6_port   = htons(port);
             if (view.empty() || view == "::" || view == "*")
-                addr6.sin6_addr = in6addr_any;
-            else if (::inet_pton(AF_INET6, view.c_str(), &addr6.sin6_addr) <= 0)
+                std::memset(&addr6.sin6_addr, 0, sizeof(addr6.sin6_addr));
+            else if (inet_pton_wrapper(AF_INET6, view, &addr6.sin6_addr) <= 0)
                 throw std::runtime_error("inet_pton failed");
 
             int v6only = dual_stack ? 0 : 1;
-            ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&v6only), sizeof(v6only));
+            os::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
-            if (::bind(fd, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) < 0)
+            if (os::bind(fd, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) < 0)
                 throw std::runtime_error("bind failed");
         } else {
             sockaddr_in addr {};
@@ -71,16 +76,26 @@ public:
             addr.sin_port   = htons(port);
             if (host.empty() || host == "0.0.0.0" || host == "*")
                 addr.sin_addr.s_addr = INADDR_ANY;
-            else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0)
+            else if (inet_pton_wrapper(AF_INET, host, &addr.sin_addr) <= 0)
                 throw std::runtime_error("inet_pton failed");
-            if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+            if (os::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
                 throw std::runtime_error("bind failed");
         }
 
-        if (::listen(fd, backlog) < 0)
+        if (os::listen(fd, backlog) < 0)
             throw std::runtime_error("listen failed");
     }
     using base::accept;
+
+private:
+    static int inet_pton_wrapper(int family, const std::string& text, void* dst)
+    {
+#if defined(_WIN32)
+        return ::InetPtonA(family, text.c_str(), dst);
+#else
+        return ::inet_pton(family, text.c_str(), dst);
+#endif
+    }
 };
 
 /**
@@ -113,9 +128,3 @@ async_accept_socket(fd_workqueue<lock, Reactor>& fwq, tcp_listener<lock, Reactor
 }
 
 } // namespace co_wq::net
-
-#else
-
-// This header is unused on Windows platforms.
-
-#endif // !_WIN32

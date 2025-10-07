@@ -29,6 +29,7 @@ static std::atomic<uint64_t>                 g_bytes_echoed { 0 };
 static std::atomic<int>                      g_listener_fd { -1 }; // for forced close
 static std::chrono::steady_clock::time_point g_server_start;
 
+using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
 #ifdef _WIN32
 #include <windows.h>
 static BOOL WINAPI console_ctrl_handler(DWORD type)
@@ -72,7 +73,7 @@ static Task<void, Work_Promise<SpinLock, void>> echo_conn(net::tcp_socket<SpinLo
 
 // server coroutine: listen on 127.0.0.1:12345 and accept a single client then exit
 static Task<void, Work_Promise<SpinLock, void>>
-echo_server(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port, int max_conn)
+echo_server(NetFdWorkqueue& fdwq, std::string host, uint16_t port, int max_conn)
 {
     net::tcp_listener<SpinLock> lst(fdwq.base(), fdwq.reactor());
     lst.bind_listen(host, port, 16);
@@ -107,8 +108,7 @@ echo_server(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port, 
     co_return;
 }
 
-static Task<void, Work_Promise<SpinLock, void>>
-echo_client(net::fd_workqueue<SpinLock>& fdwq, std::string host, uint16_t port)
+static Task<void, Work_Promise<SpinLock, void>> echo_client(NetFdWorkqueue& fdwq, std::string host, uint16_t port)
 {
     auto sock = fdwq.make_tcp_socket();
     int  rc   = co_await sock.connect(host, port);
@@ -198,7 +198,7 @@ int main(int argc, char* argv[])
     }
     // 0 => 自动检测线程数
     auto&                                    wq = get_sys_workqueue(0);
-    net::fd_workqueue<SpinLock>              fdwq(wq); // 外部创建并传入协程
+    NetFdWorkqueue                           fdwq(wq); // 外部创建并传入协程
     Task<void, Work_Promise<SpinLock, void>> server_task { nullptr };
     Task<void, Work_Promise<SpinLock, void>> client_task { nullptr };
     Task<void, Work_Promise<SpinLock, void>> udp_server_task { nullptr };

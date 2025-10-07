@@ -99,6 +99,7 @@ target("co_wq")
         if is_plat("windows") then
             add_links("Ws2_32")
             add_includedirs("net/win", {public = true})
+            add_files("io/wepoll/wepoll.c")
             if has_config("MSVC_ITERATOR_DEBUG") then
                 add_defines("_ITERATOR_DEBUG_LEVEL=2")
                 add_defines("_DISABLE_VECTOR_ALGORITHMS")

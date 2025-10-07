@@ -12,6 +12,8 @@
 
 using namespace co_wq;
 
+using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
+
 struct UdsOptions {
     bool        run_server { true };
     bool        run_client { true };
@@ -72,8 +74,7 @@ static Task<void, Work_Promise<SpinLock, void>> uds_echo_conn(net::unix_socket<S
     co_return;
 }
 
-static Task<void, Work_Promise<SpinLock, void>>
-uds_server(net::fd_workqueue<SpinLock>& fdwq, const std::string path, int max_conn)
+static Task<void, Work_Promise<SpinLock, void>> uds_server(NetFdWorkqueue& fdwq, const std::string path, int max_conn)
 {
     net::unix_listener<SpinLock> lst(fdwq.base(), fdwq.reactor());
     lst.bind_listen(path, 16);
@@ -94,7 +95,7 @@ uds_server(net::fd_workqueue<SpinLock>& fdwq, const std::string path, int max_co
 }
 
 static Task<void, Work_Promise<SpinLock, void>>
-uds_client(net::fd_workqueue<SpinLock>& fdwq, const std::string path, const std::string message)
+uds_client(NetFdWorkqueue& fdwq, const std::string path, const std::string message)
 {
     auto sock = fdwq.make_unix_socket();
     if (co_await sock.connect(path) != 0) {
@@ -121,7 +122,7 @@ int main(int argc, char* argv[])
         return 0;
     }
     auto&                                    wq = get_sys_workqueue(0);
-    net::fd_workqueue<SpinLock>              fdwq(wq);
+    NetFdWorkqueue                           fdwq(wq);
     Task<void, Work_Promise<SpinLock, void>> server_task { nullptr };
     Task<void, Work_Promise<SpinLock, void>> client_task { nullptr };
     if (options.run_server)
