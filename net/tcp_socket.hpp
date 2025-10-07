@@ -111,7 +111,7 @@ public:
             std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> guard(result, ::freeaddrinfo);
             for (auto* ai = result; ai; ai = ai->ai_next) {
                 if (ai->ai_family == sock.family()) {
-                    if (ai->ai_addrlen > sizeof(storage))
+                    if (static_cast<size_t>(ai->ai_addrlen) > sizeof(storage))
                         continue;
                     std::memcpy(&storage, ai->ai_addr, ai->ai_addrlen);
                     len = static_cast<socklen_t>(ai->ai_addrlen);
@@ -143,7 +143,7 @@ public:
 
         [[nodiscard]] bool build(sockaddr_storage& storage, socklen_t& len) const noexcept
         {
-            if (length == 0 || length > sizeof(storage))
+            if (length == 0 || static_cast<size_t>(length) > sizeof(storage))
                 return false;
             std::memcpy(&storage, &address, length);
             len = length;
