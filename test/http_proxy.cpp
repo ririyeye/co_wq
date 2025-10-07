@@ -195,12 +195,15 @@ std::string format_peer_id(int fd)
 }
 
 template <typename SrcSocket, typename DstSocket>
-Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown)
+Task<void, Work_Promise<SpinLock, void>>
+pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string flow_desc)
 {
+    const char*            flow = flow_desc.empty() ? "stream" : flow_desc.c_str();
     std::array<char, 8192> buffer {};
     while (true) {
         ssize_t n = co_await src.recv(buffer.data(), buffer.size());
         if (n == 0) {
+            CO_WQ_LOG_DEBUG("[proxy] %s closed (EOF)", flow);
             if (propagate_shutdown) {
                 if constexpr (requires(DstSocket& s) {
                                   s.tx_shutdown();
@@ -212,18 +215,23 @@ Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket& src, DstSocket& ds
             }
             break;
         }
-        if (n < 0)
+        if (n < 0) {
+            CO_WQ_LOG_WARN("[proxy] %s recv error rc=%lld", flow, static_cast<long long>(n));
             break;
+        }
 
         size_t offset = 0;
         while (offset < static_cast<size_t>(n)) {
             ssize_t sent = co_await dst.send(buffer.data() + offset, static_cast<size_t>(n) - offset);
-            if (sent <= 0)
+            if (sent <= 0) {
+                CO_WQ_LOG_WARN("[proxy] %s send error rc=%lld", flow, static_cast<long long>(sent));
                 co_return;
+            }
             offset += static_cast<size_t>(sent);
         }
     }
 
+    CO_WQ_LOG_DEBUG("[proxy] %s forwarding finished", flow);
     co_return;
 }
 
@@ -608,10 +616,15 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     configure_tcp_keepalive(client, peer_id, "client");
     configure_tcp_keepalive(upstream, peer_id, "upstream");
 
-    auto client_to_upstream = pipe_data(client, upstream, false);
-    auto upstream_to_client = pipe_data(upstream, client, true);
+    auto client_to_upstream = pipe_data(client, upstream, false, peer_id + " client->upstream");
+    auto upstream_to_client = pipe_data(upstream,
+                                        client,
+                                        true,
+                                        peer_id + " upstream->client " + format_host_for_log(target.host) + ':'
+                                            + std::to_string(target.port));
     co_await co_wq::when_all(client_to_upstream, upstream_to_client);
 
+    CO_WQ_LOG_INFO("[proxy] %s tunnel closed", peer_id.c_str());
     client.close();
     upstream.close();
     co_return;
@@ -658,8 +671,16 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
     configure_tcp_keepalive(client, peer_id, "client");
     configure_tcp_keepalive(upstream, peer_id, "upstream");
 
-    co_await pipe_data(upstream, client, false);
+    co_await pipe_data(upstream,
+                       client,
+                       false,
+                       peer_id + " upstream->client " + format_host_for_log(parts.host) + ':'
+                           + std::to_string(parts.port));
 
+    CO_WQ_LOG_INFO("[proxy] %s %s:%u response completed",
+                   peer_id.c_str(),
+                   format_host_for_log(parts.host).c_str(),
+                   static_cast<unsigned>(parts.port));
     client.close();
     upstream.close();
     co_return;
