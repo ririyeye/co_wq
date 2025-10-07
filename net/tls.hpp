@@ -64,6 +64,9 @@ namespace detail {
         return ctx;
     }
 
+    /**
+     * @brief 将 OpenSSL 错误栈收集为字符串。
+     */
     inline std::string collect_errors()
     {
         BIO* bio = BIO_new(BIO_s_mem());
@@ -77,6 +80,9 @@ namespace detail {
         return out;
     }
 
+    /**
+     * @brief 将 OpenSSL 错误码转换为统一的负 errno。
+     */
     inline int translate_failure(int ssl_err)
     {
         switch (ssl_err) {
@@ -91,6 +97,12 @@ namespace detail {
         }
     }
 
+    /**
+     * @brief 将跨平台 `os::fd_t` 转换为 OpenSSL 所需的 int fd。
+     *
+     * 在 Windows 上会检查 HANDLE 是否超出 int 范围，否则抛出异常；在类 Unix 平台直接
+     * 静态转换。
+     */
     inline int to_ssl_fd(os::fd_t fd)
     {
 #if defined(_WIN32)
@@ -105,6 +117,9 @@ namespace detail {
 
 } // namespace detail
 
+/**
+ * @brief TLS 上下文封装，管理 `SSL_CTX` 生命周期。
+ */
 class tls_context {
 public:
     tls_context() = default;
@@ -115,12 +130,21 @@ public:
 
     bool valid() const noexcept { return static_cast<bool>(_ctx); }
 
+    /**
+     * @brief 根据模式创建内置 TLS 上下文。
+     */
     static tls_context make(tls_mode mode)
     {
         detail::ensure_global_init();
         return tls_context { std::shared_ptr<SSL_CTX>(detail::make_ctx(mode), detail::ssl_ctx_deleter {}) };
     }
 
+    /**
+     * @brief 创建服务器上下文并加载 PEM 证书/私钥。
+     *
+     * @param cert_path 证书路径。
+     * @param key_path  私钥路径。
+     */
     static tls_context make_server_with_pem(const std::string& cert_path, const std::string& key_path)
     {
         auto ctx = make(tls_mode::Server);
@@ -137,6 +161,9 @@ private:
     std::shared_ptr<SSL_CTX> _ctx;
 };
 
+/**
+ * @brief DTLS 上下文封装。
+ */
 class dtls_context {
 public:
     dtls_context() = default;
@@ -147,12 +174,18 @@ public:
 
     bool valid() const noexcept { return static_cast<bool>(_ctx); }
 
+    /**
+     * @brief 根据模式创建内置 DTLS 上下文。
+     */
     static dtls_context make(dtls_mode mode)
     {
         detail::ensure_global_init();
         return dtls_context { std::shared_ptr<SSL_CTX>(detail::make_dtls_ctx(mode), detail::ssl_ctx_deleter {}) };
     }
 
+    /**
+     * @brief 创建 DTLS 服务器上下文并加载 PEM 证书/私钥。
+     */
     static dtls_context make_server_with_pem(const std::string& cert_path, const std::string& key_path)
     {
         auto ctx = make(dtls_mode::Server);
@@ -169,6 +202,11 @@ private:
     std::shared_ptr<SSL_CTX> _ctx;
 };
 
+/**
+ * @brief 通用 TLS 套接字封装，组合底层传输 socket 与 OpenSSL `SSL` 对象。
+ *
+ * 模板参数允许在 TCP、UDP (DTLS) 等不同传输之上复用同一套 awaiter/缓冲逻辑。
+ */
 template <lockable lock, template <class> class Reactor, class TransportSocket, class Context> class basic_tls_socket {
 public:
     using transport_type = TransportSocket;

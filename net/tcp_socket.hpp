@@ -26,6 +26,11 @@ template <co_wq::lockable lock, template <class> class Reactor> class fd_workque
 
 /**
  * @brief 基于 `stream_socket_base` 的 TCP socket 实现。
+ *
+ * 特性：
+ * - 提供 DNS 解析和原始地址两种 `connect` 入口；
+ * - 支持 IPv6 双栈模式，在同一 socket 上同时接受 IPv4/IPv6；
+ * - 复用基类中的 `send`/`recv` Awaiter，并在 Windows/Linux 之间保持统一接口。
  */
 template <co_wq::lockable lock, template <class> class Reactor = epoll_reactor>
 class tcp_socket : public detail::stream_socket_base<tcp_socket<lock, Reactor>, lock, Reactor> {
@@ -63,6 +68,11 @@ public:
 
     /**
      * @brief 通用目标描述体，根据地址族/双栈配置解析目标。
+     */
+    /**
+     * @brief 描述一个通过 DNS 解析的远端。
+     *
+     * 在 `connect_with` 中使用 `build` 方法将文本地址转换为 `sockaddr_storage`。
      */
     struct dns_endpoint {
         const tcp_socket& sock;
@@ -124,6 +134,9 @@ public:
         }
     };
 
+    /**
+     * @brief 封装现成的 `sockaddr`，用于快速发起 `connect`。
+     */
     struct raw_endpoint {
         sockaddr_storage address {};
         socklen_t        length { 0 };
@@ -140,12 +153,22 @@ public:
 
     /**
      * @brief 发起异步连接。
+     *
+     * @param host 文本形式的主机名或 IP。
+     * @param port 端口号。
+     * @return 返回一个可 `co_await` 的 Awaiter。
      */
     auto connect(const std::string& host, uint16_t port)
     {
         return this->connect_with(dns_endpoint { *this, host, port, dual_stack() });
     }
 
+    /**
+     * @brief 使用原始 `sockaddr` 发起连接。
+     *
+     * @param addr 目标地址指针。
+     * @param len  目标地址长度。
+     */
     auto connect(const sockaddr* addr, socklen_t len)
     {
         raw_endpoint endpoint;
@@ -158,6 +181,14 @@ public:
 
 private:
     friend class fd_workqueue<lock, Reactor>;
+    /**
+     * @brief 通过 fd 工作队列创建新的 TCP socket。
+     *
+     * @param exec               绑定的执行器。
+     * @param reactor            reactor 实例。
+     * @param fam                地址族。
+     * @param enable_dual_stack  初始化 IPv6 socket 时是否启用双栈。
+     */
     explicit tcp_socket(workqueue<lock>& exec,
                         Reactor<lock>&   reactor,
                         int              fam               = AF_INET,
@@ -169,6 +200,9 @@ private:
             os::setsockopt(this->native_handle(), IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
         }
     }
+    /**
+     * @brief 通过 `fd_workqueue::adopt_tcp_socket` 接管现有 fd。
+     */
     tcp_socket(int fd, workqueue<lock>& exec, Reactor<lock>& reactor) : base(fd, exec, reactor)
     {
         if (this->family() == AF_INET6)
@@ -193,6 +227,10 @@ private:
 
 /**
  * @brief 以 Task 形式封装 `tcp_socket::connect`。
+ *
+ * @param s    Socket 实例。
+ * @param host 目标主机。
+ * @param port 目标端口。
  */
 template <co_wq::lockable lock>
 inline Task<int, Work_Promise<lock, int>> async_connect(tcp_socket<lock>& s, const std::string host, uint16_t port)
@@ -202,6 +240,10 @@ inline Task<int, Work_Promise<lock, int>> async_connect(tcp_socket<lock>& s, con
 
 /**
  * @brief 发送全部缓冲区数据，返回成功字节数。
+ *
+ * @param s   Socket 实例。
+ * @param buf 待发送数据。
+ * @param len 数据长度。
  */
 template <co_wq::lockable lock>
 inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>>
@@ -212,6 +254,10 @@ async_send_all(tcp_socket<lock>& s, const void* buf, size_t len)
 
 /**
  * @brief writev 版本的全量发送。
+ *
+ * @param s     Socket 实例。
+ * @param iov   `iovec` 数组。
+ * @param iovcnt 数组元素个数。
  */
 template <co_wq::lockable lock>
 inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>>
@@ -222,6 +268,10 @@ async_sendv_all(tcp_socket<lock>& s, const os::iovec* iov, int iovcnt)
 
 /**
  * @brief 读取部分数据（至少一次）。
+ *
+ * @param s   Socket 实例。
+ * @param buf 存放数据的缓冲区。
+ * @param len 缓冲区长度。
  */
 template <co_wq::lockable lock>
 inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>> async_recv_some(tcp_socket<lock>& s, void* buf, size_t len)
@@ -231,6 +281,10 @@ inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>> async_recv_some(tcp_so
 
 /**
  * @brief 读取固定长度数据。
+ *
+ * @param s   Socket 实例。
+ * @param buf 存放数据的缓冲区。
+ * @param len 期望读取的字节数。
  */
 template <co_wq::lockable lock>
 inline Task<os::ssize_t, Work_Promise<lock, os::ssize_t>> async_recv_all(tcp_socket<lock>& s, void* buf, size_t len)

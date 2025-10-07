@@ -27,23 +27,40 @@ namespace co_wq::net {
 inline constexpr int k_accept_fatal = -2; // fatal error permanent for this try
 
 /**
- * @brief TCP 监听器，提供 bind+listen 及异步 accept 能力。
+ * @brief TCP 监听器，提供地址绑定、监听与协程化 `accept` 能力。
+ *
+ * 典型流程为：
+ * 1. 构造监听器并传入系统工作队列与 reactor；
+ * 2. 调用 `bind_listen` 绑定地址并开始监听；
+ * 3. `co_await listener.accept()` 获取新连接 fd，然后交给 `tcp_socket` 继续处理。
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor>
 class tcp_listener : public detail::stream_listener_base<tcp_listener<lock, Reactor>, lock, Reactor> {
     using base = detail::stream_listener_base<tcp_listener<lock, Reactor>, lock, Reactor>;
 
 public:
+    /**
+     * @brief 创建一个 TCP 监听器并立即生成底层非阻塞 socket。
+     *
+     * @param exec   绑定的系统工作队列。
+     * @param reactor 事件反应器实例。
+     * @param family 地址族，默认为 `AF_INET`，可选 `AF_INET6`。
+     */
     explicit tcp_listener(workqueue<lock>& exec, Reactor<lock>& reactor, int family = AF_INET)
         : base(exec, reactor, family, SOCK_STREAM)
     {
     }
 
     /**
-     * @brief 绑定并监听。
-     * @param host 监听地址("0.0.0.0" 或 空 字符串 表示 INADDR_ANY)。
-     * @param port 端口。
-     * @param backlog listen backlog。
+     * @brief 绑定地址并开始监听。
+     *
+     * @param host       监听地址。IPv4 下传入空串/`0.0.0.0` 表示 `INADDR_ANY`；IPv6 下可传
+     *                   入如 `[::1]` 的文本形式，函数会自动去除方括号。
+     * @param port       监听端口。
+     * @param backlog    `listen` 的 backlog 参数，决定半连接队列大小。
+     * @param dual_stack 当监听 IPv6 时是否允许双栈。true 表示允许同时接受 IPv4/IPv6。
+     *
+     * @throws std::runtime_error 绑定或监听失败时抛出。
      */
     void bind_listen(const std::string& host, uint16_t port, int backlog = 128, bool dual_stack = false)
     {
@@ -99,7 +116,9 @@ private:
 
 /**
  * @brief 异步等待一个新的 TCP 连接。
- * @return 成功时返回新 fd，致命错误返回 `k_accept_fatal`。
+ *
+ * @param lst 监听器实例。
+ * @return 成功时返回新连接 fd；若遇到致命错误则返回 `k_accept_fatal`。
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor>
 inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock, Reactor>& lst)
@@ -111,7 +130,10 @@ inline Task<int, Work_Promise<lock, int>> async_accept(tcp_listener<lock, Reacto
 // 辅助: 若成功返回已创建的 tcp_socket，否则返回一个已关闭的占位 socket
 /**
  * @brief 接受连接并自动封装为 `tcp_socket`。
- * @return 成功返回已就绪的 socket，否则返回一个已关闭的占位实例。
+ *
+ * @param fwq  fd 工作队列，用于创建/接管 `tcp_socket` 对象。
+ * @param lst 监听器实例。
+ * @return 成功返回已就绪的 socket；若遇到致命错误，则返回一个 `close()` 后的占位实例。
  */
 template <lockable lock, template <class> class Reactor = epoll_reactor>
 inline Task<tcp_socket<lock, Reactor>, Work_Promise<lock, tcp_socket<lock, Reactor>>>

@@ -31,10 +31,16 @@ using os::iovec;
 using os::ssize_t;
 
 /**
- * @brief 所有 socket 类型共享的基础核心类，负责 fd 生命周期与 reactor 登记。
+ * @brief 所有 socket 类型共享的基础核心类，负责 fd 生命周期、reactor 登记与串行队列初始化。
  *
- * @tparam lock 工作队列锁类型。
- * @tparam Reactor 反应器模板，需提供 `add_fd/remove_fd/add_waiter` 等接口。
+ * 该类不直接暴露给使用者，而是作为 `stream_socket_base` / `datagram_socket_base` 的基类存在，
+ * 提供如下能力：
+ * - 创建或接管底层 fd，并在构造时注册到指定 reactor；
+ * - 提供串行化发送/接收队列，用于保证 awaiter 的 FIFO 顺序；
+ * - 在析构或 `close_fd()` 时统一清理由 awaiter 留下的回调节点。
+ *
+ * @tparam lock    工作队列锁类型，例如 `SpinLock` 或 `std::mutex`。
+ * @tparam Reactor 反应器模板，需要实现 `add_fd/remove_fd/add_waiter[_custom]` 等接口。
  */
 template <lockable lock, template <class> class Reactor> class socket_core {
 public:
@@ -89,6 +95,16 @@ public:
     int family() const noexcept { return _family; }
 
 protected:
+    /**
+     * @brief 以给定参数创建一个新的 socket 并注册到 reactor。
+     *
+     * @param exec     绑定的执行器，所有唤醒操作都会被投递到该工作队列。
+     * @param reactor  负责事件驱动的反应器实例。
+     * @param domain   地址族，例如 `AF_INET`、`AF_INET6`。
+     * @param type     套接字类型，通常为 `SOCK_STREAM` 或 `SOCK_DGRAM`。
+     * @param protocol 协议号，默认 0 意味着由系统推导。
+     * @throws std::runtime_error 创建 socket 失败时抛出异常。
+     */
     socket_core(workqueue<lock>& exec, Reactor<lock>& reactor, int domain, int type, int protocol = 0)
         : _exec(exec), _reactor(&reactor), _family(domain), _cbq(exec)
     {
@@ -97,6 +113,14 @@ protected:
             throw std::runtime_error("socket failed");
         init_fd();
     }
+    /**
+     * @brief 接管一个已经存在的非阻塞 socket。
+     *
+     * @param fd    需接管的文件描述符。
+     * @param exec  绑定的执行器。
+     * @param reactor 事件反应器，接管后会将 fd 注册进去。
+     * @throws std::runtime_error 当传入的 fd 无效时抛出异常。
+     */
     socket_core(fd_t fd, workqueue<lock>& exec, Reactor<lock>& reactor)
         : _exec(exec), _reactor(&reactor), _fd(fd), _cbq(exec)
     {
@@ -127,10 +151,18 @@ protected:
     /**
      * @brief connect 协程的 awaiter，实现 EINPROGRESS -> 等待 EPOLLOUT 的流程。
      */
+    /**
+     * @brief connect 协程的 awaiter，实现 EINPROGRESS -> 等待 EPOLLOUT 的流程。
+     *
+     * Provider 需提供 `bool build(sockaddr_storage&, socklen_t&)` 方法，用于构造目标地址。
+     */
     template <class Derived, class Provider> struct connect_awaiter : io_waiter_base {
+        /** @brief Socket 派生类型的引用，用于访问 fd 与执行器。 */
         Derived& owner;
+        /** @brief 构造目标地址的 provider。 */
         Provider provider;
-        int      ret { 0 };
+        /** @brief connect 结果，0 表示成功，-1 表示失败。 */
+        int ret { 0 };
         connect_awaiter(Derived& s, Provider p) : owner(s), provider(std::move(p))
         {
             auto& cbq = owner.callback_queue();
@@ -210,7 +242,12 @@ private:
 };
 
 /**
- * @brief 面向流式 socket 的公共基类，封装读写 awaiter 与状态位。
+ * @brief 面向流式 socket 的公共基类，封装 connect/recv/send Awaiter 与半双工状态。
+ *
+ * 该基类提供：
+ * - `recv`/`recv_all`、`send`/`send_all` 等常用 Awaiter；
+ * - 通过串行化队列保证同一 socket 上的 awaiter 逻辑顺序；
+ * - 对端关闭、发送半关闭等状态位管理。
  */
 template <class Derived, lockable lock, template <class> class Reactor>
 class stream_socket_base : public socket_core<lock, Reactor> {
@@ -263,11 +300,22 @@ public:
     /**
      * @brief 非阻塞 recv 协程驱动器，支持全量/部分读取。
      */
+    /**
+     * @brief 面向流式 socket 的非阻塞读取 Awaiter。
+     *
+     * 支持“尽量读一些”与“必须读满”两种模式：当 `full` 为 true 时，Awaiter 会持续尝试直到
+     * 读取到指定长度或遇到 EOF；否则在读取到任意正字节数后立即返回。
+     */
     struct recv_awaiter : two_phase_drain_awaiter<recv_awaiter, Derived> {
-        bool    full { false };
-        char*   buf { nullptr };
-        size_t  len { 0 };
-        size_t  recvd { 0 };
+        /** @brief 是否开启“必须读满”模式。 */
+        bool full { false };
+        /** @brief 用户提供的缓冲区指针。 */
+        char* buf { nullptr };
+        /** @brief 期望读取的字节数。 */
+        size_t len { 0 };
+        /** @brief 已经成功读取的字节数。 */
+        size_t recvd { 0 };
+        /** @brief 当首次读取失败时记录的错误码。 */
         ssize_t err { 0 };
         recv_awaiter(Derived& s, void* b, size_t l, bool f)
             : two_phase_drain_awaiter<recv_awaiter, Derived>(s, s.recv_queue())
@@ -314,14 +362,27 @@ public:
     /**
      * @brief 非阻塞 send/writev 协程驱动器，支持全量发送。
      */
+    /**
+     * @brief 面向流式 socket 的非阻塞写入 Awaiter。
+     *
+     * 支持缓冲区与 `iovec` 两种输入形式，并能在“写满”为 true 时自动循环发送直到所有数据
+     * 写入或出现错误。Awaiter 会自动处理 `EPIPE`/`ECONNRESET` 并标记写半部关闭。
+     */
     struct send_awaiter : two_phase_drain_awaiter<send_awaiter, Derived> {
-        bool               full { false };
-        const char*        buf { nullptr };
-        size_t             len { 0 };
+        /** @brief 是否要求写满。 */
+        bool full { false };
+        /** @brief 缓冲区指针，`use_vec` 为 false 时有效。 */
+        const char* buf { nullptr };
+        /** @brief 待写入总字节数。 */
+        size_t len { 0 };
+        /** @brief `writev` 模式下的向量数组。 */
         std::vector<iovec> vec;
-        bool               use_vec { false };
-        size_t             sent { 0 };
-        ssize_t            err { 0 };
+        /** @brief 是否启用 `iovec` 发送路径。 */
+        bool use_vec { false };
+        /** @brief 已写入字节数。 */
+        size_t sent { 0 };
+        /** @brief 记录首次出现的错误。 */
+        ssize_t err { 0 };
         send_awaiter(Derived& s, const void* b, size_t l, bool f)
             : two_phase_drain_awaiter<send_awaiter, Derived>(s, s.send_queue())
             , full(f)
@@ -447,7 +508,7 @@ private:
 };
 
 /**
- * @brief UDP/Unix Datagram 通用基类，提供 recvfrom/sendto awaiter。
+ * @brief UDP/Unix Datagram 通用基类，提供 connect/recvfrom/sendto Awaiter。
  */
 template <class Derived, lockable lock, template <class> class Reactor, class Address, class AddressLen>
 class datagram_socket_base : public socket_core<lock, Reactor> {
@@ -473,6 +534,9 @@ public:
 
     /**
      * @brief recvfrom 协程驱动器。
+     */
+    /**
+     * @brief datagram 套接字的接收 Awaiter，支持携带源地址返回值。
      */
     struct recvfrom_awaiter : two_phase_drain_awaiter<recvfrom_awaiter, Derived> {
         void*                buf { nullptr };
@@ -519,6 +583,9 @@ public:
 
     /**
      * @brief send/sendto/sendmsg 协程驱动器。
+     */
+    /**
+     * @brief datagram 套接字的发送 Awaiter，支持 `sendto` 与 `writev` 两种调用路径。
      */
     struct send_awaiter : two_phase_drain_awaiter<send_awaiter, Derived> {
         struct dest_info {

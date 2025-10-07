@@ -19,11 +19,16 @@
 namespace co_wq::net::detail {
 
 /**
- * @brief 提供通用监听 socket 能力的 CRTP 基类。
+ * @brief 提供跨平台监听 socket 能力的 CRTP 基类。
  *
- * @tparam Derived 派生类类型，需要提供 `accept()` 的具体行为，可选定义 `k_accept_fatal` 常量。
- * @tparam lock 工作队列锁类型，需满足 `lockable` 概念。
- * @tparam Reactor 反应器模板，负责事件注册与派发。
+ * 该基类封装了监听 socket 的生命周期管理、与 reactor 的交互以及一个通用的 `accept`
+ * Awaiter，供 TCP/Unix Domain 等上层监听器复用。派生类只需负责绑定地址、设置套接字
+ * 选项等协议相关细节，即可获得统一的协程化接受逻辑。
+ *
+ * @tparam Derived 派生类类型，需要提供 `accept()` 的具体行为，可选定义 `k_accept_fatal` 常量
+ *                以描述不可恢复错误时的返回值。
+ * @tparam lock   工作队列锁类型，需满足 `lockable` 概念，通常为 `SpinLock` 或互斥量。
+ * @tparam Reactor 反应器模板，负责事件注册与派发，例如 `epoll_reactor` 或 `iocp_reactor`。
  */
 template <class Derived, lockable lock, template <class> class Reactor> class stream_listener_base {
 
@@ -31,6 +36,12 @@ public:
     /**
      * @brief 获取致命错误返回值。
      * @return 返回派生类自定义的常量，缺省为 -2，表示 accept 无法恢复。
+     */
+    /**
+     * @brief 获取 awaiter 判定的致命错误返回值。
+     *
+     * 若派生类提供了 `Derived::k_accept_fatal` 常量，则优先返回该值；否则默认返回 -2。
+     * 调用者可据此判断错误是否可重试。
      */
     static constexpr int accept_fatal()
     {
@@ -70,6 +81,11 @@ public:
     /**
      * @brief 关闭监听 socket 并移除 reactor 注册。
      */
+    /**
+     * @brief 关闭监听 socket 并解除 Reactor 注册。
+     *
+     * 当监听器正在被协程等待时，关闭操作会在下一次调度时唤醒 awaiter 并返回错误。
+     */
     void close()
     {
         if (_fd != os::invalid_fd()) {
@@ -85,21 +101,41 @@ public:
     /** @brief 返回绑定的工作队列。 */
     workqueue<lock>& exec() { return _exec; }
     int              family() const noexcept { return _family; }
-    /** @brief 返回关联的 reactor。 */
+    /**
+     * @brief 返回关联的 reactor。
+     * @return 若监听器注册在 reactor 上，则返回其指针；否则返回 nullptr。
+     */
     Reactor<lock>* reactor() { return _reactor; }
 
     /**
      * @brief 异步 accept 的 awaiter。
+     *
+     * awaiter 将在调用 `co_await` 时立即尝试非阻塞 `accept`，若未能完成则挂起当前协程并
+     * 将监听 fd 注册到 reactor，等待下一次可读事件。协程恢复后会返回新连接的 fd，或在
+     * 遇到不可恢复错误时返回 `accept_fatal()`。
      */
     struct accept_awaiter : io_waiter_base {
+        /** @brief 对应的监听器引用，用于访问底层 fd 与 reactor。 */
         stream_listener_base& lst;
-        int                   newfd { -1 };
+        /** @brief 本次 `accept` 的结果，成功时为新 fd，失败时为负值。 */
+        int newfd { -1 };
         explicit accept_awaiter(stream_listener_base& l) : lst(l) { }
+        /**
+         * @brief 首次尝试接受连接。
+         *
+         * @retval true  `accept` 已经完成，协程可直接继续执行。
+         * @retval false 需要等待 reactor 事件，协程将被挂起。
+         */
         bool await_ready() noexcept
         {
             newfd = try_accept();
             return newfd >= 0 || newfd == accept_fatal();
         }
+        /**
+         * @brief 在 `accept` 尚未完成时挂起协程，并将 awaiter 注册到 reactor。
+         *
+         * @param resume_handle 协程恢复所用的句柄，由调度器在事件就绪后回调。
+         */
         void await_suspend(std::coroutine_handle<> resume_handle)
         {
             this->h = resume_handle;
@@ -107,12 +143,25 @@ public:
             if (lst._reactor)
                 lst._reactor->add_waiter(lst._fd, EPOLLIN, this);
         }
+        /**
+         * @brief 返回最终的 `accept` 结果。
+         *
+         * @return 成功时为新建立连接的 fd；若遇到可重试错误则再次尝试一次；若遇到致命
+         *         错误则返回 `accept_fatal()`。
+         */
         int await_resume() noexcept
         {
             if (newfd >= 0 || newfd == accept_fatal())
                 return newfd;
             return try_accept();
         }
+        /**
+         * @brief 执行一次非阻塞 `accept`。
+         *
+         * @retval >=0  新连接 fd。
+         * @retval -1   当前没有待接受的连接，可在 reactor 事件后重试。
+         * @retval accept_fatal() 发生不可恢复错误。
+         */
         int try_accept() noexcept
         {
             sockaddr_storage addr;

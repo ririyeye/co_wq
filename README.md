@@ -6,7 +6,8 @@
 - **零依赖、轻量化**：纯头文件实现，除标准库外不依赖第三方组件。
 - **可插拔执行器**：`workqueue<lock>` 支持自定义锁类型，适配不同并发模型。
 - **丰富 Awaiter**：信号量、定时器、串行化 IO、TCP/UDP/UDS 套接字等 awaiter 开箱即用。
-- **跨平台网络栈**：Linux 采用 `epoll`，Windows 通过 Wine+MSVC 配置使用 IOCP 封装。
+- **跨平台网络栈**：Linux 采用 `epoll`，Windows 通过 Wine+MSVC 配置使用 IOCP 封装，网络头
+  文件统一收敛至 `net/` 根目录，所有示例统一使用 `os::fd_t` 管理文件描述符。
 - **工具完善**：提供 `script/` 下的 xmake 构建脚本，自动生成 `compile_commands.json` 便于 IDE 使用。
 
 ## 目录总览
@@ -414,6 +415,8 @@ xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
 - `udp_socket<lock, Reactor>`：支持 `send_to/recv_from`、可选 `connect()`。
 - `unix_socket<lock, Reactor>` / `unix_listener<lock, Reactor>`：协程化 Unix Domain Stream 套接字（主要在类 Unix 平台可用），
   支持文件路径或以 `@` 开头的抽象命名空间，API 与 TCP 版本保持一致（`connect/recv/send`、`bind_listen/accept`）。
+- `tls_socket<lock, Reactor>` / `dtls_socket<lock, Reactor>`：基于 OpenSSL 的 TLS/DTLS 包装，
+  统一使用 `os::fd_t` 描述底层句柄，并提供 `send_all/recv_all` 等 awaiter。
 
 ## 设计与最佳实践
 - **锁策略**：默认锁类型为 `SpinLock`，如需与多线程配合可传入自定义互斥量（需满足 `lockable` 概念）。
