@@ -33,6 +33,8 @@
 - **超时处理**：`SemReqTimeoutAwaiter` / `NotifyReqTimeoutAwaiter` 利用 `Timer_check_queue` 的 `TimeoutNode`，只有在 `armed` 标志仍为真时才 resume，防止竞态。
 - **USB**：`io/usb_device.hpp` 启用 `USING_USB` 后可用；调用 libusb 同步 API，需要调用者自行放入后台线程或注意阻塞。
 - **示例执行**：示例任务通过 `post_to` 投递到 `get_sys_workqueue()`；`sys_wait_until` 轮询标志等待完成。
+- **HTTP 代理日志**：`co_http_proxy` 默认将调试级日志写入 `logs/proxy.log`（启动时自动截断）并同步到控制台，可用 `--log-file` 覆盖路径、`--log-append/--no-log-truncate` 关闭截断、`--no-verbose`/`--quiet` 下调日志级别；隧道两端的 EOF/错误会在日志中标明具体流向（`client->upstream` 等）。
+- **代理探针脚本**：`tools/proxy_probe.py` 执行 HTTP/HTTPS/CONNECT 测试时，会对每次失败立即打印 `[failure] target=... reason=... local_port=... latency=...`，同时在汇总统计中保留最多 10 条样本，便于与代理日志或抓包结果对照。
 
 ## 推荐工作流
 - 添加新 awaiter 时参考 `io/file_io.hpp` 的 two-phase 模式：尝试->注册等待->复用同一节点。

@@ -262,13 +262,19 @@ curl --proxy http://127.0.0.1:18080 https://example.com --proxytunnel
 
 > ⚠️ 当前实现的 CONNECT 隧道在长时间的 HTTPS 回源（尤其是大响应体或慢速服务器）场景下仍存在偶发截断问题。若用于排查代理稳定性，请优先关注 HTTP 目标；HTTPS 用例建议配合抓包/日志确认结果，并关注后续修复进展。
 
-程序默认开启调试日志（输出到 `stderr`），包含时间戳、线程 ID 以及关键事件，例如“收到请求”“上游连接结果”“CONNECT 隧道关闭”等。可使用标准重定向将日志落地：
+程序默认将调试级日志写入 `logs/proxy.log`（启动时自动创建目录并按运行前截断），并把同一份日志同步到控制台。命令行提供以下开关调整行为：
+
+- `--no-verbose` / `--quiet`：分别将日志级别降到 `info` / `warn`；
+- `--log-append`（或 `--no-log-truncate`）：改为追加日志而非截断；
+- `--log-file <path>`：自定义日志文件路径。
+
+运行示例：
 
 ```bash
-xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
+xmake run co_http_proxy --host 127.0.0.1 --port 18100 --log-file logs/proxy-alt.log --log-append
 ```
 
-如需关闭日志，可在源码中将 `g_debug_logging` 初始化为 `false`，或依据自身需求扩展命令行开关。
+最新版本在 CONNECT 隧道和 HTTP 回源的双向转发中增加了详细的流向日志（如 `client->upstream`、`upstream->client`）以及 EOF/错误提示，便于快速定位哪一端提前断开。
 
 ### Proxy 稳定性测试工具
 
@@ -299,7 +305,7 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18080 2>proxy.log
 
   脚本会根据 URL 的 scheme 自动选择 HTTP 或 HTTPS 请求流程；同一轮测试可混合多个类型并同时串联若干 CONNECT 目标。
 
-  脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。失败样本现在会额外标注发起请求时的本地端口（例如 `local:13987`），方便和代理日志或抓包记录进行交叉比对。
+  脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。每次请求一旦失败会立即输出形如 `[failure] target=... reason=...` 的行，并携带本地端口与延迟信息，同时在汇总表中保留最多 10 条失败样本，方便与代理日志或抓包记录交叉排查。
 
 2. **抓包辅助脚本**：`tools/capture_proxy.py` 基于 Python 调用 Wireshark `dumpcap`，用于捕获代理本地端口及目标服务器流量，默认行为等同于旧版 `capture_proxy.bat`。
 
