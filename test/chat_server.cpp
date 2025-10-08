@@ -6,6 +6,7 @@
 #include "semaphore.hpp"
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
+#include "test_sys_stats_logger.hpp"
 #include "when_all.hpp"
 
 #if defined(USING_SSL)
@@ -1221,7 +1222,7 @@ void setup_logging(Options& options)
     }
 }
 
-void log_metrics()
+void log_metrics(const co_wq::test::SysAllocatorSnapshot& snapshot)
 {
     auto   elapsed = std::chrono::steady_clock::now() - g_start_time;
     double seconds = std::chrono::duration_cast<std::chrono::duration<double>>(elapsed).count();
@@ -1232,9 +1233,14 @@ void log_metrics()
         static_cast<unsigned long long>(g_metrics.total_connections.load()),
         static_cast<unsigned long long>(g_metrics.total_pairings.load()),
         static_cast<unsigned long long>(g_metrics.total_errors.load()),
-        sys_sta.malloc_cnt,
-        sys_sta.free_cnt,
-        sys_sta.malloc_cnt - sys_sta.free_cnt);
+        snapshot.alloc_total,
+        snapshot.free_total,
+        snapshot.balance());
+}
+
+void log_metrics()
+{
+    log_metrics(co_wq::test::capture_sys_allocator_snapshot());
 }
 
 } // namespace
@@ -1299,23 +1305,11 @@ int main(int argc, char* argv[])
                        options.max_payload);
     }
 
-    std::atomic_bool metrics_thread_stop { false };
-    std::thread      metrics_thread([&]() {
-        using namespace std::chrono_literals;
-        auto                     sleep_chunk = 100ms;
-        auto                     sleep_goal  = 5s;
-        std::chrono::nanoseconds elapsed { 0 };
-        while (!metrics_thread_stop.load(std::memory_order_acquire)) {
-            if (elapsed >= sleep_goal) {
-                log_metrics();
-                elapsed = std::chrono::nanoseconds { 0 };
-            }
-            std::this_thread::sleep_for(sleep_chunk);
-            elapsed += sleep_chunk;
-        }
-        // final sample before exit
-        log_metrics();
-    });
+    co_wq::test::SysStatsLogger::Options stats_options;
+    stats_options.interval         = std::chrono::seconds(5);
+    stats_options.callback         = [](const co_wq::test::SysAllocatorSnapshot& snapshot) { log_metrics(snapshot); };
+    stats_options.emit_default_log = false;
+    co_wq::test::SysStatsLogger metrics_logger("chat", std::move(stats_options));
 
 #if defined(USING_SSL)
     std::optional<net::tls_context> tls_ctx;
@@ -1391,9 +1385,6 @@ int main(int argc, char* argv[])
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    metrics_thread_stop.store(true, std::memory_order_release);
-    if (metrics_thread.joinable())
-        metrics_thread.join();
     log_metrics();
     CO_WQ_LOG_INFO("[chat] shutdown complete");
     return 0;

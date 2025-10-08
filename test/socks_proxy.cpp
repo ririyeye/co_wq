@@ -6,6 +6,7 @@
 //
 
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
@@ -782,8 +783,9 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    auto&          wq = get_sys_workqueue(0);
-    NetFdWorkqueue fdwq(wq);
+    co_wq::test::SysStatsLogger stats_logger("socks_proxy");
+    auto&                       wq = get_sys_workqueue(0);
+    NetFdWorkqueue              fdwq(wq);
 
     CO_WQ_LOG_INFO("[socks] starting on %s:%u", host.c_str(), static_cast<unsigned>(port));
 

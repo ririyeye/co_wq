@@ -1,3 +1,5 @@
+#pragma once
+
 #include "lock.hpp"
 #include "timer.hpp"
 #include "workqueue.hpp"

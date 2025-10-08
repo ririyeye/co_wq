@@ -1,6 +1,7 @@
 
 // echo.cpp
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 
 #if defined(USING_NET)
 #include "fd_base.hpp"
@@ -197,6 +198,7 @@ int main(int argc, char* argv[])
 #endif
     }
     // 0 => 自动检测线程数
+    co_wq::test::SysStatsLogger              stats_logger("echo");
     auto&                                    wq = get_sys_workqueue(0);
     NetFdWorkqueue                           fdwq(wq); // 外部创建并传入协程
     Task<void, Work_Promise<SpinLock, void>> server_task { nullptr };

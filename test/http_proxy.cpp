@@ -4,6 +4,7 @@
 // 使用 fd_workqueue 接受客户端连接、解析请求并桥接到上游服务器。
 
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 
 #include "fd_base.hpp"
 #include "tcp_listener.hpp"
@@ -1046,8 +1047,9 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    auto&          wq = get_sys_workqueue(0);
-    NetFdWorkqueue fdwq(wq);
+    co_wq::test::SysStatsLogger stats_logger("http_proxy");
+    auto&                       wq = get_sys_workqueue(0);
+    NetFdWorkqueue              fdwq(wq);
 
     CO_WQ_LOG_INFO("[proxy] starting on %s:%u", host.c_str(), static_cast<unsigned>(port));
 

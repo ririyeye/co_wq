@@ -1,4 +1,5 @@
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 
 #if !defined(USING_USB)
 #error "USING_USB must be enabled to build usb example"
@@ -192,8 +193,9 @@ int main(int argc, char* argv[])
 {
     auto opts = parse_args(argc, argv);
 
-    auto&       wq = get_sys_workqueue(0);
-    usb_context ctx;
+    co_wq::test::SysStatsLogger stats_logger("usb");
+    auto&                       wq = get_sys_workqueue(0);
+    usb_context                 ctx;
 
     std::atomic_bool finished { false };
 

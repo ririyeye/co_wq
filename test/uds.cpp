@@ -1,4 +1,5 @@
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 #include <string>
 
 #if defined(USING_NET) && !defined(_WIN32)
@@ -121,6 +122,7 @@ int main(int argc, char* argv[])
         CO_WQ_LOG_INFO("Nothing to do. Use --server, --client or --both.");
         return 0;
     }
+    co_wq::test::SysStatsLogger              stats_logger("uds");
     auto&                                    wq = get_sys_workqueue(0);
     NetFdWorkqueue                           fdwq(wq);
     Task<void, Work_Promise<SpinLock, void>> server_task { nullptr };

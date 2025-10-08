@@ -2,6 +2,7 @@
 #include "file_io.hpp"
 #include "file_open.hpp"
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 #include <atomic>
 #include <cstring>
 #include <sys/stat.h>
@@ -58,6 +59,7 @@ int main(int argc, char** argv)
         CO_WQ_LOG_INFO("usage: co_cp <src> <dst>");
         return 0;
     }
+    co_wq::test::SysStatsLogger stats_logger("cp");
     auto&                       wq = get_sys_workqueue(0);
     net::fd_workqueue<SpinLock> fdwq(wq);
     auto                        tk      = file_copy_task(fdwq, argv[1], argv[2]);

@@ -1,4 +1,5 @@
 #include "syswork.hpp"
+#include "test_sys_stats_logger.hpp"
 
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
@@ -397,8 +398,9 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    auto&          wq = get_sys_workqueue(0);
-    NetFdWorkqueue fdwq(wq);
+    co_wq::test::SysStatsLogger stats_logger("http_server");
+    auto&                       wq = get_sys_workqueue(0);
+    NetFdWorkqueue              fdwq(wq);
 
     const net::tls_context* tls_ctx_ptr = nullptr;
 #if defined(USING_SSL)
