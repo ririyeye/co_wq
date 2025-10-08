@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <memory>
 #if defined(_WIN32)
-#include <excpt.h>
 #include <windows.h>
 
 #endif
@@ -112,23 +111,7 @@ public:
                         haddr,
                         name,
                         magic);
-#if defined(_WIN32)
-        __try {
-            self->h.resume();
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            DWORD code = GetExceptionCode();
-            CO_WQ_CBQ_WARN("[io_waiter] resume_cb caught exception 0x%08lx self=%p h=%p name=%s magic=%08x\n",
-                           static_cast<unsigned long>(code),
-                           static_cast<void*>(self),
-                           haddr,
-                           name,
-                           magic);
-            __debugbreak();
-            return;
-        }
-#else
         self->h.resume();
-#endif
         CO_WQ_CBQ_TRACE("[io_waiter] resume_cb completed self=%p h=%p name=%s magic=%08x\n",
                         static_cast<void*>(self),
                         haddr,

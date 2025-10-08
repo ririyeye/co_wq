@@ -8,7 +8,6 @@
 #include "stream_listener_base.hpp"
 #include "unix_socket.hpp"
 #include "worker.hpp"
-#include <stdexcept>
 #include <string>
 
 #if defined(_WIN32)

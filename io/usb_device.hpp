@@ -22,7 +22,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>

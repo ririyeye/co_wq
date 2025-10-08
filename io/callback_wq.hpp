@@ -107,42 +107,16 @@ template <lockable lock> class callback_wq {
         {
             if (!waiter)
                 return false;
-#if defined(_WIN32)
-            __try {
-#endif
-                previous = waiter->callback_enqueued.exchange(desired, std::memory_order_acq_rel);
-                return true;
-#if defined(_WIN32)
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                DWORD code = GetExceptionCode();
-                CO_WQ_CBQ_WARN("[callback_wq] exchange exception waiter=%p code=0x%08lx desired=%d\n",
-                               static_cast<void*>(waiter),
-                               static_cast<unsigned long>(code),
-                               desired ? 1 : 0);
-                return false;
-            }
-#endif
+            previous = waiter->callback_enqueued.exchange(desired, std::memory_order_acq_rel);
+            return true;
         }
 
         static bool store_enqueued(io_waiter_base* waiter, bool value)
         {
             if (!waiter)
                 return false;
-#if defined(_WIN32)
-            __try {
-#endif
-                waiter->callback_enqueued.store(value, std::memory_order_release);
-                return true;
-#if defined(_WIN32)
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                DWORD code = GetExceptionCode();
-                CO_WQ_CBQ_WARN("[callback_wq] store exception waiter=%p code=0x%08lx value=%d\n",
-                               static_cast<void*>(waiter),
-                               static_cast<unsigned long>(code),
-                               value ? 1 : 0);
-                return false;
-            }
-#endif
+            waiter->callback_enqueued.store(value, std::memory_order_release);
+            return true;
         }
 
         static bool reset_guard(io_waiter_base* waiter)

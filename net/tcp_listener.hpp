@@ -10,7 +10,6 @@
 #include "tcp_socket.hpp"
 #include "worker.hpp"
 #include <cstring>
-#include <stdexcept>
 #include <string>
 
 #if !defined(_WIN32)

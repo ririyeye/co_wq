@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstddef>
 #include <mutex>
-#include <stdexcept>
 
 #ifdef _WIN32
 #include <BaseTsd.h>

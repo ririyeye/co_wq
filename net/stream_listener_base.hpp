@@ -8,7 +8,6 @@
 #include "os_compat.hpp"
 #include "workqueue.hpp"
 #include <cerrno>
-#include <stdexcept>
 
 #if defined(_WIN32)
 #include "../io/wepoll/wepoll.h"

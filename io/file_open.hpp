@@ -3,7 +3,13 @@
 #include "fd_base.hpp" // for fd_workqueue make_file variants
 #include "file_io.hpp" // for file_handle
 #include <optional>
-#include <string>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace co_wq::net {
 

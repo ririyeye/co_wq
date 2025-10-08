@@ -9,7 +9,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <mutex>
-#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
