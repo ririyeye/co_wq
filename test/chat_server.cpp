@@ -1026,9 +1026,10 @@ struct Options {
     std::string host { "0.0.0.0" };
     uint16_t    port { 9100 };
 #if defined(USING_SSL)
-    uint16_t    tls_port { 0 };
+    uint16_t    tls_port { 9101 };
     std::string cert_path;
     std::string key_path;
+    bool        tls_port_explicit { false };
 #endif
     uint32_t                  max_payload { kMaxPayloadBytes };
     spdlog::level::level_enum log_level { spdlog::level::info };
@@ -1049,11 +1050,21 @@ Options parse_args(int argc, char* argv[])
             opt.host = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             opt.port = static_cast<uint16_t>(std::stoi(argv[++i]));
+#if defined(USING_SSL)
+            if (!opt.tls_port_explicit) {
+                unsigned int candidate = static_cast<unsigned int>(opt.port) + 1u;
+                if (candidate <= std::numeric_limits<uint16_t>::max())
+                    opt.tls_port = static_cast<uint16_t>(candidate);
+                else
+                    opt.tls_port = 0;
+            }
+#endif
         } else if (arg == "--max-payload" && i + 1 < argc) {
             opt.max_payload = static_cast<uint32_t>(std::stoul(argv[++i]));
 #if defined(USING_SSL)
         } else if (arg == "--tls-port" && i + 1 < argc) {
-            opt.tls_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            opt.tls_port          = static_cast<uint16_t>(std::stoi(argv[++i]));
+            opt.tls_port_explicit = true;
         } else if (arg == "--cert" && i + 1 < argc) {
             opt.cert_path = argv[++i];
         } else if (arg == "--key" && i + 1 < argc) {
@@ -1082,6 +1093,38 @@ Options parse_args(int argc, char* argv[])
         }
     }
     return opt;
+}
+
+std::optional<std::pair<std::filesystem::path, std::filesystem::path>> locate_default_tls_materials()
+{
+    std::error_code cwd_ec;
+    auto            cwd = std::filesystem::current_path(cwd_ec);
+    if (cwd_ec)
+        cwd.clear();
+
+    std::vector<std::filesystem::path> search_roots;
+    if (!cwd.empty())
+        search_roots.push_back(cwd);
+
+    if (!cwd.empty()) {
+        auto project_root = find_project_root(cwd);
+        if (!project_root.empty() && project_root != cwd)
+            search_roots.push_back(project_root);
+    }
+
+    for (const auto& root : search_roots) {
+        auto cert_dir  = (root / "certs").lexically_normal();
+        auto cert_path = (cert_dir / "server.crt").lexically_normal();
+        auto key_path  = (cert_dir / "server.key").lexically_normal();
+
+        std::error_code cert_ec;
+        std::error_code key_ec;
+        if (std::filesystem::exists(cert_path, cert_ec) && !cert_ec && std::filesystem::exists(key_path, key_ec)
+            && !key_ec)
+            return std::make_pair(std::move(cert_path), std::move(key_path));
+    }
+
+    return std::nullopt;
 }
 
 void setup_logging(Options& options)
@@ -1212,10 +1255,49 @@ int main(int argc, char* argv[])
 
     g_start_time = std::chrono::steady_clock::now();
     ServerContext context { g_rooms, g_metrics, timers, options.max_payload };
-    CO_WQ_LOG_INFO("[chat] starting server host=%s port=%u max_payload=%u",
-                   options.host.c_str(),
-                   static_cast<unsigned>(options.port),
-                   options.max_payload);
+
+#if defined(USING_SSL)
+    if (options.tls_port != 0 && (options.cert_path.empty() || options.key_path.empty())) {
+        if (auto defaults = locate_default_tls_materials()) {
+            bool filled_cert = false;
+            bool filled_key  = false;
+            if (options.cert_path.empty()) {
+                options.cert_path = defaults->first.string();
+                filled_cert       = true;
+            }
+            if (options.key_path.empty()) {
+                options.key_path = defaults->second.string();
+                filled_key       = true;
+            }
+            if ((filled_cert || filled_key) && !options.cert_path.empty() && !options.key_path.empty()) {
+                CO_WQ_LOG_INFO("[chat] TLS auto-discovered certificates cert=%s key=%s",
+                               options.cert_path.c_str(),
+                               options.key_path.c_str());
+            }
+        }
+    }
+    if (options.tls_port != 0 && (options.cert_path.empty() || options.key_path.empty())) {
+        if (options.tls_port_explicit) {
+            CO_WQ_LOG_ERROR("[chat] TLS port=%u requires --cert and --key", static_cast<unsigned>(options.tls_port));
+            return 1;
+        }
+        CO_WQ_LOG_WARN("[chat] TLS port=%u disabled (missing --cert/--key)", static_cast<unsigned>(options.tls_port));
+        options.tls_port = 0;
+    }
+#endif
+
+    if (options.tls_port != 0) {
+        CO_WQ_LOG_INFO("[chat] starting server host=%s tcp=%u tls=%u max_payload=%u",
+                       options.host.c_str(),
+                       static_cast<unsigned>(options.port),
+                       static_cast<unsigned>(options.tls_port),
+                       options.max_payload);
+    } else {
+        CO_WQ_LOG_INFO("[chat] starting server host=%s tcp=%u max_payload=%u",
+                       options.host.c_str(),
+                       static_cast<unsigned>(options.port),
+                       options.max_payload);
+    }
 
     std::atomic_bool metrics_thread_stop { false };
     std::thread      metrics_thread([&]() {

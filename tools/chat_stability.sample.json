@@ -8,25 +8,96 @@
         }
     },
     "defaults": {
-        "cnt": 50,
-        "payload_bytes": 256,
-        "expect_receive": 0,
-        "server_push": 5,
+        "send_plan": {
+            "min": 4,
+            "max": 8
+        },
+        "payload_bytes": {
+            "min": 16,
+            "max": 256
+        },
+        "expect_receive": {
+            "min": 0,
+            "max": 8
+        },
+        "server_push": 0,
         "shutdown_after_send": false,
         "mode": "solo"
     },
     "workloads": [
         {
-            "clients": 100,
-            "client_id_prefix": "bot",
-            "mode": "solo"
+            "name": "tcp-small",
+            "transport": {
+                "mode": "tcp",
+                "port": 9100
+            },
+            "clients": 60,
+            "client_id_prefix": "tcp-small",
+            "send_plan": {
+                "min": 1,
+                "max": 4
+            },
+            "payload_bytes": {
+                "min": 16,
+                "max": 64
+            },
+            "expect_receive": {
+                "min": 0,
+                "max": 4
+            }
+        },
+        {
+            "name": "tcp-large",
+            "transport": {
+                "mode": "tcp",
+                "port": 9100
+            },
+            "clients": 20,
+            "client_id_prefix": "tcp-large",
+            "send_plan": {
+                "min": 8,
+                "max": 32
+            },
+            "payload_bytes": {
+                "min": 4096,
+                "max": 102400
+            },
+            "expect_receive": {
+                "min": 8,
+                "max": 32
+            }
+        },
+        {
+            "name": "tls-mixed",
+            "transport": {
+                "mode": "tls",
+                "port": 9101,
+                "tls": {
+                    "enabled": true,
+                    "verify": false
+                }
+            },
+            "clients": 30,
+            "client_id_prefix": "tls",
+            "send_plan": {
+                "min": 4,
+                "max": 16
+            },
+            "payload_bytes": {
+                "min": 128,
+                "max": 8192
+            },
+            "expect_receive": {
+                "min": 4,
+                "max": 16
+            }
         }
     ],
     "runtime": {
-        "max_concurrency": 4,
-        "connect_interval_ms": 50,
-        "handshake_timeout_ms": 2000,
-        "connect_timeout_ms": 5000,
+        "max_concurrency": 12,
+        "connect_interval_ms": 0,
+        "handshake_timeout_ms": 5000,
+        "connect_timeout_ms": 8000,
         "send_delay_ms": 0,
         "log_level": "INFO"
     }

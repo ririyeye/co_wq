@@ -18,7 +18,7 @@ xmake build co_chat
 
 - `--host`：监听地址，默认 `0.0.0.0`
 - `--port`：TCP 端口，默认 `9100`
-- `--tls-port`：可选 TLS 端口（需要 `--cert` 和 `--key`）
+- `--tls-port`：可选 TLS 端口（默认沿用 `--port+1`；缺省证书时会自动查找 `certs/server.crt` 和 `certs/server.key`）
 - `--max-payload`：单帧最大载荷，默认 4 MiB
 
 示例：
@@ -27,10 +27,10 @@ xmake build co_chat
 xmake run co_chat --host 0.0.0.0 --port 9100
 ```
 
-TLS 模式：
+TLS 模式（如已通过 `script/gen_selfsigned_cert.py` 生成默认证书，可省略 `--cert/--key`）：
 
 ```powershell
-xmake run co_chat --port 9100 --tls-port 9443 --cert certs/server.pem --key certs/server.key
+xmake run co_chat --port 9100 --tls-port 9443 --cert certs/server.crt --key certs/server.key
 ```
 
 ## Python 客户端

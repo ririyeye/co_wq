@@ -19,7 +19,7 @@
 - `script/`：常用构建脚本（本地、Wine-MSVC、清理）。
 - `xmake.lua`：项目构建入口，包含平台/可选功能开关。
 - `third_party/llhttp/`：HTTP 解析器子模块（来源于 [nodejs/llhttp](https://github.com/nodejs/llhttp.git)）。
-- `script/gen-selfsigned-cert.sh`：快速生成 TLS 自签证书的辅助脚本。
+- `script/gen_selfsigned_cert.py`：跨平台生成 TLS 自签证书的辅助脚本。
 
 ## 快速开始
 
@@ -178,11 +178,15 @@ xmake run co_usb --help
 
 ### 快速生成测试证书
 
-使用脚本生成自签证书：
+使用 Python 脚本生成自签证书：
 
 ```bash
-./script/gen-selfsigned-cert.sh -o certs -CN localhost
+python3 script/gen_selfsigned_cert.py -o certs -CN localhost
 ```
+
+> ⚠️ 首次使用前请确保已安装 `cryptography`：`pip install cryptography`。
+>
+> 💡 Windows 下可直接运行 `python script\gen_selfsigned_cert.py ...`。
 
 输出目录将包含：
 

@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
+import math
+import os
+import random
 import ssl
 import struct
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,8 +48,10 @@ class BotPlan:
     expect_receive: int
     server_push: int
     shutdown_after_send: bool
+    transport: TransportConfig = field(default_factory=TransportConfig)
     room: Optional[str] = None
     mode: str = "pair"
+    workload: Optional[str] = None
 
 
 @dataclass
@@ -62,6 +68,10 @@ class RuntimeConfig:
 class BotResult:
     client_id: str
     room: Optional[str] = None
+    workload: Optional[str] = None
+    host: str = ""
+    port: int = 0
+    tls_enabled: bool = False
     status: str = "ok"
     sent: int = 0
     recv_peer: int = 0
@@ -94,6 +104,147 @@ class BotState:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     ready_payload: Dict[str, Any] = field(default_factory=dict)
     summary_received: bool = False
+
+
+def clone_tls_options(tls: TLSOptions) -> TLSOptions:
+    return replace(
+        tls,
+        enabled=bool(tls.enabled),
+        verify=bool(tls.verify),
+        ca_file=tls.ca_file,
+        cert_file=tls.cert_file,
+        key_file=tls.key_file,
+    )
+
+
+def clone_transport(config: TransportConfig) -> TransportConfig:
+    return TransportConfig(
+        host=config.host,
+        port=config.port,
+        tls=clone_tls_options(config.tls),
+    )
+
+
+def merge_range_spec(spec: Any, fallback: Any) -> Any:
+    if spec is None:
+        return fallback
+    if isinstance(spec, dict) and isinstance(fallback, dict):
+        merged = dict(fallback)
+        merged.update(spec)
+        return merged
+    return spec
+
+
+def pick_from_range_spec(spec: Any, base_value: int = 0) -> int:
+    if isinstance(spec, dict):
+        if "value" in spec:
+            return int(spec["value"])
+        min_val = spec.get("min")
+        if min_val is None:
+            min_val = spec.get("min_bytes")
+        max_val = spec.get("max")
+        if max_val is None:
+            max_val = spec.get("max_bytes")
+        if min_val is None and max_val is None:
+            range_spec = spec.get("range")
+            if isinstance(range_spec, (list, tuple)) and len(range_spec) >= 2:
+                min_val, max_val = range_spec[0], range_spec[1]
+        if min_val is None:
+            min_val = base_value
+        if max_val is None:
+            max_val = min_val
+        min_int = int(min_val)
+        max_int = int(max_val)
+        if min_int > max_int:
+            min_int, max_int = max_int, min_int
+        return random.randint(min_int, max_int)
+    if isinstance(spec, (list, tuple)):
+        if not spec:
+            return base_value
+        if len(spec) == 1:
+            return int(spec[0])
+        min_int = int(spec[0])
+        max_int = int(spec[-1])
+        if min_int > max_int:
+            min_int, max_int = max_int, min_int
+        return random.randint(min_int, max_int)
+    if isinstance(spec, str):
+        stripped = spec.strip()
+        if stripped in {"send_plan", "payload_bytes", "expect_receive"}:
+            return base_value
+        if "~" in stripped:
+            parts = stripped.split("~", 1)
+            try:
+                min_int = int(parts[0])
+                max_int = int(parts[1])
+                if min_int > max_int:
+                    min_int, max_int = max_int, min_int
+                return random.randint(min_int, max_int)
+            except ValueError:
+                pass
+        return int(stripped)
+    return int(spec)
+
+
+def choose_int_value(spec: Any, fallback: Any = None, base_value: int = 0) -> int:
+    effective = merge_range_spec(spec, fallback)
+    if effective is None:
+        return base_value
+    return pick_from_range_spec(effective, base_value=base_value)
+
+
+def choose_expect_value(spec: Any, fallback: Any, send_plan: int) -> int:
+    if spec is None and fallback is None:
+        return send_plan
+    if isinstance(spec, str) and spec.strip().lower() == "send_plan":
+        return send_plan
+    return choose_int_value(spec, fallback, base_value=send_plan)
+
+
+def merge_transport(base: TransportConfig, overrides: Optional[Dict[str, Any]]) -> TransportConfig:
+    cfg = clone_transport(base)
+    if not overrides:
+        return cfg
+
+    if "host" in overrides:
+        cfg.host = str(overrides["host"])
+    if "port" in overrides:
+        cfg.port = int(overrides["port"])
+
+    mode = overrides.get("mode")
+    if isinstance(mode, str):
+        lower = mode.lower()
+        if lower in {"tls", "ssl"}:
+            cfg.tls.enabled = True
+        elif lower in {"tcp", "plain"}:
+            cfg.tls.enabled = False
+
+    tls_override = overrides.get("tls")
+    if isinstance(tls_override, dict):
+        if "enabled" in tls_override:
+            cfg.tls.enabled = bool(tls_override["enabled"])
+        if "verify" in tls_override:
+            cfg.tls.verify = bool(tls_override["verify"])
+        if "ca_file" in tls_override:
+            cfg.tls.ca_file = tls_override["ca_file"]
+        if "cert" in tls_override or "cert_file" in tls_override:
+            cfg.tls.cert_file = tls_override.get("cert", tls_override.get("cert_file"))
+        if "key" in tls_override or "key_file" in tls_override:
+            cfg.tls.key_file = tls_override.get("key", tls_override.get("key_file"))
+
+    # direct TLS shorthands on the transport block
+    if "tls_enabled" in overrides:
+        cfg.tls.enabled = bool(overrides["tls_enabled"])
+    if "tls_verify" in overrides:
+        cfg.tls.verify = bool(overrides["tls_verify"])
+    if "ca" in overrides:
+        cfg.tls.ca_file = overrides["ca"]
+    if "cert" in overrides:
+        cfg.tls.cert_file = overrides["cert"]
+    if "key" in overrides:
+        cfg.tls.key_file = overrides["key"]
+
+    return cfg
 
 
 def load_json_config(path: Path) -> Dict[str, Any]:
@@ -154,22 +305,22 @@ def parse_runtime(data: Dict[str, Any]) -> RuntimeConfig:
     )
 
 
-def derive_bot_plans(config: Dict[str, Any]) -> List[BotPlan]:
+def derive_bot_plans(config: Dict[str, Any], base_transport: TransportConfig) -> List[BotPlan]:
     defaults = config.get("defaults", {})
-    send_plan_def = int(defaults.get("send_plan", defaults.get("cnt", 0)))
-    payload_def = int(defaults.get("payload_bytes", 0))
-    expect_def = defaults.get("expect_receive")
-    if expect_def is not None:
-        expect_def = int(expect_def)
-    server_push_def = int(defaults.get("server_push", 0))
+    send_plan_default_spec = defaults.get("send_plan", defaults.get("cnt"))
+    payload_default_spec = defaults.get("payload_bytes")
+    expect_default_spec = defaults.get("expect_receive")
+    server_push_default_spec = defaults.get("server_push", 0)
     shutdown_def = bool(defaults.get("shutdown_after_send", True))
     mode_def = str(defaults.get("mode", "pair")).lower()
     if defaults.get("solo") is True:
         mode_def = "solo"
 
     plans: List[BotPlan] = []
+    max_payload_body = MAX_FRAME_BYTES - 8
 
     for entry in config.get("workloads", []):
+        workload_name = entry.get("name") or entry.get("id") or entry.get("label")
         mode = str(entry.get("mode", mode_def)).lower()
         if entry.get("solo") is True:
             mode = "solo"
@@ -178,14 +329,14 @@ def derive_bot_plans(config: Dict[str, Any]) -> List[BotPlan]:
         if mode not in {"pair", "solo"}:
             mode = "pair"
 
-        send_plan = int(entry.get("send_plan", entry.get("cnt", send_plan_def)))
-        payload_bytes = int(entry.get("payload_bytes", payload_def))
-        expect_receive_val = entry.get("expect_receive", expect_def)
-        if expect_receive_val is None:
-            expect_receive = send_plan
-        else:
-            expect_receive = int(expect_receive_val)
-        server_push = int(entry.get("server_push", server_push_def))
+        transport_template = merge_transport(base_transport, entry.get("transport"))
+
+        send_plan_spec = entry.get("send_plan", entry.get("cnt", send_plan_default_spec))
+        payload_spec = entry.get("payload_bytes")
+        if payload_spec is None:
+            payload_spec = entry.get("payload_bytes_range", payload_default_spec)
+        expect_spec = entry.get("expect_receive", expect_default_spec)
+        server_push_spec = entry.get("server_push", server_push_default_spec)
         shutdown = bool(entry.get("shutdown_after_send", shutdown_def))
 
         if mode == "pair":
@@ -212,16 +363,28 @@ def derive_bot_plans(config: Dict[str, Any]) -> List[BotPlan]:
                             client_id = str(explicit_client)
                     else:
                         client_id = f"{client_prefix}-{room_idx:04d}-{client_idx}"
+
+                    send_plan_val = max(0, choose_int_value(send_plan_spec, send_plan_default_spec, base_value=0))
+                    payload_val = max(0, choose_int_value(payload_spec, payload_default_spec, base_value=0))
+                    if payload_val > 0 and payload_val % 4 != 0:
+                        payload_val += 4 - (payload_val % 4)
+                    if payload_val > max_payload_body:
+                        payload_val = max_payload_body
+                    expect_val = max(0, choose_expect_value(expect_spec, expect_default_spec, send_plan_val))
+                    server_push_val = max(0, choose_int_value(server_push_spec, server_push_default_spec, base_value=0))
+
                     plans.append(
                         BotPlan(
                             client_id=client_id,
-                            send_plan=send_plan,
-                            payload_bytes=payload_bytes,
-                            expect_receive=expect_receive,
-                            server_push=server_push,
+                            send_plan=send_plan_val,
+                            payload_bytes=payload_val,
+                            expect_receive=expect_val,
+                            server_push=server_push_val,
                             shutdown_after_send=shutdown,
+                            transport=clone_transport(transport_template),
                             room=room_name,
                             mode=mode,
+                            workload=workload_name,
                         )
                     )
         else:
@@ -252,16 +415,28 @@ def derive_bot_plans(config: Dict[str, Any]) -> List[BotPlan]:
                         client_id = str(explicit_client)
                 else:
                     client_id = f"{client_prefix}-{seq:04d}"
+
+                send_plan_val = max(0, choose_int_value(send_plan_spec, send_plan_default_spec, base_value=0))
+                payload_val = max(0, choose_int_value(payload_spec, payload_default_spec, base_value=0))
+                if payload_val > 0 and payload_val % 4 != 0:
+                    payload_val += 4 - (payload_val % 4)
+                if payload_val > max_payload_body:
+                    payload_val = max_payload_body
+                expect_val = max(0, choose_expect_value(expect_spec, expect_default_spec, send_plan_val))
+                server_push_val = max(0, choose_int_value(server_push_spec, server_push_default_spec, base_value=0))
+
                 plans.append(
                     BotPlan(
                         client_id=client_id,
-                        send_plan=send_plan,
-                        payload_bytes=payload_bytes,
-                        expect_receive=expect_receive,
-                        server_push=server_push,
+                        send_plan=send_plan_val,
+                        payload_bytes=payload_val,
+                        expect_receive=expect_val,
+                        server_push=server_push_val,
                         shutdown_after_send=shutdown,
+                        transport=clone_transport(transport_template),
                         room=room_name if room_name else None,
                         mode=mode,
+                        workload=workload_name,
                     )
                 )
 
@@ -277,25 +452,38 @@ def derive_bot_plans(config: Dict[str, Any]) -> List[BotPlan]:
             raise ValueError("explicit bot entry requires client_id")
         if mode != "solo" and (room_value is None or room_value == ""):
             raise ValueError("pair-mode bot entry requires room")
-        send_plan = int(entry.get("send_plan", entry.get("cnt", send_plan_def)))
-        payload_bytes = int(entry.get("payload_bytes", payload_def))
-        expect_receive_val = entry.get("expect_receive", expect_def)
-        if expect_receive_val is None:
-            expect_receive = send_plan
-        else:
-            expect_receive = int(expect_receive_val)
-        server_push = int(entry.get("server_push", server_push_def))
+
+        transport_template = merge_transport(base_transport, entry.get("transport"))
+
+        send_plan_spec = entry.get("send_plan", entry.get("cnt", send_plan_default_spec))
+        payload_spec = entry.get("payload_bytes")
+        if payload_spec is None:
+            payload_spec = entry.get("payload_bytes_range", payload_default_spec)
+        expect_spec = entry.get("expect_receive", expect_default_spec)
+        server_push_spec = entry.get("server_push", server_push_default_spec)
         shutdown = bool(entry.get("shutdown_after_send", shutdown_def))
+
+        send_plan_val = max(0, choose_int_value(send_plan_spec, send_plan_default_spec, base_value=0))
+        payload_val = max(0, choose_int_value(payload_spec, payload_default_spec, base_value=0))
+        if payload_val > 0 and payload_val % 4 != 0:
+            payload_val += 4 - (payload_val % 4)
+        if payload_val > max_payload_body:
+            payload_val = max_payload_body
+        expect_val = max(0, choose_expect_value(expect_spec, expect_default_spec, send_plan_val))
+        server_push_val = max(0, choose_int_value(server_push_spec, server_push_default_spec, base_value=0))
+
         plans.append(
             BotPlan(
                 client_id=str(client_id),
-                send_plan=send_plan,
-                payload_bytes=payload_bytes,
-                expect_receive=expect_receive,
-                server_push=server_push,
+                send_plan=send_plan_val,
+                payload_bytes=payload_val,
+                expect_receive=expect_val,
+                server_push=server_push_val,
                 shutdown_after_send=shutdown,
+                transport=transport_template,
                 room=None if room_value in (None, "") else str(room_value),
                 mode=mode,
+                workload=entry.get("name") or entry.get("label"),
             )
         )
 
@@ -318,8 +506,28 @@ def create_ssl_context(tls: TLSOptions) -> Optional[ssl.SSLContext]:
     return context
 
 
+def random_base64_bytes(length: int) -> bytes:
+    if length <= 0:
+        return b""
+    raw_len = max(1, math.ceil(length * 3 / 4))
+    encoded = base64.b64encode(os.urandom(raw_len))
+    if len(encoded) >= length:
+        return encoded[:length]
+    parts = [encoded]
+    remaining = length - len(encoded)
+    while remaining > 0:
+        chunk_raw = max(1, math.ceil(remaining * 3 / 4))
+        chunk = base64.b64encode(os.urandom(chunk_raw))
+        if len(chunk) >= remaining:
+            parts.append(chunk[:remaining])
+            break
+        parts.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(parts)
+
+
 def build_data_payload(seq: int, payload_bytes: int) -> bytes:
-    body = bytes([(65 + (seq % 26)) & 0xFF]) * max(payload_bytes, 0)
+    body = random_base64_bytes(payload_bytes)
     return struct.pack("!Q", seq) + body
 
 
@@ -439,9 +647,16 @@ async def sender_task(writer: asyncio.StreamWriter, state: BotState, runtime: Ru
 
 async def run_bot(idx: int,
                   plan: BotPlan,
-                  transport: TransportConfig,
                   runtime: RuntimeConfig) -> BotResult:
-    result = BotResult(client_id=plan.client_id, room=plan.room)
+    transport = plan.transport
+    result = BotResult(
+        client_id=plan.client_id,
+        room=plan.room,
+        workload=plan.workload,
+        host=transport.host,
+        port=transport.port,
+        tls_enabled=transport.tls.enabled,
+    )
     state = BotState(plan=plan, result=result)
     start = time.perf_counter()
     ssl_ctx = create_ssl_context(transport.tls)
@@ -506,14 +721,13 @@ async def run_bot(idx: int,
 
 
 async def orchestrate(plans: List[BotPlan],
-                      transport: TransportConfig,
                       runtime: RuntimeConfig) -> List[BotResult]:
     sem = asyncio.Semaphore(max(1, runtime.max_concurrency))
     interval = runtime.connect_interval_ms / 1000.0
 
     async def launch(idx: int, plan: BotPlan) -> BotResult:
         async with sem:
-            return await run_bot(idx, plan, transport, runtime)
+            return await run_bot(idx, plan, runtime)
 
     tasks: List[asyncio.Task[BotResult]] = []
     for idx, plan in enumerate(plans):
@@ -535,28 +749,46 @@ def summarize_results(results: List[BotResult]) -> None:
 
     for r in results:
         if r.errors or r.server_errors:
-            logging.warning("[%s] errors=%s server=%s summary=%s", r.client_id, r.errors, r.server_errors, r.summary)
+            label = r.client_id if not r.workload else f"{r.client_id}@{r.workload}"
+            endpoint = f"{r.host}:{r.port}" if r.host else "<unknown>"
+            proto = "tls" if r.tls_enabled else "tcp"
+            logging.warning(
+                "[%s] target=%s(%s) errors=%s server=%s summary=%s",
+                label,
+                endpoint,
+                proto,
+                r.errors,
+                r.server_errors,
+                r.summary,
+            )
 
 
-def apply_overrides(transport: TransportConfig, runtime: RuntimeConfig, args: argparse.Namespace) -> None:
+def apply_overrides(plans: List[BotPlan], runtime: RuntimeConfig, args: argparse.Namespace) -> None:
     if args.host:
-        transport.host = args.host
+        for plan in plans:
+            plan.transport.host = args.host
     if args.port:
-        transport.port = args.port
+        for plan in plans:
+            plan.transport.port = args.port
     if args.max_concurrency:
         runtime.max_concurrency = args.max_concurrency
     if args.log_level:
         runtime.log_level = args.log_level
     if args.tls_flag is not None:
-        transport.tls.enabled = args.tls_flag
+        for plan in plans:
+            plan.transport.tls.enabled = args.tls_flag
     if args.ca:
-        transport.tls.ca_file = args.ca
+        for plan in plans:
+            plan.transport.tls.ca_file = args.ca
     if args.cert:
-        transport.tls.cert_file = args.cert
+        for plan in plans:
+            plan.transport.tls.cert_file = args.cert
     if args.key:
-        transport.tls.key_file = args.key
+        for plan in plans:
+            plan.transport.tls.key_file = args.key
     if args.no_verify:
-        transport.tls.verify = False
+        for plan in plans:
+            plan.transport.tls.verify = False
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -577,19 +809,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 async def async_main(args: argparse.Namespace, config_path: Path) -> int:
     config_data = load_json_config(config_path)
-    transport = parse_transport(config_data.get("transport", {}))
+    base_transport = parse_transport(config_data.get("transport", {}))
     runtime = parse_runtime(config_data.get("runtime", {}))
-    plans = derive_bot_plans(config_data)
+    plans = derive_bot_plans(config_data, base_transport)
 
-    apply_overrides(transport, runtime, args)
+    apply_overrides(plans, runtime, args)
     logging.basicConfig(
         level=getattr(logging, runtime.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
     logging.info("using config file %s", config_path)
-    logging.info("loaded %d bot plans targeting %s:%d", len(plans), transport.host, transport.port)
-    results = await orchestrate(plans, transport, runtime)
+    targets = sorted({
+        (plan.transport.host,
+         plan.transport.port,
+         "tls" if plan.transport.tls.enabled else "tcp")
+        for plan in plans
+    })
+    target_desc = ", ".join(f"{host}:{port}({proto})" for host, port, proto in targets)
+    logging.info(
+        "loaded %d bot plans across %d targets: %s",
+        len(plans),
+        len(targets),
+        target_desc or "<none>",
+    )
+    results = await orchestrate(plans, runtime)
     summarize_results(results)
     failures = [r for r in results if r.status != "ok" or r.errors or r.server_errors]
     return 1 if failures else 0

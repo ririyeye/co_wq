@@ -143,3 +143,42 @@
 - 若 `server_push > 0`，服务器在 `ready` 之后以同样的数据帧格式主动下发对应数量的消息。
 
 该协议既适用于纯 TCP，也适用于 TLS（握手完成后逻辑一致）。客户端可通过 JSON 配置批量生成不同房间、不同消息规模的“机器人”以进行压力与稳定性测试。
+
+## 配置与运行特性
+
+### 多 workload 与传输模式
+
+`tools/chat_stability_client.py` 支持在配置文件的 `workloads` 数组中声明任意数量的子任务。每个 workload 可以：
+
+- 指定独立的 `name`/`label`，以便在日志中识别来源；
+- 通过 `transport` 小节选择协议与端口，例如：
+  - `{ "mode": "tcp", "port": 9100 }`
+  - `{ "mode": "tls", "port": 9101, "tls": { "verify": false } }`
+- 设置房间/客户端生成规则（`clients`、`client_id_prefix` 等）。
+
+运行期会根据 workload 内部的计划生成对应数量的机器人，并把目标端口与协议写入日志（失败行会标注 `host:port(proto)`）。
+
+### 范围型计划参数
+
+`send_plan`、`payload_bytes`、`expect_receive`、`server_push` 均接受以下形式的范围描述：
+
+- 区间字典：`{"min": 4, "max": 16}` 或 `{"range": [4, 16]}`；
+- 单值：`64` 或 `{"value": 64}`；
+- 字符串区间：`"4~16"`。
+
+客户端会在每个机器人启动时随机抽取具体数值（同一 workload 内的不同机器人彼此独立），并把随机后的结果带入 `hello` 握手。
+
+### Base64 随机载荷
+
+为了覆盖更多负载模式，客户端生成数据帧时会把随机字节经 Base64 编码后裁剪到目标长度。这样可以在相同大小前提下模拟高熵内容，而服务器仍然按照 `payload_bytes` 校验长度。若配置值不是 4 的倍数，客户端会自动向上补齐，以避免 Base64 填充字符导致长度偏差。
+
+## 服务器端口与 TLS 证书
+
+- 缺省情况下，`co_chat` 会监听 `--port`（默认 9100）提供 TCP 服务，并尝试在 `--tls-port`（默认 9101）上启动 TLS。
+- 如果用户没有传入 `--tls-port`，程序会把 TLS 端口保持在 `TCP+1`；若显式覆盖了 `--port`，TLS 端口会同步调整。
+- 当 TLS 端口启用但缺少 `--cert`、`--key` 时，程序会尝试在当前目录或工程根目录下的 `certs/server.crt`、`certs/server.key` 中自动加载证书；若未找到：
+  - 如果端口是默认推导出的，程序会记录警告并自动关闭 TLS；
+  - 如果用户显式指定 `--tls-port`，程序会报错退出。
+- 一旦 TLS 启动成功，客户端可以在 workload 中开启 `mode: "tls"`（并酌情关闭证书校验或提供 CA）。
+
+示例配置可参考 `tools/chat_stability.sample.json`，其中同时包含 TCP 小包、TCP 大包和 TLS 混合流量三种 workload，用于展示以上特性。

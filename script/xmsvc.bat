@@ -42,7 +42,7 @@ if /I "%MODE%"=="full" (
 	set "CONFIG_FLAGS=--USING_NET=n --USE_BUNDLED_LLHTTP=n --USING_SSL=n --USING_USB=n --MSVC_ITERATOR_DEBUG=n --USING_EXAMPLE=n"
 )
 
-xmake.exe f -y -vD %CONFIG_FLAGS% -m debug -o build -P .
+xmake.exe f -y -vD %CONFIG_FLAGS% -m releasedbg -o build -P .
 xmake.exe project -k compile_commands -P .
 xmake.exe -vD -P .
 xmake.exe install -o install -P .
