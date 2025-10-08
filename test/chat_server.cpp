@@ -1217,6 +1217,24 @@ int main(int argc, char* argv[])
                    static_cast<unsigned>(options.port),
                    options.max_payload);
 
+    std::atomic_bool metrics_thread_stop { false };
+    std::thread      metrics_thread([&]() {
+        using namespace std::chrono_literals;
+        auto                     sleep_chunk = 100ms;
+        auto                     sleep_goal  = 5s;
+        std::chrono::nanoseconds elapsed { 0 };
+        while (!metrics_thread_stop.load(std::memory_order_acquire)) {
+            if (elapsed >= sleep_goal) {
+                log_metrics();
+                elapsed = std::chrono::nanoseconds { 0 };
+            }
+            std::this_thread::sleep_for(sleep_chunk);
+            elapsed += sleep_chunk;
+        }
+        // final sample before exit
+        log_metrics();
+    });
+
 #if defined(USING_SSL)
     std::optional<net::tls_context> tls_ctx;
     const net::tls_context*         tls_ptr = nullptr;
@@ -1291,6 +1309,9 @@ int main(int argc, char* argv[])
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    metrics_thread_stop.store(true, std::memory_order_release);
+    if (metrics_thread.joinable())
+        metrics_thread.join();
     log_metrics();
     CO_WQ_LOG_INFO("[chat] shutdown complete");
     return 0;
