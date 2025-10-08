@@ -8,6 +8,14 @@ target("co_echo")
 
 target_end()
 
+target("co_chat")
+    set_kind("binary")
+    add_deps("co_wq")
+    add_files("chat_server.cpp")
+    add_files("syswork.cpp")
+    add_packages("nlohmann_json")
+target_end()
+
 target("co_http")
     set_kind("binary")
     add_deps("co_wq")

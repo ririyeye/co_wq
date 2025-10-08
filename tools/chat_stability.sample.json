@@ -1,0 +1,33 @@
+{
+    "transport": {
+        "host": "127.0.0.1",
+        "port": 9100,
+        "tls": {
+            "enabled": false,
+            "verify": true
+        }
+    },
+    "defaults": {
+        "cnt": 50,
+        "payload_bytes": 256,
+        "expect_receive": 0,
+        "server_push": 5,
+        "shutdown_after_send": false,
+        "mode": "solo"
+    },
+    "workloads": [
+        {
+            "clients": 100,
+            "client_id_prefix": "bot",
+            "mode": "solo"
+        }
+    ],
+    "runtime": {
+        "max_concurrency": 4,
+        "connect_interval_ms": 50,
+        "handshake_timeout_ms": 2000,
+        "connect_timeout_ms": 5000,
+        "send_delay_ms": 0,
+        "log_level": "INFO"
+    }
+}
