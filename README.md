@@ -42,7 +42,7 @@ PS> python .\script\xmk.py build
 
 默认 `build` 子命令会：
 1. 以 `releasedbg` 模式写入配置并将输出目录固定为 `build/`；
-2. 根据 “full” 预设启用 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USING_USB/USING_EXAMPLE` 与 `ENABLE_LOGGING`；
+2. 根据 “full” 预设启用 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USE_BUNDLED_NGHTTP2/USING_USB/USING_EXAMPLE` 与 `ENABLE_LOGGING`；
 3. 生成 `compile_commands.json`；
 4. 构建并安装产物到 `install/`。
 
@@ -116,6 +116,7 @@ python3 script/xmk.py clean --remove-global-cache
 | `USING_NET` | `false` | 启用网络相关头文件与依赖（TCP/UDP/TLS/WebSocket 等） |
 | `USING_SSL` | `false` | 链接 OpenSSL，暴露 TLS/DTLS/socket TLS awaiter |
 | `USE_BUNDLED_LLHTTP` | `true` | 使用内置 `llhttp` 包处理 HTTP/WebSocket 升级（仅在 `USING_NET=y` 时生效） |
+| `USE_BUNDLED_NGHTTP2` | `true` | 使用内置 `nghttp2` 包以启用 HTTP/2 相关能力（仅在 `USING_NET=y` 时生效） |
 | `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
 | `USING_EXAMPLE` | `false` | 构建 `test/` 目录下示例程序（需要配合 `USING_NET=y`） |
 | `ENABLE_LOGGING` | `true` | 打开 fmt/spdlog 依赖与日志输出宏，若构建极简核心可设为 `false` |

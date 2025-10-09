@@ -46,7 +46,10 @@
 
 namespace co_wq::net::os {
 
-using fd_t    = SOCKET;
+using fd_t = SOCKET;
+#ifdef ssize_t
+#undef ssize_t
+#endif
 using ssize_t = SSIZE_T;
 
 #ifndef IOVEC_DEFINED_CO_WQ

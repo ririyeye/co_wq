@@ -23,6 +23,10 @@ option("USE_BUNDLED_LLHTTP")
     set_default(true)
 option_end()
 
+option("USE_BUNDLED_NGHTTP2")
+    set_default(true)
+option_end()
+
 option("USING_SSL")
     set_default(false)
 option_end()
@@ -51,6 +55,9 @@ option_end()
 if get_config("USING_NET") then
     if get_config("USE_BUNDLED_LLHTTP") then
         add_requires("llhttp")
+    end
+    if get_config("USE_BUNDLED_NGHTTP2") then
+        add_requires("nghttp2")
     end
     if get_config("USING_SSL") then
         add_requires("openssl3")
@@ -107,6 +114,9 @@ target("co_wq")
         end
         if get_config("USE_BUNDLED_LLHTTP") then
             add_packages("llhttp", {public = true})
+        end
+        if get_config("USE_BUNDLED_NGHTTP2") then
+            add_packages("nghttp2", {public = true})
         end
         if get_config("USING_SSL") then
             add_defines("USING_SSL", {public = true})
