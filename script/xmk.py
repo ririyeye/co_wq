@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
-"""Unified build/clean helper for co_wq.
+"""co_wq 的统一构建/清理工具。
 
-This script replaces the previous platform-specific shell/batch helpers.
+此 Python 入口将原本分散在各平台 shell/bat 脚本里的构建与清理流程全部收拢。
+无论开发者使用哪种操作系统，都可以只记住这一条命令；因此请确保这里的
+行为始终与 `README.md` 内的说明保持一致。
+
+整体行为
+--------
+- 当脚本 **不带任何参数** 执行时，会自动等价为 ``python script/xmk.py build``，
+    沿用历史默认（配置 + 构建 + 安装）的 "full" 功能集。
+- ``build`` 子命令负责完整的 xmake 配置流程，生成 ``compile_commands.json``，
+    编译目标并安装到 ``install/``。命令行参数可切换功能档（``--core``/``--full``）、
+    xmake 构建模式（``--debug``/``--releasedbg``）以及 MSVC 迭代器调试开关。
+- ``clean`` 子命令清理本地构建产物，如附带 ``--remove-global-cache`` 会额外删除
+    用户级别的 ``~/.xmake`` 缓存。
+
+实现提示
+--------
+- 始终将 ``XMAKE_GLOBALDIR`` 设为仓库根目录，确保 xmake 在本地缓存依赖包而不是
+    写到不可预期的位置。
+- 解析器的参数定义请与 README 示例同步，很多用户会直接复制那些命令。
+- 新增子命令时保持同样的结构：编写一个处理函数（例如 ``*_command``），并通过
+    ``set_defaults(func=...)`` 注册到主分发逻辑，使得入口保持精简。
+
+若未来增加新的开关或流程，请同步更新此文档字符串和 README，记录对外约定——
+后续贡献者（以及 CI）都依赖它作为唯一可信的接口说明。
 """
 from __future__ import annotations
 
@@ -143,6 +166,9 @@ def main(argv: list[str]) -> int:
         help="Also remove ~/.xmake cache",
     )
     clean_parser.set_defaults(func=clean_command)
+
+    if not argv:
+        argv = ["build"]
 
     args = parser.parse_args(argv)
     try:
