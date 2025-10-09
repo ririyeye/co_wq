@@ -34,9 +34,13 @@
 #if defined(_WIN32)
 #include <basetsd.h>
 #include <windows.h>
+#include <ws2tcpip.h>
 #else
 #include <cerrno> // NOLINT(modernize-deprecated-headers)
 #include <csignal>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
 #endif
 
@@ -195,11 +199,94 @@ std::string format_peer_id(uint64_t session_id)
     return oss.str();
 }
 
+std::string format_ipv4(const in_addr& addr)
+{
+    char buf[INET_ADDRSTRLEN] {};
+    if (::inet_ntop(AF_INET, &addr, buf, sizeof(buf)) == nullptr)
+        return {};
+    return std::string(buf);
+}
+
+std::string format_ipv6(const in6_addr& addr)
+{
+    char buf[INET6_ADDRSTRLEN] {};
+    if (::inet_ntop(AF_INET6, &addr, buf, sizeof(buf)) == nullptr)
+        return {};
+    return std::string(buf);
+}
+
+std::string format_sockaddr(const sockaddr_storage& addr)
+{
+    switch (addr.ss_family) {
+    case AF_INET: {
+        auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
+        std::ostringstream oss;
+        oss << format_ipv4(v4->sin_addr) << ':' << ntohs(v4->sin_port);
+        return oss.str();
+    }
+    case AF_INET6: {
+        auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+        const auto& bytes = v6->sin6_addr.s6_addr;
+        bool        leading_zero = true;
+        for (int i = 0; i < 10; ++i) {
+            if (bytes[i] != 0) {
+                leading_zero = false;
+                break;
+            }
+        }
+        bool is_mapped = leading_zero && bytes[10] == 0xFF && bytes[11] == 0xFF;
+        if (is_mapped) {
+            in_addr mapped {};
+            std::memcpy(&mapped, &bytes[12], sizeof(mapped));
+            std::ostringstream oss;
+            oss << format_ipv4(mapped) << ':' << ntohs(v6->sin6_port);
+            return oss.str();
+        }
+        std::ostringstream oss;
+        oss << '[' << format_ipv6(v6->sin6_addr) << "]:" << ntohs(v6->sin6_port);
+        return oss.str();
+    }
+    default:
+        break;
+    }
+    std::ostringstream oss;
+    oss << "af=" << static_cast<int>(addr.ss_family);
+    return oss.str();
+}
+
+std::string describe_remote_endpoint(const net::tcp_socket<SpinLock>& socket)
+{
+    sockaddr_storage addr {};
+    socklen_t        len = sizeof(addr);
+    if (::getpeername(socket.native_handle(), reinterpret_cast<sockaddr*>(&addr), &len) != 0)
+        return {};
+    return format_sockaddr(addr);
+}
+
 struct PipeOutcome {
     std::string label;
     std::string status { "pending" };
     bool        had_error { false };
 };
+
+std::atomic_bool g_packet_trace { false };
+
+template <typename Socket> std::string describe_socket_state(const Socket& socket)
+{
+    std::ostringstream oss;
+    oss << "{fd=" << static_cast<long long>(socket.native_handle());
+    if constexpr (requires { socket.closed(); }) {
+        oss << " closed=" << (socket.closed() ? '1' : '0');
+    }
+    if constexpr (requires { socket.rx_eof(); }) {
+        oss << " rx_eof=" << (socket.rx_eof() ? '1' : '0');
+    }
+    if constexpr (requires { socket.tx_shutdown(); }) {
+        oss << " tx_shutdown=" << (socket.tx_shutdown() ? '1' : '0');
+    }
+    oss << '}';
+    return oss.str();
+}
 
 template <typename SrcSocket, typename DstSocket>
 Task<void, Work_Promise<SpinLock, void>>
@@ -213,7 +300,12 @@ pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string f
     while (true) {
         ssize_t n = co_await src.recv(buffer.data(), buffer.size());
         if (n == 0) {
-            CO_WQ_LOG_DEBUG("[proxy] %s closed (EOF)", flow);
+            auto src_state = describe_socket_state(src);
+            auto dst_state = describe_socket_state(dst);
+            CO_WQ_LOG_INFO("[proxy] %s closed (EOF) local=%s peer=%s",
+                           flow,
+                           src_state.c_str(),
+                           dst_state.c_str());
             outcome.status = "eof";
             if (propagate_shutdown) {
                 if constexpr (requires(DstSocket& s) {
@@ -227,20 +319,44 @@ pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string f
             break;
         }
         if (n < 0) {
-            CO_WQ_LOG_WARN("[proxy] %s recv error rc=%lld", flow, static_cast<long long>(n));
+            auto src_state = describe_socket_state(src);
+            auto dst_state = describe_socket_state(dst);
+            CO_WQ_LOG_WARN("[proxy] %s recv error rc=%lld local=%s peer=%s",
+                           flow,
+                           static_cast<long long>(n),
+                           src_state.c_str(),
+                           dst_state.c_str());
             outcome.status    = std::string("recv_error rc=") + std::to_string(static_cast<long long>(n));
             outcome.had_error = true;
             break;
+        }
+
+        if (g_packet_trace.load(std::memory_order_relaxed)) {
+            CO_WQ_LOG_INFO("[proxy] %s recv bytes=%lld", flow, static_cast<long long>(n));
         }
 
         size_t offset = 0;
         while (offset < static_cast<size_t>(n)) {
             ssize_t sent = co_await dst.send(buffer.data() + offset, static_cast<size_t>(n) - offset);
             if (sent <= 0) {
-                CO_WQ_LOG_WARN("[proxy] %s send error rc=%lld", flow, static_cast<long long>(sent));
+                auto src_state = describe_socket_state(src);
+                auto dst_state = describe_socket_state(dst);
+                CO_WQ_LOG_WARN("[proxy] %s send error rc=%lld local=%s peer=%s",
+                               flow,
+                               static_cast<long long>(sent),
+                               src_state.c_str(),
+                               dst_state.c_str());
                 outcome.status    = std::string("send_error rc=") + std::to_string(static_cast<long long>(sent));
                 outcome.had_error = true;
                 break;
+            }
+            if (g_packet_trace.load(std::memory_order_relaxed)) {
+                size_t new_offset = offset + static_cast<size_t>(sent);
+                CO_WQ_LOG_INFO("[proxy] %s send bytes=%lld total=%zu/%zu",
+                               flow,
+                               static_cast<long long>(sent),
+                               new_offset,
+                               static_cast<size_t>(n));
             }
             offset += static_cast<size_t>(sent);
         }
@@ -632,6 +748,10 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
         co_return;
     }
 
+    if (auto remote = describe_remote_endpoint(upstream); !remote.empty()) {
+        CO_WQ_LOG_INFO("[proxy] %s CONNECT upstream peer=%s", peer_id.c_str(), remote.c_str());
+    }
+
     static constexpr std::string_view established
         = "HTTP/1.1 200 Connection Established\r\nProxy-Agent: co_wq-proxy\r\n\r\n";
     if (co_await client.send_all(established.data(), established.size()) <= 0) {
@@ -656,8 +776,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     auto        upstream_to_client = pipe_data(upstream,
                                         client,
                                         true,
-                                        peer_id + " upstream->client " + format_host_for_log(target.host) + ':'
-                                            + std::to_string(target.port),
+                                        peer_id + " upstream->client",
                                         upstream_to_client_outcome);
     co_await co_wq::when_all(client_to_upstream, upstream_to_client);
 
@@ -720,8 +839,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
     co_await pipe_data(upstream,
                        client,
                        false,
-                       peer_id + " upstream->client " + format_host_for_log(parts.host) + ':'
-                           + std::to_string(parts.port),
+                       peer_id + " upstream->client",
                        response_outcome);
 
     std::string response_status = response_outcome.had_error ? "error" : "completed";
@@ -959,6 +1077,7 @@ int main(int argc, char* argv[])
     std::string               log_file_path       = "logs/proxy.log";
     bool                      log_truncate        = true;
     spdlog::level::level_enum requested_log_level = spdlog::level::debug;
+    bool                      packet_trace_flag   = false;
 
     std::filesystem::path project_root;
     std::filesystem::path cwd_path;
@@ -991,6 +1110,8 @@ int main(int argc, char* argv[])
             log_truncate = true;
         } else if (arg == "--log-append" || arg == "--no-log-truncate") {
             log_truncate = false;
+        } else if (arg == "--trace-packets" || arg == "--packet-verbose") {
+            packet_trace_flag = true;
         }
     }
 
@@ -1035,6 +1156,11 @@ int main(int argc, char* argv[])
     co_wq::log::set_level(requested_log_level);
     if (log_configured) {
         CO_WQ_LOG_INFO("[proxy] logging to %s (truncate=%d)", log_file_path.c_str(), log_truncate ? 1 : 0);
+    }
+
+    g_packet_trace.store(packet_trace_flag, std::memory_order_release);
+    if (packet_trace_flag) {
+        CO_WQ_LOG_INFO("[proxy] per-packet logging enabled");
     }
 
 #if defined(_WIN32)
