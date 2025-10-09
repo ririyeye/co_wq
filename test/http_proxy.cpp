@@ -197,9 +197,8 @@ std::string describe_remote_endpoint(const net::tcp_socket<SpinLock>& socket)
 
 std::string format_peer_id(uint64_t session_id)
 {
-    char buffer[32];
-    std::snprintf(buffer, sizeof(buffer), "session-%06llu", static_cast<unsigned long long>(session_id));
-    return std::string(buffer);
+    std::string result = "[" + std::to_string(session_id) + "]";
+    return result;
 }
 
 std::filesystem::path find_project_root(std::filesystem::path current)
