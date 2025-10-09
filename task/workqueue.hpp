@@ -326,8 +326,7 @@ template <lockable Lock> struct workqueue {
 #ifndef NDEBUG
                 // Detect and guard against calling invalid debug poison addresses like 0xCDCDCDCD...
                 if (__wq_is_debug_poison_func_ptr(fn)) {
-                    assert(("worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized",
-                            false));
+                    assert(!"worknode.func is invalid (debug poison pattern like 0xCDCD...), likely uninitialized");
                     return 1; // skip calling to avoid crash in debug
                 }
 #endif

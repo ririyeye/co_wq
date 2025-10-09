@@ -26,6 +26,15 @@ target("co_http")
 
 target_end()
 
+target("co_curl")
+    set_kind("binary")
+    add_deps("co_wq")
+
+    add_files("co_curl.cpp")
+    add_files("syswork.cpp")
+
+target_end()
+
 target("co_http_proxy")
     set_kind("binary")
     add_deps("co_wq")

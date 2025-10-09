@@ -73,6 +73,8 @@ public:
                 t.join();
         }
     }
+
+    ~executor_wq() { stop_and_join(); }
 };
 
 executor_wq& get_executor()
@@ -124,12 +126,4 @@ void sys_wait_until(std::atomic_bool& finished)
     }
 }
 
-// 可选：程序结束时清理（若需要显式调用）
-struct sys_cleanup {
-    ~sys_cleanup()
-    {
-        get_executor().stop_and_join();
-        // timer 不删除以避免静态析构顺序问题（可选清理）
-    }
-};
-static sys_cleanup g_cleanup_guard; // 进程退出自动回收
+// timer 不删除以避免静态析构顺序问题（可选清理）
