@@ -46,6 +46,10 @@ PS> python .\script\xmk.py build
 3. 生成 `compile_commands.json`；
 4. 构建并安装产物到 `install/`。
 
+脚本会在执行前检查 `.xmake/repositories/` 下的 xmake 仓库镜像，若发现被误指向当前
+项目会自动改回官方镜像，避免构建时强制 `git reset` 覆写本地修改。可通过设置环境变量
+`CO_WQ_XMAKE_REPO_MIRROR=github`（默认优先 `gitee`）切换首选镜像源。
+
 常用参数：
 
 - `--core`：仅构建最小核心（关闭网络/TLS/USB/示例与日志模块）。
