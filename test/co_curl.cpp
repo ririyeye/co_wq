@@ -1,6 +1,7 @@
 #include "syswork.hpp"
 #include "test_sys_stats_logger.hpp"
 
+#include "dns_resolver.hpp"
 #include "fd_base.hpp"
 #include "tcp_socket.hpp"
 #if defined(USING_SSL)
@@ -12,8 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -44,17 +45,17 @@ struct HeaderEntry {
 };
 
 struct CommandLineOptions {
-    std::string              method { "GET" };
-    bool                     method_explicit { false };
-    std::string              url;
-    std::vector<HeaderEntry> headers;
-    std::string              body;
-    bool                     verbose { false };
-    bool                     include_headers { false };
-    bool                     follow_redirects { false };
-    int                      max_redirects { 10 };
+    std::string                method { "GET" };
+    bool                       method_explicit { false };
+    std::string                url;
+    std::vector<HeaderEntry>   headers;
+    std::string                body;
+    bool                       verbose { false };
+    bool                       include_headers { false };
+    bool                       follow_redirects { false };
+    int                        max_redirects { 10 };
     std::optional<std::string> output_path;
-    bool                        insecure { false };
+    bool                       insecure { false };
 };
 
 struct ParsedUrl {
@@ -98,8 +99,7 @@ bool iequals(std::string_view a, std::string_view b)
     if (a.size() != b.size())
         return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i]))
-            != std::tolower(static_cast<unsigned char>(b[i])))
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
             return false;
     }
     return true;
@@ -170,10 +170,10 @@ std::optional<ParsedUrl> parse_url(const std::string& url)
     if (authority_start >= url.size())
         return std::nullopt;
 
-    auto slash_pos = url.find('/', authority_start);
+    auto        slash_pos = url.find('/', authority_start);
     std::string authority = slash_pos == std::string::npos ? url.substr(authority_start)
                                                            : url.substr(authority_start, slash_pos - authority_start);
-    result.path = slash_pos == std::string::npos ? std::string("/") : url.substr(slash_pos);
+    result.path           = slash_pos == std::string::npos ? std::string("/") : url.substr(slash_pos);
     if (authority.empty())
         return std::nullopt;
 
@@ -197,10 +197,13 @@ bool header_exists(const std::vector<HeaderEntry>& headers, std::string_view nam
 
 void remove_content_headers(std::vector<HeaderEntry>& headers)
 {
-    headers.erase(std::remove_if(headers.begin(), headers.end(), [](const HeaderEntry& h) {
-                      auto lower = to_lower(h.name);
-                      return lower == "content-length" || lower == "content-type" || lower == "transfer-encoding";
-                  }),
+    headers.erase(std::remove_if(headers.begin(),
+                                 headers.end(),
+                                 [](const HeaderEntry& h) {
+                                     auto lower = to_lower(h.name);
+                                     return lower == "content-length" || lower == "content-type"
+                                         || lower == "transfer-encoding";
+                                 }),
                   headers.end());
 }
 
@@ -209,9 +212,7 @@ struct BuiltRequest {
     std::vector<HeaderEntry> headers;
 };
 
-BuiltRequest build_http_request(const CommandLineOptions& base,
-                                const RequestState&       state,
-                                const ParsedUrl&          url)
+BuiltRequest build_http_request(const CommandLineOptions& base, const RequestState& state, const ParsedUrl& url)
 {
     BuiltRequest result;
     result.headers = base.headers;
@@ -221,8 +222,8 @@ BuiltRequest build_http_request(const CommandLineOptions& base,
     const bool has_body = !state.body.empty();
 
     if (!header_exists(result.headers, "Host")) {
-        std::string value = url.host;
-        const bool  is_https = url.scheme == "https";
+        std::string value           = url.host;
+        const bool  is_https        = url.scheme == "https";
         const bool  is_default_port = (is_https && url.port == 443) || (!is_https && url.port == 80);
         if (!is_default_port) {
             value.push_back(':');
@@ -245,8 +246,7 @@ BuiltRequest build_http_request(const CommandLineOptions& base,
         result.headers.push_back({ "Content-Length", std::to_string(state.body.size()) });
     }
 
-    result.payload.reserve(state.method.size() + url.path.size() + 32 + state.body.size()
-                           + result.headers.size() * 32);
+    result.payload.reserve(state.method.size() + url.path.size() + 32 + state.body.size() + result.headers.size() * 32);
     result.payload.append(state.method);
     result.payload.push_back(' ');
     result.payload.append(url.path.empty() ? "/" : url.path);
@@ -339,7 +339,7 @@ std::optional<CommandLineOptions> parse_arguments(int argc, char* argv[])
         } else if (arg == "-X" || arg == "--method") {
             if (!require_value(idx, arg.data()))
                 return std::nullopt;
-            options.method          = argv[++idx];
+            options.method = argv[++idx];
             to_upper_inplace(options.method);
             options.method_explicit = true;
         } else if (arg == "-H" || arg == "--header") {
@@ -396,24 +396,24 @@ std::optional<CommandLineOptions> parse_arguments(int argc, char* argv[])
 }
 
 struct ResponseContext {
-    llhttp_t                                      parser;
-    llhttp_settings_t                             settings;
-    std::string                                   status_text;
-    int                                           status_code { 0 };
-    int                                           http_major { 1 };
-    int                                           http_minor { 1 };
-    std::vector<HeaderEntry>                      header_sequence;
-    std::unordered_map<std::string, std::string>  header_lookup;
-    std::string                                   current_field;
-    std::string                                   current_value;
-    bool                                          headers_complete { false };
-    bool                                          message_complete { false };
-    bool                                          verbose { false };
-    bool                                          include_headers { false };
-    bool                                          buffer_body { false };
-    std::string                                   header_block;
-    std::string                                   body_buffer;
-    std::FILE*                                    output { nullptr };
+    llhttp_t                                     parser;
+    llhttp_settings_t                            settings;
+    std::string                                  status_text;
+    int                                          status_code { 0 };
+    int                                          http_major { 1 };
+    int                                          http_minor { 1 };
+    std::vector<HeaderEntry>                     header_sequence;
+    std::unordered_map<std::string, std::string> header_lookup;
+    std::string                                  current_field;
+    std::string                                  current_value;
+    bool                                         headers_complete { false };
+    bool                                         message_complete { false };
+    bool                                         verbose { false };
+    bool                                         include_headers { false };
+    bool                                         buffer_body { false };
+    std::string                                  header_block;
+    std::string                                  body_buffer;
+    std::FILE*                                   output { nullptr };
 
     ResponseContext()
     {
@@ -441,15 +441,15 @@ struct ResponseContext {
     {
         llhttp_reset(&parser);
         status_text.clear();
-        status_code       = 0;
-        http_major        = 1;
-        http_minor        = 1;
+        status_code = 0;
+        http_major  = 1;
+        http_minor  = 1;
         header_sequence.clear();
         header_lookup.clear();
         current_field.clear();
         current_value.clear();
-        headers_complete  = false;
-        message_complete  = false;
+        headers_complete = false;
+        message_complete = false;
         header_block.clear();
         body_buffer.clear();
     }
@@ -498,10 +498,10 @@ struct ResponseContext {
 
     static int on_headers_complete_cb(llhttp_t* parser)
     {
-        auto* ctx     = static_cast<ResponseContext*>(parser->data);
-        ctx->status_code  = parser->status_code;
-        ctx->http_major   = parser->http_major;
-        ctx->http_minor   = parser->http_minor;
+        auto* ctx             = static_cast<ResponseContext*>(parser->data);
+        ctx->status_code      = parser->status_code;
+        ctx->http_major       = parser->http_major;
+        ctx->http_minor       = parser->http_minor;
         ctx->headers_complete = true;
 
         ctx->header_block.clear();
@@ -558,7 +558,7 @@ struct ResponseContext {
 
     static int on_message_complete_cb(llhttp_t* parser)
     {
-        auto* ctx           = static_cast<ResponseContext*>(parser->data);
+        auto* ctx             = static_cast<ResponseContext*>(parser->data);
         ctx->message_complete = true;
         return 0;
     }
@@ -608,9 +608,9 @@ std::string resolve_redirect_url(const ParsedUrl& base, const std::string& locat
     if (location.find("http://") == 0 || location.find("https://") == 0)
         return location;
     if (location.front() == '/') {
-        std::string result = base.scheme + "://" + base.host;
-        const bool is_https = base.scheme == "https";
-        const bool default_port = (is_https && base.port == 443) || (!is_https && base.port == 80);
+        std::string result       = base.scheme + "://" + base.host;
+        const bool  is_https     = base.scheme == "https";
+        const bool  default_port = (is_https && base.port == 443) || (!is_https && base.port == 80);
         if (!default_port) {
             result.push_back(':');
             result.append(std::to_string(base.port));
@@ -618,9 +618,9 @@ std::string resolve_redirect_url(const ParsedUrl& base, const std::string& locat
         result.append(location);
         return result;
     }
-    std::string result = base.scheme + "://" + base.host;
-    const bool is_https = base.scheme == "https";
-    const bool default_port = (is_https && base.port == 443) || (!is_https && base.port == 80);
+    std::string result       = base.scheme + "://" + base.host;
+    const bool  is_https     = base.scheme == "https";
+    const bool  default_port = (is_https && base.port == 443) || (!is_https && base.port == 80);
     if (!default_port) {
         result.push_back(':');
         result.append(std::to_string(base.port));
@@ -696,7 +696,7 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
         co_return 1;
     }
 
-    std::FILE* output = nullptr;
+    std::FILE* output       = nullptr;
     bool       close_output = false;
     if (options.output_path.has_value()) {
         if (*options.output_path == "-") {
@@ -716,14 +716,14 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
     if (options.insecure)
         CO_WQ_LOG_WARN("[co_curl] --insecure currently skips additional certificate checks (default behavior)");
 
-    std::string current_url    = options.url;
-    std::string current_method = options.method;
-    std::string current_body   = options.body;
+    std::string current_url          = options.url;
+    std::string current_method       = options.method;
+    std::string current_body         = options.body;
     bool        drop_content_headers = false;
 
-    int   redirect_count = 0;
-    int   final_status   = 0;
-    bool  success        = false;
+    int  redirect_count = 0;
+    int  final_status   = 0;
+    bool success        = false;
 
     while (redirect_count <= options.max_redirects) {
         auto parsed = parse_url(current_url);
@@ -738,17 +738,30 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
             log_request_verbose(*parsed, state, built);
 
         ResponseContext response_ctx;
-        response_ctx.verbose          = options.verbose;
-        response_ctx.include_headers  = options.include_headers;
-        response_ctx.buffer_body      = options.follow_redirects;
-        response_ctx.output           = output;
+        response_ctx.verbose         = options.verbose;
+        response_ctx.include_headers = options.include_headers;
+        response_ctx.buffer_body     = options.follow_redirects;
+        response_ctx.output          = output;
 
         int rc = 0;
         if (parsed->scheme == "https") {
 #if defined(USING_SSL)
-            auto tls_socket = fdwq.make_tls_socket(net::tls_context::make(net::tls_mode::Client), net::tls_mode::Client);
+            auto tls_socket = fdwq.make_tls_socket(net::tls_context::make(net::tls_mode::Client),
+                                                   net::tls_mode::Client);
             apply_tls_sni(tls_socket, parsed->host);
-            int connect_rc = co_await tls_socket.underlying().connect(parsed->host, parsed->port);
+            auto&                     tcp_base = tls_socket.underlying();
+            net::dns::resolve_options dns_opts;
+            dns_opts.family           = tcp_base.family();
+            dns_opts.allow_dual_stack = tcp_base.dual_stack();
+            auto resolved             = net::dns::resolve_sync(parsed->host, parsed->port, dns_opts);
+            if (!resolved.success) {
+                CO_WQ_LOG_ERROR("[co_curl] dns resolve failed: %s (%d)",
+                                resolved.error_message.c_str(),
+                                resolved.error_code);
+                co_return 1;
+            }
+            int connect_rc = co_await tcp_base.connect(reinterpret_cast<const sockaddr*>(&resolved.storage),
+                                                       resolved.length);
             if (connect_rc != 0) {
                 CO_WQ_LOG_ERROR("[co_curl] connect failed: %s", std::strerror(errno));
                 co_return 1;
@@ -765,8 +778,19 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
             co_return 1;
 #endif
         } else {
-            auto tcp_socket = fdwq.make_tcp_socket(AF_INET6, true);
-            int  connect_rc = co_await tcp_socket.connect(parsed->host, parsed->port);
+            auto                      tcp_socket = fdwq.make_tcp_socket(AF_INET6, true);
+            net::dns::resolve_options dns_opts;
+            dns_opts.family           = tcp_socket.family();
+            dns_opts.allow_dual_stack = tcp_socket.dual_stack();
+            auto resolved             = net::dns::resolve_sync(parsed->host, parsed->port, dns_opts);
+            if (!resolved.success) {
+                CO_WQ_LOG_ERROR("[co_curl] dns resolve failed: %s (%d)",
+                                resolved.error_message.c_str(),
+                                resolved.error_code);
+                co_return 1;
+            }
+            int connect_rc = co_await tcp_socket.connect(reinterpret_cast<const sockaddr*>(&resolved.storage),
+                                                         resolved.length);
             if (connect_rc != 0) {
                 CO_WQ_LOG_ERROR("[co_curl] connect failed: %s", std::strerror(errno));
                 co_return 1;
@@ -781,7 +805,7 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
 
         final_status = response_ctx.status_code;
 
-        bool should_redirect = false;
+        bool        should_redirect = false;
         std::string location;
         if (options.follow_redirects && redirect_count < options.max_redirects) {
             switch (response_ctx.status_code) {
@@ -870,12 +894,12 @@ int main(int argc, char* argv[])
 
     co_wq::test::SysStatsLogger stats_logger("co_curl");
 
-    auto&          wq  = get_sys_workqueue(0);
+    auto&          wq = get_sys_workqueue(0);
     NetFdWorkqueue fdwq(wq);
 
-    auto client_task = run_client(fdwq, std::move(options));
-    auto coroutine   = client_task.get();
-    auto& promise    = coroutine.promise();
+    auto  client_task = run_client(fdwq, std::move(options));
+    auto  coroutine   = client_task.get();
+    auto& promise     = coroutine.promise();
 
     std::atomic_bool finished { false };
     promise.mUserData    = &finished;

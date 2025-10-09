@@ -4,6 +4,7 @@
 #include "test_sys_stats_logger.hpp"
 
 #if defined(USING_NET)
+#include "dns_resolver.hpp"
 #include "fd_base.hpp"
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
@@ -111,10 +112,18 @@ echo_server(NetFdWorkqueue& fdwq, std::string host, uint16_t port, int max_conn)
 
 static Task<void, Work_Promise<SpinLock, void>> echo_client(NetFdWorkqueue& fdwq, std::string host, uint16_t port)
 {
-    auto sock = fdwq.make_tcp_socket();
-    int  rc   = co_await sock.connect(host, port);
+    auto                      sock = fdwq.make_tcp_socket();
+    net::dns::resolve_options opts;
+    opts.family           = sock.family();
+    opts.allow_dual_stack = sock.dual_stack();
+    auto resolved         = net::dns::resolve_sync(host, port, opts);
+    if (!resolved.success) {
+        CO_WQ_LOG_ERROR("connect failed: dns error=%s (%d)", resolved.error_message.c_str(), resolved.error_code);
+        co_return;
+    }
+    int rc = co_await sock.connect(reinterpret_cast<const sockaddr*>(&resolved.storage), resolved.length);
     if (rc != 0) {
-        CO_WQ_LOG_ERROR("connect failed");
+        CO_WQ_LOG_ERROR("connect failed rc=%d", rc);
         co_return;
     }
     char buf[256];

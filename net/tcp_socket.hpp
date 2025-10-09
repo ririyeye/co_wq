@@ -10,12 +10,10 @@
 #include "worker.hpp"
 #include <cstdio>
 #include <cstring>
-#include <memory>
 #include <string>
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif
@@ -74,17 +72,25 @@ public:
      *
      * 在 `connect_with` 中使用 `build` 方法将文本地址转换为 `sockaddr_storage`。
      */
-    struct dns_endpoint {
+    struct ip_endpoint {
         const tcp_socket& sock;
         std::string       host;
         uint16_t          port;
-        bool              allow_dual { false };
 
-        [[nodiscard]] static std::string strip_brackets(const std::string& input)
+        static std::string strip_brackets(const std::string& input)
         {
             if (input.size() >= 2 && input.front() == '[' && input.back() == ']')
                 return input.substr(1, input.size() - 2);
             return input;
+        }
+
+        static int inet_pton_wrapper(int family, const std::string& text, void* dst)
+        {
+#if defined(_WIN32)
+            return ::InetPtonA(family, text.c_str(), dst);
+#else
+            return ::inet_pton(family, text.c_str(), dst);
+#endif
         }
 
         [[nodiscard]] bool build(sockaddr_storage& storage, socklen_t& len) const
@@ -93,43 +99,51 @@ public:
             if (node.empty())
                 return false;
 
-            addrinfo hints {};
-            hints.ai_socktype = SOCK_STREAM;
-            hints.ai_protocol = IPPROTO_TCP;
-            hints.ai_family   = sock.family();
-            if (hints.ai_family == AF_INET6 && allow_dual)
-                hints.ai_family = AF_UNSPEC;
+            const bool looks_ipv6 = node.find(':') != std::string::npos;
+            auto       family     = sock.family();
 
-            char service[16] {};
-            std::snprintf(service, sizeof(service), "%u", static_cast<unsigned>(port));
+            if (family == AF_INET) {
+                if (looks_ipv6)
+                    return false;
+                auto* addr = reinterpret_cast<sockaddr_in*>(&storage);
+                std::memset(addr, 0, sizeof(sockaddr_in));
+                addr->sin_family = AF_INET;
+                addr->sin_port   = htons(port);
+                if (inet_pton_wrapper(AF_INET, node, &addr->sin_addr) <= 0)
+                    return false;
+                len = static_cast<socklen_t>(sizeof(sockaddr_in));
+                return true;
+            }
 
-            addrinfo* result = nullptr;
-            int       rc     = ::getaddrinfo(node.c_str(), service, &hints, &result);
-            if (rc != 0 || !result)
-                return false;
-
-            std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> guard(result, ::freeaddrinfo);
-            for (auto* ai = result; ai; ai = ai->ai_next) {
-                if (ai->ai_family == sock.family()) {
-                    if (static_cast<size_t>(ai->ai_addrlen) > sizeof(storage))
-                        continue;
-                    std::memcpy(&storage, ai->ai_addr, ai->ai_addrlen);
-                    len = static_cast<socklen_t>(ai->ai_addrlen);
-                    return true;
-                }
-                if (sock.family() == AF_INET6 && allow_dual && ai->ai_family == AF_INET) {
-                    auto* v4 = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
-                    auto* v6 = reinterpret_cast<sockaddr_in6*>(&storage);
-                    std::memset(v6, 0, sizeof(sockaddr_in6));
-                    v6->sin6_family           = AF_INET6;
-                    v6->sin6_port             = v4->sin_port;
-                    v6->sin6_addr.s6_addr[10] = 0xFF;
-                    v6->sin6_addr.s6_addr[11] = 0xFF;
-                    std::memcpy(&v6->sin6_addr.s6_addr[12], &v4->sin_addr, sizeof(v4->sin_addr));
+            if (family == AF_INET6) {
+                if (looks_ipv6) {
+                    auto* addr6 = reinterpret_cast<sockaddr_in6*>(&storage);
+                    std::memset(addr6, 0, sizeof(sockaddr_in6));
+                    addr6->sin6_family = AF_INET6;
+                    addr6->sin6_port   = htons(port);
+                    if (inet_pton_wrapper(AF_INET6, node, &addr6->sin6_addr) <= 0)
+                        return false;
                     len = static_cast<socklen_t>(sizeof(sockaddr_in6));
                     return true;
                 }
+
+                if (!sock.dual_stack())
+                    return false;
+
+                sockaddr_in  addr4 {};
+                sockaddr_in6 addr6 {};
+                if (inet_pton_wrapper(AF_INET, node, &addr4.sin_addr) <= 0)
+                    return false;
+                addr6.sin6_family           = AF_INET6;
+                addr6.sin6_port             = htons(port);
+                addr6.sin6_addr.s6_addr[10] = 0xFF;
+                addr6.sin6_addr.s6_addr[11] = 0xFF;
+                std::memcpy(&addr6.sin6_addr.s6_addr[12], &addr4.sin_addr, sizeof(addr4.sin_addr));
+                std::memcpy(&storage, &addr6, sizeof(addr6));
+                len = static_cast<socklen_t>(sizeof(sockaddr_in6));
+                return true;
             }
+
             return false;
         }
     };
@@ -160,7 +174,7 @@ public:
      */
     auto connect(const std::string& host, uint16_t port)
     {
-        return this->connect_with(dns_endpoint { *this, host, port, dual_stack() });
+        return this->connect_with(ip_endpoint { *this, host, port });
     }
 
     /**

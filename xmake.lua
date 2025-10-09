@@ -96,6 +96,7 @@ target("co_wq")
         add_includedirs("io", {public = true})
         add_includedirs("net", {public = true})
         add_defines("USING_NET", {public = true})
+        add_files("net/dns_resolver.cpp")
         if is_plat("windows") then
             add_links("Ws2_32")
             add_files("io/wepoll/wepoll.c")

@@ -6,6 +6,7 @@
 #include "syswork.hpp"
 #include "test_sys_stats_logger.hpp"
 
+#include "dns_resolver.hpp"
 #include "fd_base.hpp"
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
@@ -15,9 +16,11 @@
 #include <llhttp.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +42,7 @@
 #include <arpa/inet.h>
 #include <cerrno> // NOLINT(modernize-deprecated-headers)
 #include <csignal>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -50,112 +54,74 @@ using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
 
 namespace {
 
+std::string to_lower(std::string_view input)
+{
+    std::string result;
+    result.reserve(input.size());
+    for (unsigned char ch : input)
+        result.push_back(static_cast<char>(std::tolower(ch)));
+    return result;
+}
+
 bool parse_port(std::string_view input, uint16_t& port_out)
 {
     if (input.empty() || input.size() > 5)
         return false;
 
-    unsigned int value = 0;
-    for (char ch : input) {
-        if (!std::isdigit(static_cast<unsigned char>(ch)))
+    uint32_t value = 0;
+    for (unsigned char ch : input) {
+        if (!std::isdigit(ch))
             return false;
-        value = value * 10u + static_cast<unsigned int>(ch - '0');
+        value = value * 10 + static_cast<uint32_t>(ch - '0');
         if (value > std::numeric_limits<uint16_t>::max())
             return false;
     }
-
     port_out = static_cast<uint16_t>(value);
     return true;
 }
 
-std::string to_lower(std::string_view input)
-{
-    std::string result;
-    result.reserve(input.size());
-    for (char ch : input) {
-        result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    }
-    return result;
-}
-
 bool split_host_port(std::string_view input, uint16_t default_port, std::string& host_out, uint16_t& port_out)
 {
+    host_out.clear();
+    port_out = default_port;
+
     if (input.empty())
         return false;
 
-    std::string host;
-    std::string port_str;
-
     if (input.front() == '[') {
-        auto close = input.find(']');
-        if (close == std::string::npos)
+        auto closing = input.find(']');
+        if (closing == std::string_view::npos)
             return false;
-        host        = std::string(input.substr(1, close - 1));
-        size_t next = close + 1;
-        if (next < input.size()) {
-            if (input[next] != ':')
-                return false;
-            port_str = std::string(input.substr(next + 1));
-        }
-    } else {
-        auto colon = input.find(':');
-        if (colon != std::string::npos) {
-            if (input.find(':', colon + 1) != std::string::npos)
-                return false; // IPv6 literal must be bracketed
-            host     = std::string(input.substr(0, colon));
-            port_str = std::string(input.substr(colon + 1));
-        } else {
-            host = std::string(input);
-        }
+        host_out.assign(input.substr(1, closing - 1));
+        if (closing + 1 == input.size())
+            return true;
+        if (input[closing + 1] != ':')
+            return false;
+        std::string_view port_part = input.substr(closing + 2);
+        uint16_t         port      = 0;
+        if (!parse_port(port_part, port))
+            return false;
+        port_out = port;
+        return true;
     }
 
-    if (host.empty())
-        return false;
-
-    uint16_t port_value = default_port;
-    if (!port_str.empty()) {
-        if (!parse_port(port_str, port_value))
+    auto first_colon = input.find(':');
+    auto last_colon  = input.rfind(':');
+    if (first_colon != std::string_view::npos && first_colon == last_colon) {
+        std::string_view host_part = input.substr(0, first_colon);
+        std::string_view port_part = input.substr(first_colon + 1);
+        if (host_part.empty())
             return false;
+        uint16_t port = 0;
+        if (!parse_port(port_part, port))
+            return false;
+        host_out.assign(host_part);
+        port_out = port;
+        return true;
     }
 
-    host_out = std::move(host);
-    port_out = port_value;
+    host_out.assign(input);
     return true;
-}
-
-std::string format_host_for_log(const std::string& host)
-{
-    if (host.find(':') != std::string::npos) {
-        std::ostringstream oss;
-        oss << '[' << host << ']';
-        return oss.str();
-    }
-    return host;
-}
-
-std::filesystem::path find_project_root(const std::filesystem::path& start_dir)
-{
-    std::error_code ec;
-    auto            current = std::filesystem::weakly_canonical(start_dir, ec);
-    if (ec)
-        current = start_dir;
-
-    while (!current.empty()) {
-        auto candidate_xmake = current / "xmake.lua";
-        if (std::filesystem::exists(candidate_xmake, ec) && !ec)
-            return current;
-
-        auto candidate_git = current / ".git";
-        if (std::filesystem::exists(candidate_git, ec) && !ec)
-            return current;
-
-        auto parent = current.parent_path();
-        if (parent == current)
-            break;
-        current = std::move(parent);
-    }
-
-    return {};
 }
 
 struct HeaderEntry {
@@ -192,65 +158,31 @@ struct HttpProxyContext {
     }
 };
 
-std::string format_peer_id(uint64_t session_id)
+std::string format_host_for_log(const std::string& host)
 {
-    std::ostringstream oss;
-    oss << '[' << session_id << ']';
-    return oss.str();
+    if (host.find(':') != std::string::npos) {
+        if (!host.empty() && host.front() == '[' && host.back() == ']')
+            return host;
+        return '[' + host + ']';
+    }
+    return host;
 }
 
-std::string format_ipv4(const in_addr& addr)
+std::string format_sockaddr(const sockaddr* addr, socklen_t len)
 {
-    char buf[INET_ADDRSTRLEN] {};
-    if (::inet_ntop(AF_INET, &addr, buf, sizeof(buf)) == nullptr)
+    if (addr == nullptr || len <= 0)
         return {};
-    return std::string(buf);
-}
-
-std::string format_ipv6(const in6_addr& addr)
-{
-    char buf[INET6_ADDRSTRLEN] {};
-    if (::inet_ntop(AF_INET6, &addr, buf, sizeof(buf)) == nullptr)
+    char host[NI_MAXHOST]    = {};
+    char service[NI_MAXSERV] = {};
+    int  rc = ::getnameinfo(addr, len, host, sizeof(host), service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (rc != 0)
         return {};
-    return std::string(buf);
-}
-
-std::string format_sockaddr(const sockaddr_storage& addr)
-{
-    switch (addr.ss_family) {
-    case AF_INET: {
-        auto*              v4 = reinterpret_cast<const sockaddr_in*>(&addr);
-        std::ostringstream oss;
-        oss << format_ipv4(v4->sin_addr) << ':' << ntohs(v4->sin_port);
-        return oss.str();
-    }
-    case AF_INET6: {
-        auto*       v6           = reinterpret_cast<const sockaddr_in6*>(&addr);
-        const auto& bytes        = v6->sin6_addr.s6_addr;
-        bool        leading_zero = true;
-        for (int i = 0; i < 10; ++i) {
-            if (bytes[i] != 0) {
-                leading_zero = false;
-                break;
-            }
-        }
-        bool is_mapped = leading_zero && bytes[10] == 0xFF && bytes[11] == 0xFF;
-        if (is_mapped) {
-            in_addr mapped {};
-            std::memcpy(&mapped, &bytes[12], sizeof(mapped));
-            std::ostringstream oss;
-            oss << format_ipv4(mapped) << ':' << ntohs(v6->sin6_port);
-            return oss.str();
-        }
-        std::ostringstream oss;
-        oss << '[' << format_ipv6(v6->sin6_addr) << "]:" << ntohs(v6->sin6_port);
-        return oss.str();
-    }
-    default:
-        break;
-    }
     std::ostringstream oss;
-    oss << "af=" << static_cast<int>(addr.ss_family);
+    if (addr->sa_family == AF_INET6)
+        oss << '[' << host << ']';
+    else
+        oss << host;
+    oss << ':' << service;
     return oss.str();
 }
 
@@ -260,7 +192,31 @@ std::string describe_remote_endpoint(const net::tcp_socket<SpinLock>& socket)
     socklen_t        len = sizeof(addr);
     if (::getpeername(socket.native_handle(), reinterpret_cast<sockaddr*>(&addr), &len) != 0)
         return {};
-    return format_sockaddr(addr);
+    return format_sockaddr(reinterpret_cast<sockaddr*>(&addr), len);
+}
+
+std::string format_peer_id(uint64_t session_id)
+{
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "session-%06llu", static_cast<unsigned long long>(session_id));
+    return std::string(buffer);
+}
+
+std::filesystem::path find_project_root(std::filesystem::path current)
+{
+    if (current.empty())
+        return {};
+    current = current.lexically_normal();
+    std::error_code ec;
+    while (!current.empty()) {
+        if (std::filesystem::exists(current / "xmake.lua", ec) || std::filesystem::exists(current / ".git", ec))
+            return current;
+        auto parent = current.parent_path();
+        if (parent == current)
+            break;
+        current = std::move(parent);
+    }
+    return {};
 }
 
 struct PipeOutcome {
@@ -570,13 +526,6 @@ void configure_tcp_keepalive(net::tcp_socket<SpinLock>& socket, const std::strin
 #endif
 }
 
-Task<int, Work_Promise<SpinLock, int>>
-connect_upstream(net::tcp_socket<SpinLock>& socket, NetFdWorkqueue& fdwq, const std::string& host, uint16_t port)
-{
-    (void)fdwq;
-    co_return co_await socket.connect(host, port);
-}
-
 // 构造最小化的 HTTP/1.1 错误/控制响应。
 std::string build_http_response(int status_code, const std::string& reason, const std::string& body)
 {
@@ -672,6 +621,12 @@ std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
 std::atomic_int                g_active_sessions { 0 };
 std::atomic<uint64_t>          g_next_session_id { 1 };
 
+net::dns::async_resolver& get_dns_resolver()
+{
+    static net::dns::async_resolver resolver;
+    return resolver;
+}
+
 void on_connection_task_completed(co_wq::Promise_base& promise)
 {
     if (auto* counter = static_cast<std::atomic_int*>(promise.mUserData)) {
@@ -760,17 +715,68 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
 }
 
 // 建立 CONNECT 隧道，将客户端/上游 sockets 互相转发，直到任一方关闭。
-Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock>& client,
-                                                        NetFdWorkqueue&            fdwq,
-                                                        const ConnectTarget&       target,
-                                                        const std::string&         peer_id)
+Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock>&            client,
+                                                        NetFdWorkqueue&                       fdwq,
+                                                        const ConnectTarget&                  target,
+                                                        const std::string&                    peer_id,
+                                                        std::chrono::steady_clock::time_point request_start)
 {
     auto upstream = make_upstream_socket(fdwq);
     CO_WQ_LOG_INFO("[proxy] %s CONNECT %s:%u",
                    peer_id.c_str(),
                    format_host_for_log(target.host).c_str(),
                    static_cast<unsigned>(target.port));
-    int rc = co_await connect_upstream(upstream, fdwq, target.host, target.port);
+
+    net::dns::resolve_options opts;
+    opts.family           = upstream.family();
+    opts.allow_dual_stack = upstream.dual_stack();
+    auto       dns_result = co_await get_dns_resolver().resolve(upstream.exec(), target.host, target.port, opts);
+    auto       finish_tp  = dns_result.finish_time;
+    const auto now_tp     = std::chrono::steady_clock::now();
+    if (finish_tp == std::chrono::steady_clock::time_point {})
+        finish_tp = now_tp;
+    auto start_tp              = dns_result.start_time == std::chrono::steady_clock::time_point {} ? finish_tp
+                                                                                                   : dns_result.start_time;
+    auto submit_tp             = dns_result.submit_time == std::chrono::steady_clock::time_point {} ? start_tp
+                                                                                                    : dns_result.submit_time;
+    auto elapsed_since_request = std::chrono::duration_cast<std::chrono::milliseconds>(finish_tp - request_start)
+                                     .count();
+    auto queue_ms = std::max<long long>(
+        0LL,
+        std::chrono::duration_cast<std::chrono::milliseconds>(start_tp - submit_tp).count());
+    auto lookup_ms = std::max<long long>(
+        0LL,
+        std::chrono::duration_cast<std::chrono::milliseconds>(finish_tp - start_tp).count());
+
+    if (!dns_result.success) {
+        CO_WQ_LOG_WARN(
+            "[proxy] %s DNS resolve failed %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld error=%s (%d)",
+            peer_id.c_str(),
+            target.host.c_str(),
+            static_cast<unsigned>(target.port),
+            static_cast<long long>(elapsed_since_request),
+            static_cast<long long>(lookup_ms),
+            static_cast<long long>(queue_ms),
+            dns_result.error_message.c_str(),
+            dns_result.error_code);
+        std::string response = build_http_response(502, "Bad Gateway", "Failed to resolve upstream host\n");
+        (void)co_await client.send_all(response.data(), response.size());
+        client.close();
+        CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=dns_resolve_failed duration_ms=%lld",
+                       peer_id.c_str(),
+                       static_cast<long long>(elapsed_since_request));
+        co_return;
+    }
+
+    CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld",
+                   peer_id.c_str(),
+                   target.host.c_str(),
+                   static_cast<unsigned>(target.port),
+                   static_cast<long long>(elapsed_since_request),
+                   static_cast<long long>(lookup_ms),
+                   static_cast<long long>(queue_ms));
+
+    int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
         CO_WQ_LOG_WARN("[proxy] %s CONNECT upstream failed %s:%u rc=%d",
                        peer_id.c_str(),
@@ -830,11 +836,12 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
 }
 
 // 处理常规 HTTP 请求：重新构造请求行/头部并回源，然后将响应回写给客户端。
-Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&          ctx,
-                                                             net::tcp_socket<SpinLock>& client,
-                                                             NetFdWorkqueue&            fdwq,
-                                                             const UrlParts&            parts,
-                                                             const std::string&         peer_id)
+Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&                     ctx,
+                                                             net::tcp_socket<SpinLock>&            client,
+                                                             NetFdWorkqueue&                       fdwq,
+                                                             const UrlParts&                       parts,
+                                                             const std::string&                    peer_id,
+                                                             std::chrono::steady_clock::time_point request_start)
 {
     auto upstream = make_upstream_socket(fdwq);
     CO_WQ_LOG_INFO("[proxy] %s %s %s:%u%s",
@@ -843,7 +850,57 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
                    format_host_for_log(parts.host).c_str(),
                    static_cast<unsigned>(parts.port),
                    parts.path.c_str());
-    int rc = co_await connect_upstream(upstream, fdwq, parts.host, parts.port);
+
+    net::dns::resolve_options opts;
+    opts.family           = upstream.family();
+    opts.allow_dual_stack = upstream.dual_stack();
+    auto       dns_result = co_await get_dns_resolver().resolve(upstream.exec(), parts.host, parts.port, opts);
+    auto       finish_tp  = dns_result.finish_time;
+    const auto now_tp     = std::chrono::steady_clock::now();
+    if (finish_tp == std::chrono::steady_clock::time_point {})
+        finish_tp = now_tp;
+    auto start_tp              = dns_result.start_time == std::chrono::steady_clock::time_point {} ? finish_tp
+                                                                                                   : dns_result.start_time;
+    auto submit_tp             = dns_result.submit_time == std::chrono::steady_clock::time_point {} ? start_tp
+                                                                                                    : dns_result.submit_time;
+    auto elapsed_since_request = std::chrono::duration_cast<std::chrono::milliseconds>(finish_tp - request_start)
+                                     .count();
+    auto queue_ms = std::max<long long>(
+        0LL,
+        std::chrono::duration_cast<std::chrono::milliseconds>(start_tp - submit_tp).count());
+    auto lookup_ms = std::max<long long>(
+        0LL,
+        std::chrono::duration_cast<std::chrono::milliseconds>(finish_tp - start_tp).count());
+
+    if (!dns_result.success) {
+        CO_WQ_LOG_WARN(
+            "[proxy] %s DNS resolve failed %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld error=%s (%d)",
+            peer_id.c_str(),
+            parts.host.c_str(),
+            static_cast<unsigned>(parts.port),
+            static_cast<long long>(elapsed_since_request),
+            static_cast<long long>(lookup_ms),
+            static_cast<long long>(queue_ms),
+            dns_result.error_message.c_str(),
+            dns_result.error_code);
+        std::string response = build_http_response(502, "Bad Gateway", "Failed to resolve upstream host\n");
+        (void)co_await client.send_all(response.data(), response.size());
+        client.close();
+        CO_WQ_LOG_INFO("[proxy] %s response closed status=dns_resolve_failed duration_ms=%lld",
+                       peer_id.c_str(),
+                       static_cast<long long>(elapsed_since_request));
+        co_return;
+    }
+
+    CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld",
+                   peer_id.c_str(),
+                   parts.host.c_str(),
+                   static_cast<unsigned>(parts.port),
+                   static_cast<long long>(elapsed_since_request),
+                   static_cast<long long>(lookup_ms),
+                   static_cast<long long>(queue_ms));
+
+    int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
         CO_WQ_LOG_WARN("[proxy] %s upstream connect failed %s:%u rc=%d",
                        peer_id.c_str(),
@@ -964,6 +1021,8 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
 
     CO_WQ_LOG_DEBUG("[proxy] %s %s %s", peer_id.c_str(), ctx.method.c_str(), ctx.url.c_str());
 
+    auto request_ready = std::chrono::steady_clock::now();
+
     if (ctx.method == "CONNECT") {
         auto target = parse_connect_target(ctx.url);
         if (!target) {
@@ -974,7 +1033,7 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
             CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=invalid_connect_target", peer_id.c_str());
             co_return;
         }
-        co_await handle_connect(client, fdwq, *target, peer_id);
+        co_await handle_connect(client, fdwq, *target, peer_id, request_ready);
         co_return;
     }
 
@@ -987,7 +1046,7 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
         co_return;
     }
 
-    co_await handle_http_request(ctx, client, fdwq, *parts, peer_id);
+    co_await handle_http_request(ctx, client, fdwq, *parts, peer_id, request_ready);
     co_return;
 }
 

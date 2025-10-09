@@ -8,6 +8,7 @@
 #include "syswork.hpp"
 #include "test_sys_stats_logger.hpp"
 
+#include "dns_resolver.hpp"
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
 #include "when_all.hpp"
@@ -234,7 +235,13 @@ Task<int, Work_Promise<SpinLock, int>>
 connect_upstream(net::tcp_socket<SpinLock>& socket, NetFdWorkqueue& fdwq, const std::string& host, uint16_t port)
 {
     (void)fdwq;
-    co_return co_await socket.connect(host, port);
+    net::dns::resolve_options opts;
+    opts.family           = socket.family();
+    opts.allow_dual_stack = socket.dual_stack();
+    auto resolved         = net::dns::resolve_sync(host, port, opts);
+    if (!resolved.success)
+        co_return -1;
+    co_return co_await socket.connect(reinterpret_cast<const sockaddr*>(&resolved.storage), resolved.length);
 }
 
 struct SocksRequest {
