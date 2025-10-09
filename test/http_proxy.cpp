@@ -36,10 +36,10 @@
 #include <windows.h>
 #include <ws2tcpip.h>
 #else
+#include <arpa/inet.h>
 #include <cerrno> // NOLINT(modernize-deprecated-headers)
 #include <csignal>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
 
 #endif
@@ -219,14 +219,14 @@ std::string format_sockaddr(const sockaddr_storage& addr)
 {
     switch (addr.ss_family) {
     case AF_INET: {
-        auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
+        auto*              v4 = reinterpret_cast<const sockaddr_in*>(&addr);
         std::ostringstream oss;
         oss << format_ipv4(v4->sin_addr) << ':' << ntohs(v4->sin_port);
         return oss.str();
     }
     case AF_INET6: {
-        auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
-        const auto& bytes = v6->sin6_addr.s6_addr;
+        auto*       v6           = reinterpret_cast<const sockaddr_in6*>(&addr);
+        const auto& bytes        = v6->sin6_addr.s6_addr;
         bool        leading_zero = true;
         for (int i = 0; i < 10; ++i) {
             if (bytes[i] != 0) {
@@ -289,8 +289,12 @@ template <typename Socket> std::string describe_socket_state(const Socket& socke
 }
 
 template <typename SrcSocket, typename DstSocket>
-Task<void, Work_Promise<SpinLock, void>>
-pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string flow_desc, PipeOutcome& outcome)
+Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket&   src,
+                                                   DstSocket&   dst,
+                                                   bool         propagate_shutdown,
+                                                   std::string  flow_desc,
+                                                   PipeOutcome& outcome,
+                                                   bool         close_dst_on_eof = false)
 {
     const char*            flow = flow_desc.empty() ? "stream" : flow_desc.c_str();
     std::array<char, 8192> buffer {};
@@ -302,10 +306,7 @@ pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string f
         if (n == 0) {
             auto src_state = describe_socket_state(src);
             auto dst_state = describe_socket_state(dst);
-            CO_WQ_LOG_INFO("[proxy] %s closed (EOF) local=%s peer=%s",
-                           flow,
-                           src_state.c_str(),
-                           dst_state.c_str());
+            CO_WQ_LOG_INFO("[proxy] %s closed (EOF) local=%s peer=%s", flow, src_state.c_str(), dst_state.c_str());
             outcome.status = "eof";
             if (propagate_shutdown) {
                 if constexpr (requires(DstSocket& s) {
@@ -316,18 +317,53 @@ pipe_data(SrcSocket& src, DstSocket& dst, bool propagate_shutdown, std::string f
                         dst.shutdown_tx();
                 }
             }
+            if (close_dst_on_eof) {
+                if constexpr (requires(DstSocket& s) {
+                                  s.close();
+                                  s.closed();
+                              }) {
+                    if (!dst.closed())
+                        dst.close();
+                } else if constexpr (requires(DstSocket& s) { s.close(); }) {
+                    dst.close();
+                }
+            }
             break;
         }
         if (n < 0) {
-            auto src_state = describe_socket_state(src);
-            auto dst_state = describe_socket_state(dst);
-            CO_WQ_LOG_WARN("[proxy] %s recv error rc=%lld local=%s peer=%s",
-                           flow,
-                           static_cast<long long>(n),
-                           src_state.c_str(),
-                           dst_state.c_str());
-            outcome.status    = std::string("recv_error rc=") + std::to_string(static_cast<long long>(n));
-            outcome.had_error = true;
+            auto src_state     = describe_socket_state(src);
+            auto dst_state     = describe_socket_state(dst);
+            bool source_closed = false;
+            if constexpr (requires { src.closed(); }) {
+                source_closed = src.closed();
+            }
+            if (source_closed) {
+                CO_WQ_LOG_INFO("[proxy] %s recv aborted (socket already closed) local=%s peer=%s",
+                               flow,
+                               src_state.c_str(),
+                               dst_state.c_str());
+                outcome.status    = "cancelled";
+                outcome.had_error = false;
+            } else {
+                CO_WQ_LOG_WARN("[proxy] %s recv error rc=%lld local=%s peer=%s",
+                               flow,
+                               static_cast<long long>(n),
+                               src_state.c_str(),
+                               dst_state.c_str());
+                outcome.status    = std::string("recv_error rc=") + std::to_string(static_cast<long long>(n));
+                outcome.had_error = true;
+            }
+            if (close_dst_on_eof) {
+                if constexpr (requires(DstSocket& s) {
+                                  s.close();
+                                  s.closed();
+                              }) {
+                    if (!dst.closed())
+                        dst.close();
+                } else if constexpr (requires(DstSocket& s) { s.close(); }) {
+                    dst.close();
+                }
+            }
             break;
         }
 
@@ -770,9 +806,10 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     PipeOutcome upstream_to_client_outcome;
     auto        client_to_upstream = pipe_data(client,
                                         upstream,
-                                        false,
+                                        true,
                                         peer_id + " client->upstream",
-                                        client_to_upstream_outcome);
+                                        client_to_upstream_outcome,
+                                        true);
     auto        upstream_to_client = pipe_data(upstream,
                                         client,
                                         true,
@@ -836,11 +873,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
     configure_tcp_keepalive(upstream, peer_id, "upstream");
 
     PipeOutcome response_outcome;
-    co_await pipe_data(upstream,
-                       client,
-                       false,
-                       peer_id + " upstream->client",
-                       response_outcome);
+    co_await pipe_data(upstream, client, false, peer_id + " upstream->client", response_outcome);
 
     std::string response_status = response_outcome.had_error ? "error" : "completed";
     CO_WQ_LOG_INFO("[proxy] %s %s:%u response closed status=%s upstream->client=%s",
