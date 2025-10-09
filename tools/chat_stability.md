@@ -9,8 +9,7 @@
 ## 构建 C++ 测试服务器
 
 ```powershell
-# 需要 Git Bash / MSYS2 等环境以执行 .sh 脚本
-bash script/xmk-local.sh
+python .\script\xmk.py build
 xmake build co_chat
 ```
 

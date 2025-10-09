@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3  # removed soon
 """Capture proxy traffic using dumpcap.
 
 This script replicates the functionality of capture_proxy.bat with a Python interface.

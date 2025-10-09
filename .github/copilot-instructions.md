@@ -6,9 +6,9 @@
 - Linux 默认依赖 `epoll`，Windows 通过 Wine + MSVC 构建转 IOCP。`USING_NET/USING_SSL/USING_USB/USING_EXAMPLE` 控制可选模块。
 
 ## 构建与脚本
-- 优先运行 `bash script/xmk-local.sh`：`xmake` 配置 releasedbg 模式、启用 examples、生成 `compile_commands.json`，并将产物安装到 `install/`。
+- 优先运行 `python script/xmk.py build`：`xmake` 配置 releasedbg 模式、启用 examples、生成 `compile_commands.json`，并将产物安装到 `install/`。
 - Windows(Wine) 使用 `bash script/xmk-wine-msvc.sh`，需先安装 msvc-wine SDK；脚本会 `xmake -p windows -a x64` 并单独构建 `co_wq`。
-- 清理使用 `bash script/clean.sh`（会删 `.xmake/ build/ install/` 等）。
+- 清理使用 `python script/xmk.py clean`（会删 `.xmake/ build/ install/ .cache/`，可附带 `--remove-global-cache` 删除 `~/.xmake`）。
 - 手动 xmake：`xmake f -y -m releasedbg --USING_EXAMPLE=y -o build` → `xmake -vD` → `xmake install -o install`。
 - 注意 `xmake` 目标：`co_wq` 静态库 +（启用 examples 时）`test/xmake.lua` 下的 `co_echo/co_http/...` 可执行文件。
 
@@ -40,9 +40,9 @@
 - 添加新 awaiter 时参考 `io/file_io.hpp` 的 two-phase 模式：尝试->注册等待->复用同一节点。
 - 引入新网络原语需在 `xmake.lua` 中 gated by `USING_NET/USING_SSL/USING_USB`，并更新对应 includes。
 - 若增添示例程序，记得在 `test/xmake.lua` 注册目标并受 `USING_EXAMPLE` 控制。
-- 修改构建脚本后运行 `script/xmk-local.sh` 以刷新 `compile_commands.json`。
+- 修改构建脚本后运行 `python script/xmk.py build` 以刷新 `compile_commands.json`。
 
 ## 调试与验证
 - 判断内存泄漏：查看 `task/sys_sta.malloc_cnt/free_cnt`（例如在 demo 中打印）。
 - Reactor 问题：确认 `fd_workqueue` 构造时 `add_fd` 成功；`epoll_reactor` 在析构时会移除 fd 并唤醒所有 waiter。
-- Windows 构建：确保 `script/xmsvc.bat` 中的 `--sdk` 路径有效，必要时运行 `wineserver -k` 重启。
+- Windows 构建：在 VS 工具链环境中直接用 `python script/xmk.py build`，必要时运行 `wineserver -k` 重启 Wine。

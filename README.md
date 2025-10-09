@@ -16,7 +16,7 @@
 - `io/`：反应器、串行化调度、文件与网络 IO 封装。
 - `net/`：面向 Linux/Windows 的 TCP/UDP 高层接口。
 - `test/`：示例程序（如 `echo` 服务），需启用 `USING_EXAMPLE` 构建选项。
-- `script/`：常用构建脚本（本地、Wine-MSVC、清理）。
+- `script/`：跨平台构建/清理脚本（统一入口 `xmk.py`）及辅助工具。
 - `xmake.lua`：项目构建入口，包含平台/可选功能开关。
 - `third_party/llhttp/`：HTTP 解析器子模块（来源于 [nodejs/llhttp](https://github.com/nodejs/llhttp.git)）。
 - `script/gen_selfsigned_cert.py`：跨平台生成 TLS 自签证书的辅助脚本。
@@ -27,50 +27,47 @@
 - C++20 编译器（GCC 12+/Clang 15+/MSVC 19.36+）
 - [xmake](https://xmake.io/) 2.7+
 
-### Linux/WSL 构建
+### 跨平台构建（Python CLI）
+推荐使用 `script/xmk.py` 统一完成配置、构建与安装：
+
 ```bash
-$ bash script/xmk-local.sh
+$ python3 script/xmk.py build
 ```
-脚本默认以 `releasedbg` 模式启用网络/TLS/USB 模块与全部示例，执行流程：
-1. 以 `releasedbg` 模式写入配置，将输出目录设置为 `build/`；
-2. 根据“full”预设打开 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USING_USB/USING_EXAMPLE`；
+
+或在 PowerShell 中：
+
+```powershell
+PS> python .\script\xmk.py build
+```
+
+默认 `build` 子命令会：
+1. 以 `releasedbg` 模式写入配置并将输出目录固定为 `build/`；
+2. 根据 “full” 预设启用 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USING_USB/USING_EXAMPLE` 与 `ENABLE_LOGGING`；
 3. 生成 `compile_commands.json`；
 4. 构建并安装产物到 `install/`。
 
-若仅需最小核心（仅 `task/` 与 `sync/`），可执行：
+常用参数：
 
-```bash
-$ bash script/xmk-local.sh --core
-```
+- `--core`：仅构建最小核心（关闭网络/TLS/USB/示例与日志模块）。
+- `--debug` / `--releasedbg`：选择 xmake 构建模式（默认 `releasedbg`）。
+- `--msvc-iterator-debug`：在 Windows/MSVC 环境下启用 `_ITERATOR_DEBUG_LEVEL=2` 以捕获 STL 断言（默认关闭，可配合 `--no-msvc-iterator-debug` 还原）。
 
-使用 `--help` 查看可用模式说明。
+运行 `python script/xmk.py build --help` 查看完整选项列表。
 
 ### Windows（MSVC 工具链，本机）
-在包含 Visual Studio 工具链的 PowerShell 提示符中执行：
-```powershell
-PS> .\script\xmsvc.bat
-```
-批处理默认执行与 `xmk-local.sh` 相同的“full”配置（启用网络/TLS/USB/示例），流程包括：
-1. 以 `releasedbg` 模式写入配置并使用 `build/` 目录；
-2. 生成 `compile_commands.json`；
-3. 构建并安装到 `install/`。
+确保已加载 Visual Studio 工具链（如在“x64 Native Tools Command Prompt”或对应的 PowerShell 配置文件中），即可直接运行上述 Python 命令。脚本会自动在当前项目目录内设置 `XMAKE_GLOBALDIR`，无需额外环境变量。
 
-若只需核心库，可附加 `--core` 参数：
+### Linux/WSL
+在任何可用 `python3` 与 `xmake` 的 shell 中执行同样的命令即可，无需额外适配。
 
-```powershell
-PS> .\script\xmsvc.bat --core
-```
-
-同样可通过 `--help` 查看模式说明。
-
-> 🔍 若需排查 MSVC STL 迭代器越界，可在配置阶段附加 `--MSVC_ITERATOR_DEBUG=y`，xmake 将定义 `_ITERATOR_DEBUG_LEVEL=2` 并关闭向量化算法以获得详细断言。默认关闭以保持发行性能。
+> 🔍 若需排查 MSVC STL 迭代器越界，搭配 `python script/xmk.py build --msvc-iterator-debug` 使用即可。
 
 ### Windows（Wine + MSVC 工具链）
 参考 `script/xmk-wine-msvc.sh`：
 ```bash
 $ bash script/xmk-wine-msvc.sh
 ```
-脚本默认以 `releasedbg` 模式仅构建核心库（关闭 `USING_NET/USING_SSL/USING_USB/USING_EXAMPLE`），步骤包括：
+脚本默认以 `releasedbg` 模式仅构建核心库（关闭 `USING_NET/USING_SSL/USING_USB/USING_EXAMPLE` 且关闭日志模块），步骤包括：
 1. 写入 `--sdk=/opt/toolchain/msvc-wine/msvc` 等配置并使用 `build/` 作为输出目录；
 2. 构建并安装 `co_wq` 静态库；
 3. 生成 `compile_commands.json` 给 IDE 使用。
@@ -81,6 +78,8 @@ $ bash script/xmk-wine-msvc.sh
 $ bash script/xmk-wine-msvc.sh --full
 ```
 
+`--full` 会重新启用网络/TLS/USB/示例及日志依赖；其余构建模式可参考脚本内置说明。
+
 脚本也提供 `--help` 查看全部参数说明。
 
 > ℹ️ 首次执行任一构建脚本时，xmake 会通过内置包管理器下载依赖（如 llhttp、openssl、libusb），请确保网络连通。
@@ -89,15 +88,21 @@ $ bash script/xmk-wine-msvc.sh --full
 
 ### 清理构建缓存
 ```bash
-$ bash script/clean.sh
+$ python3 script/xmk.py clean
 ```
-该脚本会移除 `.xmake/`、`~/.xmake/`、`build/`、`install/` 及 `.cache/`。
+或在 PowerShell 中：
 
-Windows 可执行：
 ```powershell
-PS> .\script\clean.bat
+PS> python .\script\xmk.py clean
 ```
-会同样清理工作区内的构建产物，并额外尝试删除 `%USERPROFILE%\.xmake` 缓存。
+
+默认会移除 `.xmake/`、`build/`、`install/` 及 `.cache/`。若还需删除全局缓存，可附加 `--remove-global-cache`：
+
+```bash
+python3 script/xmk.py clean --remove-global-cache
+```
+
+该参数会额外清理 `~/.xmake`（或 Windows 下的 `%USERPROFILE%\.xmake`）。
 
 ## 手动使用 xmake
 默认配置仅输出核心组件（`task/` 与 `sync/`），无额外第三方依赖。可通过下表开关选择性启用模块：
@@ -109,6 +114,7 @@ PS> .\script\clean.bat
 | `USE_BUNDLED_LLHTTP` | `true` | 使用内置 `llhttp` 包处理 HTTP/WebSocket 升级（仅在 `USING_NET=y` 时生效） |
 | `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
 | `USING_EXAMPLE` | `false` | 构建 `test/` 目录下示例程序（需要配合 `USING_NET=y`） |
+| `ENABLE_LOGGING` | `true` | 打开 fmt/spdlog 依赖与日志输出宏，若构建极简核心可设为 `false` |
 | `MSVC_ITERATOR_DEBUG` | `false` | Windows/MSVC 专用，启用 `_ITERATOR_DEBUG_LEVEL=2` 并关闭向量化算法，便于定位 STL 迭代器越界 |
 
 最小化构建示例：
@@ -133,7 +139,7 @@ xmake install -o install
 
 ## TLS/SSL 支持
 
-`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。核心构建默认不启用 SSL，若需要 TLS/DTLS，可在配置阶段添加 `--USING_NET=y --USING_SSL=y`（或直接运行 `script/xmk-local.sh`/`xmsvc.bat` 默认的 “full” 模式）。此外还提供 `net::dtls_socket` 封装，基于 UDP (`net::udp_socket`) 组合实现 DTLS 握手与读写 awaiter，适用于低时延场景（需保证底层 UDP 已绑定/连接到对端）。
+`co_wq` 内置 OpenSSL 驱动的 `net::tls_socket`。核心构建默认不启用 SSL，若需要 TLS/DTLS，可在配置阶段添加 `--USING_NET=y --USING_SSL=y`（或直接运行 `python script/xmk.py build` 默认启用的 “full” 模式）。此外还提供 `net::dtls_socket` 封装，基于 UDP (`net::udp_socket`) 组合实现 DTLS 握手与读写 awaiter，适用于低时延场景（需保证底层 UDP 已绑定/连接到对端）。
 
 ## USB IO 支持
 
@@ -204,7 +210,7 @@ xmake build co_http
 xmake run co_http --host 0.0.0.0 --port 8443 --cert certs/server.crt --key certs/server.key
 ```
 
-> ✅ 已执行 `script/xmk-local.sh` 或 `script/xmsvc.bat` 默认的 “full” 模式时，可跳过上述 `xmake f` 配置步骤。
+> ✅ 已执行 `python script/xmk.py build` 默认的 “full” 模式时，可跳过上述 `xmake f` 配置步骤。
 
 随后可通过浏览器或 `curl` 访问：
 
@@ -215,7 +221,7 @@ curl -k https://127.0.0.1:8443/
 > ⚠️ 自签证书仅用于测试；生产环境请使用受信任的 CA 证书，并在服务端配置 `SSL_CTX_load_verify_locations` 等细节。
 
 ## 示例程序
-以下示例假设已通过 `script/xmk-local.sh`（默认 full）或手动执行 `xmake f` 使 `USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_EXAMPLE=y`（以及按需开启 `USING_SSL/USING_USB`）。完成配置后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：
+以下示例假设已通过 `python script/xmk.py build`（默认 full）或手动执行 `xmake f` 使 `USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_EXAMPLE=y`（以及按需开启 `USING_SSL/USING_USB`）。完成配置后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：
 ```bash
 xmake run echo --both --host 127.0.0.1 --port 12345
 ```
@@ -310,33 +316,6 @@ xmake run co_http_proxy --host 127.0.0.1 --port 18100 --log-file logs/proxy-alt.
   脚本会根据 URL 的 scheme 自动选择 HTTP 或 HTTPS 请求流程；同一轮测试可混合多个类型并同时串联若干 CONNECT 目标。
 
   脚本会输出整体成功率、失败原因分类（超时、连接失败、TLS 握手失败、HTTP 状态异常等）、平均/最大延迟，并列出失败最多的目标以协助定位；如启用 `--compare-direct`，会紧接着打印直连基线结果，便于横向对照。每次请求一旦失败会立即输出形如 `[failure] target=... reason=...` 的行，并携带本地端口与延迟信息，同时在汇总表中保留最多 10 条失败样本，方便与代理日志或抓包记录交叉排查。
-
-2. **抓包辅助脚本**：`tools/capture_proxy.py` 基于 Python 调用 Wireshark `dumpcap`，用于捕获代理本地端口及目标服务器流量，默认行为等同于旧版 `capture_proxy.bat`。
-
-     ```powershell
-     # 列出接口编号： dumpcap -D
-     python tools/capture_proxy.py 7 180
-     ```
-
-     - 位置参数依次为 `dumpcap` 可识别的接口（编号或名称）与抓包时长（秒，默认 120）；
-     - 脚本会解析 `www.baidu.com` 的 IPv4 地址并构造 BPF 过滤表达式：
-       $$tcp\;port\;18100\;\lor\;\left(tcp\;port\;443\;\land\;\bigvee_i host_i\right)$$
-     - 抓包文件输出到 `logs/proxy_capture_YYYYMMDD_HHMMSS.pcapng`；可通过 `--output` 指定文件名；
-     - 若系统未安装 dnspython，脚本会退回标准库 `socket.getaddrinfo` 解析；
-     - 如未能解析目标主机，会退化为仅监听本地代理端口并给出提示。
-
-    可使用 `--target` 修改解析目标，或通过 `--dumpcap` 显式指定 `dumpcap.exe` 路径（默认尝试环境变量及 `C:/Program Files/Wireshark/dumpcap.exe`）。若在 Windows 控制台看到中文接口名乱码，可追加 `--encoding gbk`（或其他合适编码）让脚本以指定编码解码 `dumpcap` 输出。
-
-  3. **抓包分析脚本**：`tools/analyze_capture.py` 借助 `tshark` 解析 `pcap/pcapng` 中的 TCP 元数据，生成包含连接状态、收发字节统计及 RST/FIN 事件的文本报告，帮助快速定位异常会话。
-
-    ```powershell
-    # 默认分析所有 TCP 数据包，并在同目录生成 capture_analysis_*.log
-    python tools/analyze_capture.py logs/proxy_capture_20251006_215716.pcapng
-    ```
-
-    - 默认的显示过滤器为 `tcp`，可通过 `--display-filter` 传入自定义 Wireshark display filter；
-    - 报告包含连接持续时间、双向字节数、SYN/FIN/RST 计数，并优先列出携带 RST 的会话；
-    - 若未显式指定 `--output`，会在抓包文件所在目录下生成 `capture_analysis_YYYYMMDD_HHMMSS.log`。
 
   ### WebSocket Echo 示例
 
@@ -436,7 +415,7 @@ xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
 
 ## 常见问题
 - **找不到网络相关头文件**：确保 `xmake f --USING_NET=y`。
-- **示例未构建**：手动打开 `USING_EXAMPLE` 选项，或使用 `script/xmk-local.sh`。
+- **示例未构建**：手动打开 `USING_EXAMPLE` 选项，或使用 `python script/xmk.py build`。
 - **Wine 编译失败**：确认脚本中的 MSVC SDK 路径正确，并提前安装 `msvc-wine` 项目依赖。
 - **自定义锁死循环**：若自定义锁实现使用阻塞等待（如 `std::mutex`），请确保在多线程环境中不会阻塞 reactor 线程。
 
