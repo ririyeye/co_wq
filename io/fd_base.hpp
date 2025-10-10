@@ -9,6 +9,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #ifndef _SSIZE_T_DEFINED
+#ifdef ssize_t
+#undef ssize_t
+#endif
 using ssize_t = SSIZE_T;
 #define _SSIZE_T_DEFINED
 #endif

@@ -7,7 +7,12 @@
 #include "worker.hpp"
 
 #if defined(_WIN32)
+#include <basetsd.h>
 #include <winsock2.h>
+
+#ifdef ssize_t
+#undef ssize_t
+#endif
 #endif
 
 #include <libusb-1.0/libusb.h>

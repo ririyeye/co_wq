@@ -612,7 +612,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http2_connection(Socket sock, st
                                                     reinterpret_cast<const uint8_t*>(initial_data.data()),
                                                     initial_data.size());
         if (consumed < 0) {
-            CO_WQ_LOG_ERROR("[http] http/2 preface error: %s", nghttp2_strerror(consumed));
+            CO_WQ_LOG_ERROR("[http] http/2 preface error: %s", nghttp2_strerror(static_cast<int>(consumed)));
             nghttp2_session_del(session);
             sock.close();
             co_return;
@@ -643,7 +643,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http2_connection(Socket sock, st
                                                     reinterpret_cast<uint8_t*>(buffer.data()),
                                                     static_cast<size_t>(n));
         if (consumed < 0) {
-            CO_WQ_LOG_ERROR("[http] http/2 decode error: %s", nghttp2_strerror(consumed));
+            CO_WQ_LOG_ERROR("[http] http/2 decode error: %s", nghttp2_strerror(static_cast<int>(consumed)));
             break;
         }
         rv = nghttp2_session_send(session);

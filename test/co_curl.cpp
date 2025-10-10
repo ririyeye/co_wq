@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -224,6 +225,11 @@ std::string format_endpoint(const sockaddr* addr)
         return "[unknown family]";
     }
 #endif
+}
+
+std::string errno_message(int err)
+{
+    return std::error_code(err, std::generic_category()).message();
 }
 
 #if defined(USING_SSL)
@@ -1285,7 +1291,7 @@ perform_request_http1(Socket& socket, const BuiltRequest& built, ResponseContext
 {
     ssize_t sent = co_await socket.send_all(built.payload.data(), built.payload.size());
     if (sent < 0) {
-        CO_WQ_LOG_ERROR("[co_curl] send error: %s", std::strerror(errno));
+        CO_WQ_LOG_ERROR("[co_curl] send error: %s", errno_message(errno).c_str());
         co_return -1;
     }
 
@@ -1293,7 +1299,7 @@ perform_request_http1(Socket& socket, const BuiltRequest& built, ResponseContext
     while (!ctx.message_complete) {
         ssize_t n = co_await socket.recv(buffer.data(), buffer.size());
         if (n < 0) {
-            CO_WQ_LOG_ERROR("[co_curl] recv error: %s", std::strerror(errno));
+            CO_WQ_LOG_ERROR("[co_curl] recv error: %s", errno_message(errno).c_str());
             co_return -1;
         }
         if (n == 0)
@@ -1336,9 +1342,22 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
         if (*options.output_path == "-") {
             output = stdout;
         } else {
+            std::error_code open_ec;
+#if defined(_WIN32)
+            FILE*   file_handle = nullptr;
+            errno_t ferr        = ::fopen_s(&file_handle, options.output_path->c_str(), "wb");
+            if (ferr != 0)
+                open_ec = std::error_code(ferr, std::generic_category());
+            output = file_handle;
+#else
             output = std::fopen(options.output_path->c_str(), "wb");
+            if (!output)
+                open_ec = std::error_code(errno, std::generic_category());
+#endif
             if (!output) {
-                CO_WQ_LOG_ERROR("[co_curl] failed to open %s", options.output_path->c_str());
+                CO_WQ_LOG_ERROR("[co_curl] failed to open %s: %s",
+                                options.output_path->c_str(),
+                                open_ec ? open_ec.message().c_str() : "unknown error");
                 co_return 1;
             }
             close_output = true;
@@ -1418,7 +1437,7 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
             int connect_rc = co_await tcp_base.connect(reinterpret_cast<const sockaddr*>(&resolved.storage),
                                                        resolved.length);
             if (connect_rc != 0) {
-                CO_WQ_LOG_ERROR("[co_curl] connect failed: %s", std::strerror(errno));
+                CO_WQ_LOG_ERROR("[co_curl] connect failed: %s", errno_message(errno).c_str());
                 co_return 1;
             }
             verbose_printf(options.verbose, "* Connected to %s\n", endpoint.c_str());
@@ -1467,7 +1486,7 @@ Task<int, Work_Promise<SpinLock, int>> run_client(NetFdWorkqueue& fdwq, CommandL
             int connect_rc = co_await tcp_socket.connect(reinterpret_cast<const sockaddr*>(&resolved.storage),
                                                          resolved.length);
             if (connect_rc != 0) {
-                CO_WQ_LOG_ERROR("[co_curl] connect failed: %s", std::strerror(errno));
+                CO_WQ_LOG_ERROR("[co_curl] connect failed: %s", errno_message(errno).c_str());
                 co_return 1;
             }
             verbose_printf(options.verbose, "* Connected to %s\n", endpoint.c_str());
