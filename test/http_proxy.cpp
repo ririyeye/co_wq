@@ -197,6 +197,22 @@ std::string format_sockaddr(const sockaddr* addr, socklen_t len)
     return oss.str();
 }
 
+// 仅格式化 host，不包含端口。用于打印 DNS 返回的所有 IP。
+std::string format_sockaddr_host_only(const sockaddr* addr, socklen_t len)
+{
+    if (addr == nullptr || len <= 0)
+        return {};
+    char host[NI_MAXHOST] = {};
+    int  rc               = ::getnameinfo(addr, len, host, sizeof(host), nullptr, 0, NI_NUMERICHOST);
+    if (rc != 0)
+        return {};
+    if (addr->sa_family == AF_INET6) {
+        std::string h = host;
+        return std::string("[") + h + "]";
+    }
+    return host;
+}
+
 std::string describe_remote_endpoint(const net::tcp_socket<SpinLock>& socket)
 {
     sockaddr_storage addr {};
@@ -339,7 +355,7 @@ Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket&   src,
 
         size_t offset = 0;
         while (offset < static_cast<size_t>(n)) {
-            ssize_t sent = co_await dst.send(buffer.data() + offset, static_cast<size_t>(n) - offset);
+            ssize_t sent = co_await dst.send_all(buffer.data() + offset, static_cast<size_t>(n) - offset);
             if (sent <= 0) {
                 auto src_state = describe_socket_state(src);
                 auto dst_state = describe_socket_state(dst);
@@ -868,13 +884,41 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
         co_return;
     }
 
-    CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld",
-                   peer_id.c_str(),
-                   target.host.c_str(),
-                   static_cast<unsigned>(target.port),
-                   static_cast<long long>(elapsed_since_request),
-                   static_cast<long long>(lookup_ms),
-                   static_cast<long long>(queue_ms));
+    // 构造所有解析出的 IP 列表
+    std::string ips_str;
+    if (!dns_result.endpoints.empty()) {
+        std::ostringstream oss;
+        bool               first = true;
+        for (const auto& ep : dns_result.endpoints) {
+            auto one = format_sockaddr_host_only(reinterpret_cast<const sockaddr*>(&ep.addr), ep.len);
+            if (one.empty())
+                continue;
+            if (!first)
+                oss << ", ";
+            first = false;
+            oss << one;
+        }
+        ips_str = oss.str();
+    }
+
+    if (!ips_str.empty()) {
+        CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld ips=[%s]",
+                       peer_id.c_str(),
+                       target.host.c_str(),
+                       static_cast<unsigned>(target.port),
+                       static_cast<long long>(elapsed_since_request),
+                       static_cast<long long>(lookup_ms),
+                       static_cast<long long>(queue_ms),
+                       ips_str.c_str());
+    } else {
+        CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld",
+                       peer_id.c_str(),
+                       target.host.c_str(),
+                       static_cast<unsigned>(target.port),
+                       static_cast<long long>(elapsed_since_request),
+                       static_cast<long long>(lookup_ms),
+                       static_cast<long long>(queue_ms));
+    }
 
     update_active_session(session_id,
                           std::string("connecting ") + format_host_port_for_state(target.host, target.port));
@@ -1024,13 +1068,41 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         co_return;
     }
 
-    CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld",
-                   peer_id.c_str(),
-                   parts.host.c_str(),
-                   static_cast<unsigned>(parts.port),
-                   static_cast<long long>(elapsed_since_request),
-                   static_cast<long long>(lookup_ms),
-                   static_cast<long long>(queue_ms));
+    // 构造所有解析出的 IP 列表
+    std::string ips_str;
+    if (!dns_result.endpoints.empty()) {
+        std::ostringstream oss;
+        bool               first = true;
+        for (const auto& ep : dns_result.endpoints) {
+            auto one = format_sockaddr_host_only(reinterpret_cast<const sockaddr*>(&ep.addr), ep.len);
+            if (one.empty())
+                continue;
+            if (!first)
+                oss << ", ";
+            first = false;
+            oss << one;
+        }
+        ips_str = oss.str();
+    }
+
+    if (!ips_str.empty()) {
+        CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld ips=[%s]",
+                       peer_id.c_str(),
+                       parts.host.c_str(),
+                       static_cast<unsigned>(parts.port),
+                       static_cast<long long>(elapsed_since_request),
+                       static_cast<long long>(lookup_ms),
+                       static_cast<long long>(queue_ms),
+                       ips_str.c_str());
+    } else {
+        CO_WQ_LOG_INFO("[proxy] %s DNS resolved %s:%u duration_ms=%lld lookup_ms=%lld queue_ms=%lld",
+                       peer_id.c_str(),
+                       parts.host.c_str(),
+                       static_cast<unsigned>(parts.port),
+                       static_cast<long long>(elapsed_since_request),
+                       static_cast<long long>(lookup_ms),
+                       static_cast<long long>(queue_ms));
+    }
 
     update_active_session(session_id, ctx.method + " connecting " + format_host_port_for_state(parts.host, parts.port));
 

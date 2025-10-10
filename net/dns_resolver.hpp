@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace co_wq {
 
@@ -21,11 +22,19 @@ namespace net::dns {
     };
 
     struct resolve_result {
-        bool                                  success { false };
-        sockaddr_storage                      storage {};
-        socklen_t                             length { 0 };
-        int                                   error_code { 0 };
-        std::string                           error_message;
+        bool             success { false };
+        sockaddr_storage storage {};
+        socklen_t        length { 0 };
+        int              error_code { 0 };
+        std::string      error_message;
+        // 所有候选地址（按 getaddrinfo 返回顺序）。第一个匹配策略的地址仍保存在 storage/length，便于兼容旧调用点。
+        struct endpoint_entry {
+            sockaddr_storage addr {};
+            socklen_t        len { 0 };
+        };
+        std::vector<endpoint_entry> endpoints;
+        // 被选中的 endpoints 索引；若无可用则为 SIZE_MAX。
+        size_t                                selected_index { static_cast<size_t>(-1) };
         std::chrono::steady_clock::time_point submit_time {};
         std::chrono::steady_clock::time_point start_time {};
         std::chrono::steady_clock::time_point finish_time {};

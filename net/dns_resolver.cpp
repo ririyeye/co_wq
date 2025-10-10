@@ -47,6 +47,8 @@ namespace {
         result.error_code = 0;
         result.error_message.clear();
         result.length = 0;
+        result.endpoints.clear();
+        result.selected_index = static_cast<size_t>(-1);
 
         std::string node = strip_brackets(host);
         if (node.empty()) {
@@ -78,6 +80,19 @@ namespace {
 
         std::unique_ptr<addrinfo, decltype(&::freeaddrinfo)> guard(result_list, ::freeaddrinfo);
 
+        // 先收集所有候选地址（仅拷贝原始 sockaddr），便于调用方打印全部解析结果。
+        for (auto* ai = result_list; ai; ai = ai->ai_next) {
+            if (ai->ai_addr && ai->ai_addrlen > 0) {
+                if (static_cast<size_t>(ai->ai_addrlen) <= sizeof(resolve_result::endpoint_entry {}.addr)) {
+                    resolve_result::endpoint_entry ep;
+                    std::memset(&ep, 0, sizeof(ep));
+                    std::memcpy(&ep.addr, ai->ai_addr, ai->ai_addrlen);
+                    ep.len = static_cast<socklen_t>(ai->ai_addrlen);
+                    result.endpoints.push_back(ep);
+                }
+            }
+        }
+
         auto copy_family = [&](const addrinfo* ai) {
             if (static_cast<size_t>(ai->ai_addrlen) > sizeof(result.storage))
                 return false;
@@ -88,17 +103,21 @@ namespace {
         };
 
         const addrinfo* selected = nullptr;
-        for (auto* ai = result_list; ai; ai = ai->ai_next) {
+        size_t          index    = 0;
+        for (auto* ai = result_list; ai; ai = ai->ai_next, ++index) {
             if (options.family == AF_UNSPEC) {
-                selected = ai;
+                selected              = ai;
+                result.selected_index = index < result.endpoints.size() ? index : static_cast<size_t>(-1);
                 break;
             }
             if (ai->ai_family == options.family) {
-                selected = ai;
+                selected              = ai;
+                result.selected_index = index < result.endpoints.size() ? index : static_cast<size_t>(-1);
                 break;
             }
             if (options.family == AF_INET6 && options.allow_dual_stack && ai->ai_family == AF_INET) {
-                selected = ai;
+                selected              = ai;
+                result.selected_index = index < result.endpoints.size() ? index : static_cast<size_t>(-1);
                 break;
             }
         }
