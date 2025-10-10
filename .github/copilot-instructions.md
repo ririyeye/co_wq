@@ -1,13 +1,15 @@
 # co_wq Copilot Instructions
 
+以后都用中文回答。
+
 ## 项目概览
 - `co_wq` 提供基于 C++20 协程的跨平台异步框架：`task/` 内实现 `Task`/`Promise`，`sync/` 封装信号量、定时器，`io/` 与 `net/` 提供 epoll/IOCP reactor 与 TCP/UDP/TLS/Unix Socket/文件/USB awaiter。
 - 核心执行器 `co_wq::workqueue<Lock>` 驱动所有回调。投递节点必须初始化 `worknode::func` 并保持生命周期 > 在途任务。
-- Linux 默认依赖 `epoll`，Windows 通过 Wine + MSVC 构建转 IOCP。`USING_NET/USING_SSL/USING_USB/USING_EXAMPLE` 控制可选模块。
+- Linux 默认依赖 `epoll`，Windows 使用 MSVC 构建接入 IOCP。`USING_NET/USING_SSL/USING_USB/USING_EXAMPLE` 控制可选模块。
 
 ## 构建与脚本
 - 优先运行 `python script/xmk.py build`：`xmake` 配置 releasedbg 模式、启用 examples、生成 `compile_commands.json`，并将产物安装到 `install/`。
-- Windows(Wine) 使用 `bash script/xmk-wine-msvc.sh`，需先安装 msvc-wine SDK；脚本会 `xmake -p windows -a x64` 并单独构建 `co_wq`。
+- Windows 环境请使用 MSVC 工具链执行 `python script/xmk.py build`。
 - 清理使用 `python script/xmk.py clean`（会删 `.xmake/ build/ install/ .cache/`，可附带 `--remove-global-cache` 删除 `~/.xmake`）。
 - 手动 xmake：`xmake f -y -m releasedbg --USING_EXAMPLE=y -o build` → `xmake -vD` → `xmake install -o install`。
 - 注意 `xmake` 目标：`co_wq` 静态库 +（启用 examples 时）`test/xmake.lua` 下的 `co_echo/co_http/...` 可执行文件。
@@ -45,4 +47,4 @@
 ## 调试与验证
 - 判断内存泄漏：查看 `task/sys_sta.malloc_cnt/free_cnt`（例如在 demo 中打印）。
 - Reactor 问题：确认 `fd_workqueue` 构造时 `add_fd` 成功；`epoll_reactor` 在析构时会移除 fd 并唤醒所有 waiter。
-- Windows 构建：在 VS 工具链环境中直接用 `python script/xmk.py build`，必要时运行 `wineserver -k` 重启 Wine。
+- Windows 构建：在 VS 工具链环境中直接用 `python script/xmk.py build`。
