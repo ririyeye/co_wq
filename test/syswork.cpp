@@ -1,6 +1,7 @@
 #include "syswork.hpp"
 #include "workqueue.hpp"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -85,7 +86,36 @@ executor_wq& get_executor()
 
 struct timer_holder {
     co_wq::Timer_check_queue<co_wq::SpinLock>* ptr;
+    std::atomic_bool                           ticker_running { false };
+    std::atomic_bool                           ticker_stop { false };
+    std::thread                                ticker_thread;
+
     timer_holder() : ptr(nullptr) { }
+
+    void ensure_ticker()
+    {
+        if (ticker_running.load(std::memory_order_acquire))
+            return;
+        bool expected = false;
+        if (!ticker_running.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+            return;
+        ticker_stop.store(false, std::memory_order_release);
+        ticker_thread = std::thread([this]() {
+            while (!ticker_stop.load(std::memory_order_acquire)) {
+                auto* queue = ptr;
+                if (queue)
+                    queue->tick_update();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+    }
+
+    ~timer_holder()
+    {
+        ticker_stop.store(true, std::memory_order_release);
+        if (ticker_thread.joinable())
+            ticker_thread.join();
+    }
 };
 timer_holder& get_timer_holder()
 {
@@ -105,6 +135,7 @@ co_wq::workqueue<co_wq::SpinLock>& get_sys_workqueue(int threads)
         exec.start_workers(threads);
         // 初始化 timer 队列
         get_timer_holder().ptr = new co_wq::Timer_check_queue<co_wq::SpinLock>(exec);
+        get_timer_holder().ensure_ticker();
     });
     return exec;
 }
@@ -115,6 +146,7 @@ co_wq::Timer_check_queue<co_wq::SpinLock>& get_sys_timer(void)
         // 若用户先调用 timer，隐式初始化
         (void)get_sys_workqueue(0);
     }
+    get_timer_holder().ensure_ticker();
     return *get_timer_holder().ptr;
 }
 
