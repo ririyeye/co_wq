@@ -10,8 +10,10 @@
 #include "worker.hpp"
 
 #include <llhttp.h>
+#include <nghttp2/nghttp2.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -67,6 +69,40 @@ std::string to_lower(std::string_view input)
     }
     return out;
 }
+
+#if defined(USING_SSL)
+int select_http_alpn(SSL*,
+                     const unsigned char** out,
+                     unsigned char*        outlen,
+                     const unsigned char*  in,
+                     unsigned int          inlen,
+                     void*)
+{
+    unsigned int pos = 0;
+    while (pos < inlen) {
+        unsigned int         len   = in[pos];
+        const unsigned char* proto = in + pos + 1;
+        if (len == 2 && std::memcmp(proto, "h2", 2) == 0) {
+            *out    = proto;
+            *outlen = static_cast<unsigned char>(len);
+            return SSL_TLSEXT_ERR_OK;
+        }
+        pos += 1 + len;
+    }
+    pos = 0;
+    while (pos < inlen) {
+        unsigned int         len   = in[pos];
+        const unsigned char* proto = in + pos + 1;
+        if (len == 8 && std::memcmp(proto, "http/1.1", 8) == 0) {
+            *out    = proto;
+            *outlen = static_cast<unsigned char>(len);
+            return SSL_TLSEXT_ERR_OK;
+        }
+        pos += 1 + len;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+#endif
 
 int on_message_begin(llhttp_t* parser)
 {
@@ -136,6 +172,72 @@ int on_message_complete(llhttp_t* parser)
     return 0;
 }
 
+struct AppResponse {
+    int         status_code { 0 };
+    std::string reason;
+    std::string body;
+    std::string content_type { "text/plain; charset=utf-8" };
+};
+
+AppResponse make_app_response(const std::string&                                  method,
+                              const std::string&                                  url,
+                              const std::unordered_map<std::string, std::string>& headers,
+                              const std::string&                                  body)
+{
+    AppResponse result;
+
+    if (method == "GET" && (url == "/" || url == "/index" || url == "/index.html")) {
+        result.status_code = 200;
+        result.reason      = "OK";
+        result.body        = "Hello from co_wq HTTP server!\n";
+        result.body += "Method: " + method + "\n";
+        result.body += "Path: " + url + "\n";
+    } else if (method == "GET" && url == "/health") {
+        result.status_code = 200;
+        result.reason      = "OK";
+        result.body        = "OK\n";
+    } else if (method == "POST" && url == "/echo-json") {
+        try {
+            nlohmann::json request_json;
+            if (!body.empty()) {
+                request_json = nlohmann::json::parse(body);
+            } else {
+                request_json = nlohmann::json::object();
+            }
+
+            nlohmann::json response_json {
+                { "status",  "ok"         },
+                { "method",  method       },
+                { "path",    url          },
+                { "request", request_json }
+            };
+
+            if (auto it = headers.find("content-type"); it != headers.end())
+                response_json["request_content_type"] = it->second;
+
+            result.status_code  = 200;
+            result.reason       = "OK";
+            result.content_type = "application/json; charset=utf-8";
+            result.body         = response_json.dump();
+        } catch (const nlohmann::json::exception& ex) {
+            nlohmann::json error_json {
+                { "status", "error"   },
+                { "reason", ex.what() }
+            };
+            result.status_code  = 400;
+            result.reason       = "Bad Request";
+            result.content_type = "application/json; charset=utf-8";
+            result.body         = error_json.dump();
+        }
+    } else {
+        result.status_code = 404;
+        result.reason      = "Not Found";
+        result.body        = "Not Found\n";
+    }
+
+    return result;
+}
+
 std::string build_http_response(int              status_code,
                                 std::string_view reason,
                                 std::string_view body,
@@ -188,7 +290,8 @@ void sigint_handler(int)
 }
 #endif
 
-template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_connection(Socket sock)
+template <typename Socket>
+Task<void, Work_Promise<SpinLock, void>> handle_http1_connection(Socket sock, std::string initial_data)
 {
     llhttp_settings_t settings;
     llhttp_settings_init(&settings);
@@ -214,16 +317,17 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
     bool                   received_any_data { false };
     bool                   client_disconnected_early { false };
 
-    if constexpr (requires(Socket& s) { s.handshake(); }) {
-        int hs = co_await sock.handshake();
-        if (hs != 0) {
-            CO_WQ_LOG_ERROR("[http] tls handshake failed, code=%d", hs);
-            sock.close();
-            co_return;
+    if (!initial_data.empty()) {
+        received_any_data  = true;
+        llhttp_errno_t err = llhttp_execute(&parser, initial_data.data(), initial_data.size());
+        if (err != HPE_OK) {
+            parse_error        = true;
+            const char* reason = llhttp_get_error_reason(&parser);
+            error_reason       = (reason && *reason) ? reason : llhttp_errno_name(err);
         }
     }
 
-    while (!ctx.message_complete) {
+    while (!ctx.message_complete && !parse_error) {
         ssize_t n = co_await sock.recv(buffer.data(), buffer.size());
         if (n < 0) {
             parse_error  = true;
@@ -273,52 +377,349 @@ template <typename Socket> Task<void, Work_Promise<SpinLock, void>> handle_http_
         response      = build_http_response(400, "Bad Request", response_body);
         CO_WQ_LOG_ERROR("[http] parse error: %s", error_reason.c_str());
     } else {
-        if (ctx.method == "GET" && (ctx.url == "/" || ctx.url == "/index" || ctx.url == "/index.html")) {
-            response_body = "Hello from co_wq HTTP server!\n";
-            response_body += "Method: " + ctx.method + "\n";
-            response_body += "Path: " + ctx.url + "\n";
-            response = build_http_response(200, "OK", response_body);
-        } else if (ctx.method == "GET" && ctx.url == "/health") {
-            response_body = "OK\n";
-            response      = build_http_response(200, "OK", response_body);
-        } else if (ctx.method == "POST" && ctx.url == "/echo-json") {
-            try {
-                nlohmann::json request_json;
-                if (!ctx.body.empty()) {
-                    request_json = nlohmann::json::parse(ctx.body);
-                } else {
-                    request_json = nlohmann::json::object();
-                }
-
-                nlohmann::json response_json {
-                    { "status",  "ok"         },
-                    { "method",  ctx.method   },
-                    { "path",    ctx.url      },
-                    { "request", request_json }
-                };
-
-                if (auto it = ctx.headers.find("content-type"); it != ctx.headers.end())
-                    response_json["request_content_type"] = it->second;
-
-                response_body = response_json.dump();
-                response      = build_http_response(200, "OK", response_body, "application/json; charset=utf-8");
-            } catch (const nlohmann::json::exception& ex) {
-                nlohmann::json error_json {
-                    { "status", "error"   },
-                    { "reason", ex.what() }
-                };
-                response_body = error_json.dump();
-                response = build_http_response(400, "Bad Request", response_body, "application/json; charset=utf-8");
-            }
-        } else {
-            response_body = "Not Found\n";
-            response      = build_http_response(404, "Not Found", response_body);
-        }
+        AppResponse app = make_app_response(ctx.method, ctx.url, ctx.headers, ctx.body);
+        response_body   = app.body;
+        response        = build_http_response(app.status_code, app.reason, response_body, app.content_type);
     }
 
     (void)co_await sock.send_all(response.data(), response.size());
     sock.close();
     co_return;
+}
+
+struct Http2ServerResponseData {
+    std::string body;
+    size_t      offset { 0 };
+};
+
+struct Http2ServerStream {
+    std::string                                  method;
+    std::string                                  path;
+    std::unordered_map<std::string, std::string> headers;
+    std::string                                  body;
+    bool                                         responded { false };
+};
+
+struct Http2ServerSession {
+    std::vector<uint8_t>                                 send_buffer;
+    std::unordered_map<int32_t, Http2ServerStream>       streams;
+    std::unordered_map<int32_t, Http2ServerResponseData> responses;
+};
+
+[[maybe_unused]] static ssize_t
+h2_server_send_callback(nghttp2_session*, const uint8_t* data, size_t length, int, void* user_data)
+{
+    auto* state = static_cast<Http2ServerSession*>(user_data);
+    state->send_buffer.insert(state->send_buffer.end(), data, data + length);
+    return static_cast<ssize_t>(length);
+}
+
+[[maybe_unused]] static int h2_server_on_begin_headers(nghttp2_session*, const nghttp2_frame* frame, void* user_data)
+{
+    if (frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+        return 0;
+    auto* state = static_cast<Http2ServerSession*>(user_data);
+    state->streams.emplace(frame->hd.stream_id, Http2ServerStream {});
+    return 0;
+}
+
+[[maybe_unused]] static int h2_server_on_header(nghttp2_session*,
+                                                const nghttp2_frame* frame,
+                                                const uint8_t*       name,
+                                                size_t               namelen,
+                                                const uint8_t*       value,
+                                                size_t               valuelen,
+                                                uint8_t,
+                                                void* user_data)
+{
+    if (frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+        return 0;
+    auto* state = static_cast<Http2ServerSession*>(user_data);
+    auto  it    = state->streams.find(frame->hd.stream_id);
+    if (it == state->streams.end())
+        return 0;
+    auto&       stream = it->second;
+    std::string key(reinterpret_cast<const char*>(name), namelen);
+    std::string val(reinterpret_cast<const char*>(value), valuelen);
+    if (key == ":method") {
+        stream.method = std::move(val);
+    } else if (key == ":path") {
+        stream.path = std::move(val);
+    } else if (key == ":scheme" || key == ":authority") {
+        // ignore
+    } else {
+        stream.headers[to_lower(key)] = std::move(val);
+    }
+    return 0;
+}
+
+[[maybe_unused]] static int
+h2_server_on_data_chunk(nghttp2_session*, uint8_t, int32_t stream_id, const uint8_t* data, size_t len, void* user_data)
+{
+    auto* state = static_cast<Http2ServerSession*>(user_data);
+    auto  it    = state->streams.find(stream_id);
+    if (it == state->streams.end())
+        return 0;
+    it->second.body.append(reinterpret_cast<const char*>(data), len);
+    return 0;
+}
+
+[[maybe_unused]] static ssize_t h2_server_data_read(nghttp2_session*,
+                                                    int32_t,
+                                                    uint8_t*             buf,
+                                                    size_t               length,
+                                                    uint32_t*            data_flags,
+                                                    nghttp2_data_source* source,
+                                                    void*)
+{
+    auto* payload = static_cast<Http2ServerResponseData*>(source->ptr);
+    if (!payload)
+        return 0;
+    size_t remaining = payload->body.size() > payload->offset ? payload->body.size() - payload->offset : 0;
+    size_t to_copy   = std::min(length, remaining);
+    if (to_copy > 0) {
+        std::memcpy(buf, payload->body.data() + payload->offset, to_copy);
+        payload->offset += to_copy;
+    }
+    if (payload->offset >= payload->body.size())
+        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return static_cast<ssize_t>(to_copy);
+}
+
+static int h2_server_submit_response(nghttp2_session* session, Http2ServerSession& state, int32_t stream_id)
+{
+    auto it = state.streams.find(stream_id);
+    if (it == state.streams.end())
+        return 0;
+    auto& stream = it->second;
+    if (stream.responded)
+        return 0;
+
+    AppResponse app            = make_app_response(stream.method, stream.path, stream.headers, stream.body);
+    std::string status         = std::to_string(app.status_code);
+    std::string content_length = std::to_string(app.body.size());
+
+    std::vector<std::pair<std::string, std::string>> header_pairs;
+    header_pairs.emplace_back(":status", std::move(status));
+    header_pairs.emplace_back("content-type", app.content_type);
+    header_pairs.emplace_back("content-length", content_length);
+
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(header_pairs.size());
+    for (auto& kv : header_pairs) {
+        nva.push_back(nghttp2_nv { reinterpret_cast<uint8_t*>(kv.first.data()),
+                                   reinterpret_cast<uint8_t*>(kv.second.data()),
+                                   kv.first.size(),
+                                   kv.second.size(),
+                                   NGHTTP2_NV_FLAG_NONE });
+    }
+
+    nghttp2_data_provider  data_provider {};
+    nghttp2_data_provider* provider_ptr = nullptr;
+    if (!app.body.empty()) {
+        auto& payload               = state.responses[stream_id];
+        payload.body                = std::move(app.body);
+        payload.offset              = 0;
+        data_provider.source.ptr    = &payload;
+        data_provider.read_callback = h2_server_data_read;
+        provider_ptr                = &data_provider;
+    }
+
+    int rv = nghttp2_submit_response(session, stream_id, nva.data(), nva.size(), provider_ptr);
+    if (rv != 0)
+        return rv;
+    stream.responded = true;
+    return 0;
+}
+
+[[maybe_unused]] static int
+h2_server_on_frame_recv(nghttp2_session* session, const nghttp2_frame* frame, void* user_data)
+{
+    auto*   state     = static_cast<Http2ServerSession*>(user_data);
+    int32_t stream_id = frame->hd.stream_id;
+    if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+            int rv = h2_server_submit_response(session, *state, stream_id);
+            if (rv != 0)
+                return rv;
+        }
+    } else if (frame->hd.type == NGHTTP2_DATA) {
+        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+            int rv = h2_server_submit_response(session, *state, stream_id);
+            if (rv != 0)
+                return rv;
+        }
+    }
+    return 0;
+}
+
+[[maybe_unused]] static int h2_server_on_stream_close(nghttp2_session*, int32_t stream_id, uint32_t, void* user_data)
+{
+    auto* state = static_cast<Http2ServerSession*>(user_data);
+    state->streams.erase(stream_id);
+    state->responses.erase(stream_id);
+    return 0;
+}
+
+template <typename Socket>
+Task<void, Work_Promise<SpinLock, void>> handle_http2_connection(Socket sock, std::string initial_data)
+{
+    Http2ServerSession session_state;
+
+    nghttp2_session_callbacks* callbacks = nullptr;
+    if (nghttp2_session_callbacks_new(&callbacks) != 0) {
+        sock.close();
+        co_return;
+    }
+    nghttp2_session_callbacks_set_send_callback(callbacks, h2_server_send_callback);
+    nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, h2_server_on_begin_headers);
+    nghttp2_session_callbacks_set_on_header_callback(callbacks, h2_server_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, h2_server_on_data_chunk);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, h2_server_on_frame_recv);
+    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, h2_server_on_stream_close);
+
+    nghttp2_session* session = nullptr;
+    int              rv      = nghttp2_session_server_new(&session, callbacks, &session_state);
+    nghttp2_session_callbacks_del(callbacks);
+    if (rv != 0) {
+        sock.close();
+        co_return;
+    }
+
+    nghttp2_settings_entry settings[] = {
+        { NGHTTP2_SETTINGS_ENABLE_PUSH, 0 }
+    };
+    rv = nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, settings, std::size(settings));
+    if (rv != 0) {
+        nghttp2_session_del(session);
+        sock.close();
+        co_return;
+    }
+
+    rv = nghttp2_session_send(session);
+    if (rv == 0 && !session_state.send_buffer.empty()) {
+        ssize_t sent = co_await sock.send_all(session_state.send_buffer.data(), session_state.send_buffer.size());
+        if (sent <= 0) {
+            nghttp2_session_del(session);
+            sock.close();
+            co_return;
+        }
+        session_state.send_buffer.clear();
+    }
+
+    if (!initial_data.empty()) {
+        ssize_t consumed = nghttp2_session_mem_recv(session,
+                                                    reinterpret_cast<const uint8_t*>(initial_data.data()),
+                                                    initial_data.size());
+        if (consumed < 0) {
+            CO_WQ_LOG_ERROR("[http] http/2 preface error: %s", nghttp2_strerror(consumed));
+            nghttp2_session_del(session);
+            sock.close();
+            co_return;
+        }
+        rv = nghttp2_session_send(session);
+        if (rv != 0) {
+            nghttp2_session_del(session);
+            sock.close();
+            co_return;
+        }
+        if (!session_state.send_buffer.empty()) {
+            ssize_t sent = co_await sock.send_all(session_state.send_buffer.data(), session_state.send_buffer.size());
+            if (sent <= 0) {
+                nghttp2_session_del(session);
+                sock.close();
+                co_return;
+            }
+            session_state.send_buffer.clear();
+        }
+    }
+
+    std::array<char, 8192> buffer {};
+    while (nghttp2_session_want_read(session) || nghttp2_session_want_write(session)) {
+        ssize_t n = co_await sock.recv(buffer.data(), buffer.size());
+        if (n <= 0)
+            break;
+        ssize_t consumed = nghttp2_session_mem_recv(session,
+                                                    reinterpret_cast<uint8_t*>(buffer.data()),
+                                                    static_cast<size_t>(n));
+        if (consumed < 0) {
+            CO_WQ_LOG_ERROR("[http] http/2 decode error: %s", nghttp2_strerror(consumed));
+            break;
+        }
+        rv = nghttp2_session_send(session);
+        if (rv != 0) {
+            CO_WQ_LOG_ERROR("[http] http/2 send error: %s", nghttp2_strerror(rv));
+            break;
+        }
+        if (!session_state.send_buffer.empty()) {
+            ssize_t sent = co_await sock.send_all(session_state.send_buffer.data(), session_state.send_buffer.size());
+            if (sent <= 0)
+                break;
+            session_state.send_buffer.clear();
+        }
+    }
+
+    sock.close();
+    nghttp2_session_del(session);
+    co_return;
+}
+
+template <typename Socket>
+Task<void, Work_Promise<SpinLock, void>> handle_http_connection(Socket sock, bool enable_http2)
+{
+    static constexpr std::string_view h2_preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    bool        use_http2 = false;
+    std::string initial_data;
+
+    if constexpr (requires(Socket& s) { s.handshake(); }) {
+        int hs = co_await sock.handshake();
+        if (hs != 0) {
+            CO_WQ_LOG_ERROR("[http] tls handshake failed, code=%d", hs);
+            sock.close();
+            co_return;
+        }
+        if (enable_http2) {
+#if defined(USING_SSL)
+            const unsigned char* alpn     = nullptr;
+            unsigned int         alpn_len = 0;
+            SSL_get0_alpn_selected(sock.ssl_handle(), &alpn, &alpn_len);
+            if (alpn_len == 2 && alpn && std::memcmp(alpn, "h2", 2) == 0)
+                use_http2 = true;
+#endif
+        }
+    }
+
+    if (enable_http2 && !use_http2) {
+        std::array<char, 4096> probe {};
+        size_t                 read_total = 0;
+        bool                   mismatch   = false;
+        while (read_total < h2_preface.size()) {
+            ssize_t n = co_await sock.recv(probe.data() + read_total, probe.size() - read_total);
+            if (n <= 0) {
+                sock.close();
+                co_return;
+            }
+            read_total += static_cast<size_t>(n);
+            initial_data.assign(probe.data(), read_total);
+            size_t compare_len = std::min(initial_data.size(), h2_preface.size());
+            if (initial_data.compare(0, compare_len, h2_preface.substr(0, compare_len)) != 0) {
+                mismatch = true;
+                break;
+            }
+            if (read_total >= probe.size() || read_total >= h2_preface.size())
+                break;
+        }
+        if (!mismatch && initial_data.size() >= h2_preface.size())
+            use_http2 = true;
+    }
+
+    if (use_http2) {
+        co_await handle_http2_connection(std::move(sock), std::move(initial_data));
+        co_return;
+    }
+
+    co_await handle_http1_connection(std::move(sock), std::move(initial_data));
 }
 
 Task<void, Work_Promise<SpinLock, void>> http_server(NetFdWorkqueue& fdwq,
@@ -328,7 +729,8 @@ Task<void, Work_Promise<SpinLock, void>> http_server(NetFdWorkqueue& fdwq,
                                                      ,
                                                      const net::tls_context* tls_ctx
 #endif
-)
+                                                     ,
+                                                     bool enable_http2)
 {
     net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor());
     listener.bind_listen(host, port, 128);
@@ -348,7 +750,7 @@ Task<void, Work_Promise<SpinLock, void>> http_server(NetFdWorkqueue& fdwq,
         if (tls_ctx) {
             try {
                 auto tls_sock = fdwq.adopt_tls_socket(fd, *tls_ctx, net::tls_mode::Server);
-                auto task     = handle_http_connection(std::move(tls_sock));
+                auto task     = handle_http_connection(std::move(tls_sock), enable_http2);
                 post_to(task, fdwq.base());
             } catch (const std::exception& ex) {
                 CO_WQ_LOG_ERROR("[http] tls socket setup failed: %s", ex.what());
@@ -357,7 +759,7 @@ Task<void, Work_Promise<SpinLock, void>> http_server(NetFdWorkqueue& fdwq,
 #endif
         {
             auto socket = fdwq.adopt_tcp_socket(fd);
-            auto task   = handle_http_connection(std::move(socket));
+            auto task   = handle_http_connection(std::move(socket), enable_http2);
             post_to(task, fdwq.base());
         }
     }
@@ -375,7 +777,8 @@ int main(int argc, char* argv[])
     uint16_t    port = 8080;
     std::string cert_path;
     std::string key_path;
-    bool        use_tls = false;
+    bool        use_tls      = false;
+    bool        enable_http2 = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string_view arg(argv[i]);
@@ -389,6 +792,8 @@ int main(int argc, char* argv[])
         } else if (arg == "--key" && i + 1 < argc) {
             key_path = argv[++i];
             use_tls  = true;
+        } else if (arg == "--http2") {
+            enable_http2 = true;
         }
     }
 
@@ -412,6 +817,8 @@ int main(int argc, char* argv[])
         }
         try {
             tls_ctx.emplace(net::tls_context::make_server_with_pem(cert_path, key_path));
+            if (enable_http2)
+                SSL_CTX_set_alpn_select_cb(tls_ctx->native_handle(), &select_http_alpn, nullptr);
             tls_ctx_ptr = &(*tls_ctx);
             CO_WQ_LOG_INFO("[http] TLS enabled, cert=%s", cert_path.c_str());
         } catch (const std::exception& ex) {
@@ -428,7 +835,8 @@ int main(int argc, char* argv[])
                                    ,
                                    tls_ctx_ptr
 #endif
-    );
+                                   ,
+                                   enable_http2);
     auto             coroutine = server_task.get();
     auto&            promise   = coroutine.promise();
     std::atomic_bool finished { false };
