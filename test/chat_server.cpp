@@ -15,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -359,11 +360,10 @@ uint64_t read_u64_be(const uint8_t* data)
 
 std::vector<uint8_t> make_binary_payload(uint64_t seq, const std::vector<uint8_t>& body)
 {
-    std::vector<uint8_t> payload;
-    payload.reserve(8 + body.size());
-    for (int shift = 56; shift >= 0; shift -= 8)
-        payload.push_back(static_cast<uint8_t>((seq >> shift) & 0xFF));
-    payload.insert(payload.end(), body.begin(), body.end());
+    std::vector<uint8_t> payload(8 + body.size());
+    for (int shift = 56, idx = 0; shift >= 0; shift -= 8, ++idx)
+        payload[idx] = static_cast<uint8_t>((seq >> shift) & 0xFF);
+    std::copy(body.begin(), body.end(), payload.begin() + 8);
     return payload;
 }
 
