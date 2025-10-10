@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -46,6 +47,7 @@
 #include <csignal>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -252,6 +254,7 @@ struct PipeOutcome {
 };
 
 std::atomic_bool g_packet_trace { false };
+std::atomic_bool g_force_shutdown { false };
 
 template <typename Socket> std::string describe_socket_state(const Socket& socket)
 {
@@ -278,12 +281,36 @@ Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket&   src,
                                                    PipeOutcome& outcome,
                                                    bool         close_dst_on_eof = false)
 {
-    const char*            flow = flow_desc.empty() ? "stream" : flow_desc.c_str();
-    std::array<char, 8192> buffer {};
+    const char* flow = flow_desc.empty() ? "stream" : flow_desc.c_str();
+    // 16 KiB 缓冲在兼顾吞吐的同时，进一步细化下游发送节奏以平滑直播播放。
+    std::array<char, 16384> buffer {};
     outcome.label     = flow_desc;
     outcome.status    = "pending";
     outcome.had_error = false;
     while (true) {
+        if (g_force_shutdown.load(std::memory_order_acquire)) {
+            outcome.status    = "cancelled";
+            outcome.had_error = true;
+            if constexpr (requires {
+                              src.close();
+                              src.closed();
+                          }) {
+                if (!src.closed())
+                    src.close();
+            } else if constexpr (requires { src.close(); }) {
+                src.close();
+            }
+            if constexpr (requires {
+                              dst.close();
+                              dst.closed();
+                          }) {
+                if (!dst.closed())
+                    dst.close();
+            } else if constexpr (requires { dst.close(); }) {
+                dst.close();
+            }
+            break;
+        }
         ssize_t n = co_await src.recv(buffer.data(), buffer.size());
         if (n == 0) {
             auto src_state = describe_socket_state(src);
@@ -355,6 +382,11 @@ Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket&   src,
 
         size_t offset = 0;
         while (offset < static_cast<size_t>(n)) {
+            if (g_force_shutdown.load(std::memory_order_acquire)) {
+                outcome.status    = "cancelled";
+                outcome.had_error = true;
+                break;
+            }
             ssize_t sent = co_await dst.send_all(buffer.data() + offset, static_cast<size_t>(n) - offset);
             if (sent <= 0) {
                 auto src_state = describe_socket_state(src);
@@ -513,7 +545,18 @@ void configure_graceful_close(net::tcp_socket<SpinLock>& socket, const std::stri
         CO_WQ_LOG_WARN("%s %.*s enlarge SO_RCVBUF failed: %d", peer_id.c_str(), (int)role.size(), role.data(), err);
     }
 #else
-    (void)socket;
+    int fd = socket.native_handle();
+    if (fd >= 0) {
+        // 启用 TCP_NODELAY：对 TLS/小记录流可以降低延迟抖动。
+        int nodelay = 1;
+        if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
+            CO_WQ_LOG_DEBUG("%s %.*s enable TCP_NODELAY failed: %s",
+                            peer_id.c_str(),
+                            (int)role.size(),
+                            role.data(),
+                            std::strerror(errno));
+        }
+    }
     (void)peer_id;
     (void)role;
 #endif
@@ -546,7 +589,23 @@ void configure_tcp_keepalive(net::tcp_socket<SpinLock>& socket, const std::strin
         CO_WQ_LOG_WARN("%s %.*s configure keepalive failed: %d", peer_id.c_str(), (int)role.size(), role.data(), err);
     }
 #else
-    (void)socket;
+    int fd = socket.native_handle();
+    if (fd >= 0) {
+        int on = 1;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+        int idle = 60; // 60s 空闲后探测
+        (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+        int intvl = 5; // 每 5s 重试
+        (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+        int cnt = 5; // 连续 5 次失败判定断开
+        (void)::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+    }
     (void)peer_id;
     (void)role;
 #endif
@@ -655,6 +714,7 @@ struct ActiveSessionInfo {
     std::string                           client_peer;
     std::string                           current_state;
     std::chrono::steady_clock::time_point start_time { std::chrono::steady_clock::now() };
+    std::function<void()>                 close_fn;
 };
 
 std::mutex                                      g_session_mutex;
@@ -666,6 +726,7 @@ void close_listener_from_signal()
         listener->close();
         g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
     }
+    g_force_shutdown.store(true, std::memory_order_release);
 }
 
 struct SessionCompletionContext {
@@ -690,6 +751,14 @@ void update_active_session(uint64_t session_id, std::string new_state)
     auto                        it = g_session_map.find(session_id);
     if (it != g_session_map.end())
         it->second.current_state = std::move(new_state);
+}
+
+void set_session_closer(uint64_t session_id, std::function<void()> closer)
+{
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    auto                        it = g_session_map.find(session_id);
+    if (it != g_session_map.end())
+        it->second.close_fn = std::move(closer);
 }
 
 void unregister_active_session(uint64_t session_id)
@@ -718,6 +787,31 @@ void log_active_sessions(std::string_view reason)
                        info.client_peer.c_str(),
                        info.current_state.c_str(),
                        static_cast<long long>(lifetime_ms));
+    }
+}
+
+void close_all_sessions(std::string_view reason)
+{
+    std::vector<std::function<void()>> closers;
+    {
+        std::lock_guard<std::mutex> lock(g_session_mutex);
+        closers.reserve(g_session_map.size());
+        for (auto& [id, info] : g_session_map) {
+            if (info.close_fn)
+                closers.push_back(info.close_fn);
+            CO_WQ_LOG_INFO("[proxy] closing session %s due to %.*s",
+                           info.peer_id.c_str(),
+                           (int)reason.size(),
+                           reason.data());
+        }
+    }
+    for (auto& fn : closers) {
+        try {
+            if (fn)
+                fn();
+        } catch (const std::exception& ex) {
+            CO_WQ_LOG_WARN("[proxy] close function threw exception: %s", ex.what());
+        }
     }
 }
 
@@ -750,6 +844,7 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
         int count = g_sigint_count.fetch_add(1, std::memory_order_acq_rel) + 1;
         g_sigint_seen.store(true, std::memory_order_release);
         g_stop.store(true, std::memory_order_release);
+        g_force_shutdown.store(true, std::memory_order_release);
         if (count > 1)
             ::ExitProcess(1);
         return TRUE;
@@ -765,6 +860,7 @@ void sigint_handler(int)
     int count = g_sigint_count.fetch_add(1, std::memory_order_acq_rel) + 1;
     g_sigint_seen.store(true, std::memory_order_release);
     g_stop.store(true, std::memory_order_release);
+    g_force_shutdown.store(true, std::memory_order_release);
     if (count > 1)
         std::_Exit(1);
 }
@@ -832,6 +928,14 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
                                                         const std::string&                    peer_id,
                                                         std::chrono::steady_clock::time_point request_start)
 {
+    set_session_closer(session_id, [&client]() {
+        if constexpr (requires { client.closed(); }) {
+            if (!client.closed())
+                client.close();
+        } else {
+            client.close();
+        }
+    });
     auto upstream = make_upstream_socket(fdwq);
     CO_WQ_LOG_INFO("[proxy] %s CONNECT %s:%u",
                    peer_id.c_str(),
@@ -922,6 +1026,21 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
 
     update_active_session(session_id,
                           std::string("connecting ") + format_host_port_for_state(target.host, target.port));
+
+    set_session_closer(session_id, [&client, &upstream]() {
+        if constexpr (requires { client.closed(); }) {
+            if (!client.closed())
+                client.close();
+        } else {
+            client.close();
+        }
+        if constexpr (requires { upstream.closed(); }) {
+            if (!upstream.closed())
+                upstream.close();
+        } else {
+            upstream.close();
+        }
+    });
 
     int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
@@ -1014,6 +1133,14 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
                                                              const std::string&                    peer_id,
                                                              std::chrono::steady_clock::time_point request_start)
 {
+    set_session_closer(session_id, [&client]() {
+        if constexpr (requires { client.closed(); }) {
+            if (!client.closed())
+                client.close();
+        } else {
+            client.close();
+        }
+    });
     auto upstream = make_upstream_socket(fdwq);
     CO_WQ_LOG_INFO("[proxy] %s %s %s:%u%s",
                    peer_id.c_str(),
@@ -1106,6 +1233,21 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
 
     update_active_session(session_id, ctx.method + " connecting " + format_host_port_for_state(parts.host, parts.port));
 
+    set_session_closer(session_id, [&client, &upstream]() {
+        if constexpr (requires { client.closed(); }) {
+            if (!client.closed())
+                client.close();
+        } else {
+            client.close();
+        }
+        if constexpr (requires { upstream.closed(); }) {
+            if (!upstream.closed())
+                upstream.close();
+        } else {
+            upstream.close();
+        }
+    });
+
     int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
         CO_WQ_LOG_WARN("[proxy] %s upstream connect failed %s:%u rc=%d",
@@ -1187,6 +1329,14 @@ Task<void, Work_Promise<SpinLock, void>> handle_proxy_connection(NetFdWorkqueue&
     bool                   received_any_data { false };
 
     update_active_session(session_id, "processing request");
+    set_session_closer(session_id, [&client]() {
+        if constexpr (requires { client.closed(); }) {
+            if (!client.closed())
+                client.close();
+        } else {
+            client.close();
+        }
+    });
 
     while (!ctx.message_complete) {
         ssize_t n = co_await client.recv(buffer.data(), buffer.size());
@@ -1405,8 +1555,10 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
                 next_report = now + std::chrono::seconds(1);
             }
             if (now - wait_start >= kGrace) {
+                g_force_shutdown.store(true, std::memory_order_release);
                 CO_WQ_LOG_WARN("[proxy] forcing shutdown with %d active session(s) still pending", remaining);
                 log_active_sessions("forcing shutdown");
+                close_all_sessions("forced shutdown");
                 break;
             }
         }
@@ -1432,6 +1584,7 @@ Task<void, Work_Promise<SpinLock, void>> log_sigint_once()
                 CO_WQ_LOG_WARN("[proxy] received SIGINT (count=%d)", count);
             spdlog::default_logger_raw()->flush();
             close_listener_from_signal();
+            close_all_sessions("signal interrupt");
             break;
         }
         co_await co_wq::delay_ms(get_sys_timer(), 50);
