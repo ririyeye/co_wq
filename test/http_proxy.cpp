@@ -23,9 +23,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -45,6 +47,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #endif
 
@@ -166,6 +169,14 @@ std::string format_host_for_log(const std::string& host)
         return '[' + host + ']';
     }
     return host;
+}
+
+std::string format_host_port_for_state(const std::string& host, uint16_t port)
+{
+    std::string label = format_host_for_log(host);
+    label.push_back(':');
+    label.append(std::to_string(port));
+    return label;
 }
 
 std::string format_sockaddr(const sockaddr* addr, socklen_t len)
@@ -614,11 +625,85 @@ int on_message_complete(llhttp_t* parser)
 }
 
 // 进程级运行状态标记，配合信号处理实现 Ctrl+C 安全退出。
-std::atomic_bool               g_stop { false };
-std::atomic<net::os::fd_t>     g_listener_fd { net::os::invalid_fd() };
-std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
-std::atomic_int                g_active_sessions { 0 };
-std::atomic<uint64_t>          g_next_session_id { 1 };
+std::atomic_bool                          g_stop { false };
+std::atomic<net::os::fd_t>                g_listener_fd { net::os::invalid_fd() };
+std::atomic_int                           g_active_sessions { 0 };
+std::atomic<uint64_t>                     g_next_session_id { 1 };
+std::atomic_int                           g_sigint_count { 0 };
+std::atomic_bool                          g_sigint_seen { false };
+std::atomic_bool                          g_sigint_logged { false };
+std::atomic<net::tcp_listener<SpinLock>*> g_listener_ptr { nullptr };
+
+struct ActiveSessionInfo {
+    std::string                           peer_id;
+    std::string                           client_peer;
+    std::string                           current_state;
+    std::chrono::steady_clock::time_point start_time { std::chrono::steady_clock::now() };
+};
+
+std::mutex                                      g_session_mutex;
+std::unordered_map<uint64_t, ActiveSessionInfo> g_session_map;
+
+void close_listener_from_signal()
+{
+    if (auto* listener = g_listener_ptr.exchange(nullptr, std::memory_order_acq_rel)) {
+        listener->close();
+        g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
+    }
+}
+
+struct SessionCompletionContext {
+    std::atomic_int* counter { nullptr };
+    uint64_t         session_id { 0 };
+};
+
+void register_active_session(uint64_t session_id, std::string peer_id, std::string client_peer)
+{
+    ActiveSessionInfo info;
+    info.peer_id       = std::move(peer_id);
+    info.client_peer   = client_peer.empty() ? std::string("(unknown)") : std::move(client_peer);
+    info.current_state = "awaiting request";
+    info.start_time    = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    g_session_map[session_id] = std::move(info);
+}
+
+void update_active_session(uint64_t session_id, std::string new_state)
+{
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    auto                        it = g_session_map.find(session_id);
+    if (it != g_session_map.end())
+        it->second.current_state = std::move(new_state);
+}
+
+void unregister_active_session(uint64_t session_id)
+{
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    g_session_map.erase(session_id);
+}
+
+void log_active_sessions(std::string_view reason)
+{
+    std::lock_guard<std::mutex> lock(g_session_mutex);
+    if (g_session_map.empty()) {
+        CO_WQ_LOG_INFO("[proxy] no active sessions pending (%.*s)", static_cast<int>(reason.size()), reason.data());
+        return;
+    }
+
+    CO_WQ_LOG_INFO("[proxy] %zu active session(s) pending (%.*s)",
+                   g_session_map.size(),
+                   static_cast<int>(reason.size()),
+                   reason.data());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto& [id, info] : g_session_map) {
+        auto lifetime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - info.start_time).count();
+        CO_WQ_LOG_INFO("[proxy] %s client=%s state=%s lifetime_ms=%lld",
+                       info.peer_id.c_str(),
+                       info.client_peer.c_str(),
+                       info.current_state.c_str(),
+                       static_cast<long long>(lifetime_ms));
+    }
+}
 
 net::dns::async_resolver& get_dns_resolver()
 {
@@ -628,8 +713,12 @@ net::dns::async_resolver& get_dns_resolver()
 
 void on_connection_task_completed(co_wq::Promise_base& promise)
 {
-    if (auto* counter = static_cast<std::atomic_int*>(promise.mUserData)) {
-        counter->fetch_sub(1, std::memory_order_acq_rel);
+    auto* ctx = static_cast<SessionCompletionContext*>(promise.mUserData);
+    if (ctx != nullptr) {
+        if (ctx->counter != nullptr)
+            ctx->counter->fetch_sub(1, std::memory_order_acq_rel);
+        unregister_active_session(ctx->session_id);
+        delete ctx;
     }
 }
 
@@ -637,12 +726,16 @@ void on_connection_task_completed(co_wq::Promise_base& promise)
 static BOOL WINAPI console_ctrl_handler(DWORD type)
 {
     if (type == CTRL_C_EVENT) {
+        static constexpr char kSigintMsg[] = "[proxy] SIGINT received\r\n";
+        DWORD                 written      = 0;
+        HANDLE                handle       = GetStdHandle(STD_ERROR_HANDLE);
+        if (handle != INVALID_HANDLE_VALUE)
+            WriteFile(handle, kSigintMsg, sizeof(kSigintMsg) - 1, &written, nullptr);
+        int count = g_sigint_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        g_sigint_seen.store(true, std::memory_order_release);
         g_stop.store(true, std::memory_order_release);
-        auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
-        if (fd != net::os::invalid_fd())
-            net::os::close_fd(fd);
-        if (auto* flag = g_finished_ptr.load(std::memory_order_acquire))
-            flag->store(true, std::memory_order_release);
+        if (count > 1)
+            ::ExitProcess(1);
         return TRUE;
     }
     return FALSE;
@@ -650,12 +743,14 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 #else
 void sigint_handler(int)
 {
+    constexpr char kSigintMsg[] = "[proxy] SIGINT received\n";
+    ssize_t        ignored      = ::write(STDERR_FILENO, kSigintMsg, sizeof(kSigintMsg) - 1);
+    (void)ignored;
+    int count = g_sigint_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+    g_sigint_seen.store(true, std::memory_order_release);
     g_stop.store(true, std::memory_order_release);
-    auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
-    if (fd != net::os::invalid_fd())
-        net::os::close_fd(fd);
-    if (auto* flag = g_finished_ptr.load(std::memory_order_acquire))
-        flag->store(true, std::memory_order_release);
+    if (count > 1)
+        std::_Exit(1);
 }
 #endif
 
@@ -716,6 +811,7 @@ std::string build_upstream_request(const HttpProxyContext& ctx, const UrlParts& 
 // 建立 CONNECT 隧道，将客户端/上游 sockets 互相转发，直到任一方关闭。
 Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock>&            client,
                                                         NetFdWorkqueue&                       fdwq,
+                                                        uint64_t                              session_id,
                                                         const ConnectTarget&                  target,
                                                         const std::string&                    peer_id,
                                                         std::chrono::steady_clock::time_point request_start)
@@ -725,6 +821,9 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
                    peer_id.c_str(),
                    format_host_for_log(target.host).c_str(),
                    static_cast<unsigned>(target.port));
+
+    update_active_session(session_id,
+                          std::string("DNS resolving ") + format_host_port_for_state(target.host, target.port));
 
     net::dns::resolve_options opts;
     opts.family           = upstream.family();
@@ -761,6 +860,8 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
         std::string response = build_http_response(502, "Bad Gateway", "Failed to resolve upstream host\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
+        update_active_session(session_id,
+                              std::string("DNS failed ") + format_host_port_for_state(target.host, target.port));
         CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=dns_resolve_failed duration_ms=%lld",
                        peer_id.c_str(),
                        static_cast<long long>(elapsed_since_request));
@@ -775,6 +876,9 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
                    static_cast<long long>(lookup_ms),
                    static_cast<long long>(queue_ms));
 
+    update_active_session(session_id,
+                          std::string("connecting ") + format_host_port_for_state(target.host, target.port));
+
     int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
         CO_WQ_LOG_WARN("[proxy] %s CONNECT upstream failed %s:%u rc=%d",
@@ -785,6 +889,8 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
         std::string response = build_http_response(502, "Bad Gateway", "Failed to connect upstream\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
+        update_active_session(session_id,
+                              std::string("connect failed ") + format_host_port_for_state(target.host, target.port));
         CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=upstream_connect_failed rc=%d", peer_id.c_str(), rc);
         co_return;
     }
@@ -798,6 +904,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     if (co_await client.send_all(established.data(), established.size()) <= 0) {
         client.close();
         upstream.close();
+        update_active_session(session_id, "client write failed during CONNECT");
         CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=client_write_failed", peer_id.c_str());
         co_return;
     }
@@ -806,6 +913,9 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
     configure_graceful_close(upstream, peer_id, "upstream");
     configure_tcp_keepalive(client, peer_id, "client");
     configure_tcp_keepalive(upstream, peer_id, "upstream");
+
+    update_active_session(session_id,
+                          std::string("forwarding CONNECT ") + format_host_port_for_state(target.host, target.port));
 
     PipeOutcome client_to_upstream_outcome;
     PipeOutcome upstream_to_client_outcome;
@@ -829,6 +939,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
                    tunnel_status.c_str(),
                    client_to_upstream_outcome.status.c_str(),
                    upstream_to_client_outcome.status.c_str());
+    update_active_session(session_id, std::string("closed ") + tunnel_status);
     client.close();
     upstream.close();
     co_return;
@@ -838,6 +949,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
 Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&                     ctx,
                                                              net::tcp_socket<SpinLock>&            client,
                                                              NetFdWorkqueue&                       fdwq,
+                                                             uint64_t                              session_id,
                                                              const UrlParts&                       parts,
                                                              const std::string&                    peer_id,
                                                              std::chrono::steady_clock::time_point request_start)
@@ -849,6 +961,9 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
                    format_host_for_log(parts.host).c_str(),
                    static_cast<unsigned>(parts.port),
                    parts.path.c_str());
+
+    update_active_session(session_id,
+                          ctx.method + " DNS resolving " + format_host_port_for_state(parts.host, parts.port));
 
     net::dns::resolve_options opts;
     opts.family           = upstream.family();
@@ -885,6 +1000,8 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         std::string response = build_http_response(502, "Bad Gateway", "Failed to resolve upstream host\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
+        update_active_session(session_id,
+                              ctx.method + " DNS failed " + format_host_port_for_state(parts.host, parts.port));
         CO_WQ_LOG_INFO("[proxy] %s response closed status=dns_resolve_failed duration_ms=%lld",
                        peer_id.c_str(),
                        static_cast<long long>(elapsed_since_request));
@@ -899,6 +1016,8 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
                    static_cast<long long>(lookup_ms),
                    static_cast<long long>(queue_ms));
 
+    update_active_session(session_id, ctx.method + " connecting " + format_host_port_for_state(parts.host, parts.port));
+
     int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
         CO_WQ_LOG_WARN("[proxy] %s upstream connect failed %s:%u rc=%d",
@@ -909,6 +1028,8 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         std::string response = build_http_response(502, "Bad Gateway", "Failed to connect upstream\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
+        update_active_session(session_id,
+                              ctx.method + " connect failed " + format_host_port_for_state(parts.host, parts.port));
         CO_WQ_LOG_INFO("[proxy] %s response closed status=upstream_connect_failed rc=%d", peer_id.c_str(), rc);
         co_return;
     }
@@ -919,6 +1040,7 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
         upstream.close();
+        update_active_session(session_id, ctx.method + " upstream send failed");
         CO_WQ_LOG_INFO("[proxy] %s response closed status=upstream_send_failed", peer_id.c_str());
         co_return;
     }
@@ -927,6 +1049,9 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
     configure_graceful_close(upstream, peer_id, "upstream");
     configure_tcp_keepalive(client, peer_id, "client");
     configure_tcp_keepalive(upstream, peer_id, "upstream");
+
+    update_active_session(session_id,
+                          ctx.method + " awaiting response from " + format_host_port_for_state(parts.host, parts.port));
 
     PipeOutcome response_outcome;
     co_await pipe_data(upstream, client, false, peer_id + " upstream->client", response_outcome);
@@ -938,14 +1063,17 @@ Task<void, Work_Promise<SpinLock, void>> handle_http_request(HttpProxyContext&  
                    static_cast<unsigned>(parts.port),
                    response_status.c_str(),
                    response_outcome.status.c_str());
+    update_active_session(session_id, ctx.method + " closed " + response_status);
     client.close();
     upstream.close();
     co_return;
 }
 
 // 单个客户端连接生命周期：解析首个请求并根据方法调度处理逻辑。
-Task<void, Work_Promise<SpinLock, void>>
-handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, std::string peer_id)
+Task<void, Work_Promise<SpinLock, void>> handle_proxy_connection(NetFdWorkqueue&           fdwq,
+                                                                 net::tcp_socket<SpinLock> client,
+                                                                 uint64_t                  session_id,
+                                                                 std::string               peer_id)
 {
     llhttp_settings_t settings;
     llhttp_settings_init(&settings);
@@ -969,6 +1097,8 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
     bool                   parse_error { false };
     std::string            error_reason;
     bool                   received_any_data { false };
+
+    update_active_session(session_id, "processing request");
 
     while (!ctx.message_complete) {
         ssize_t n = co_await client.recv(buffer.data(), buffer.size());
@@ -1012,6 +1142,7 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
 
     if (parse_error) {
         CO_WQ_LOG_ERROR("[proxy] %s parse error: %s", peer_id.c_str(), error_reason.c_str());
+        update_active_session(session_id, std::string("parse error: ") + error_reason);
         std::string response = build_http_response(400, "Bad Request", "Failed to parse request\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
@@ -1032,20 +1163,24 @@ handle_proxy_connection(NetFdWorkqueue& fdwq, net::tcp_socket<SpinLock> client, 
             CO_WQ_LOG_INFO("[proxy] %s tunnel closed status=invalid_connect_target", peer_id.c_str());
             co_return;
         }
-        co_await handle_connect(client, fdwq, *target, peer_id, request_ready);
+        update_active_session(session_id,
+                              std::string("CONNECT queued ") + format_host_port_for_state(target->host, target->port));
+        co_await handle_connect(client, fdwq, session_id, *target, peer_id, request_ready);
         co_return;
     }
 
     auto parts = parse_http_url(ctx.url);
     if (!parts) {
         CO_WQ_LOG_WARN("[proxy] %s received non-absolute URI: %s", peer_id.c_str(), ctx.url.c_str());
+        update_active_session(session_id, "non-absolute URI");
         std::string response = build_http_response(400, "Bad Request", "Proxy requires absolute URI\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();
         co_return;
     }
 
-    co_await handle_http_request(ctx, client, fdwq, *parts, peer_id, request_ready);
+    update_active_session(session_id, ctx.method + " queued " + format_host_port_for_state(parts->host, parts->port));
+    co_await handle_http_request(ctx, client, fdwq, session_id, *parts, peer_id, request_ready);
     co_return;
 }
 
@@ -1082,6 +1217,7 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
 
     auto                        listen_cfg = analyze_listen_host(host);
     net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor(), listen_cfg.family);
+    g_listener_ptr.store(&listener, std::memory_order_release);
     try {
         listener.bind_listen(listen_cfg.bind_host, port, 128, listen_cfg.dual_stack);
     } catch (const std::exception& ex) {
@@ -1102,6 +1238,7 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
         auto msg = oss.str();
         CO_WQ_LOG_ERROR("%s", msg.c_str());
         listener.close();
+        g_listener_ptr.store(nullptr, std::memory_order_release);
         g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
         co_return;
     }
@@ -1130,15 +1267,21 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
         std::string peer_id    = format_peer_id(session_id);
         CO_WQ_LOG_DEBUG("[proxy] %s accepted (fd=%d)", peer_id.c_str(), fd);
         auto socket = fdwq.adopt_tcp_socket(fd);
-        auto task   = handle_proxy_connection(fdwq, std::move(socket), std::move(peer_id));
+        auto remote = describe_remote_endpoint(socket);
+        register_active_session(session_id, peer_id, remote);
+        auto task = handle_proxy_connection(fdwq, std::move(socket), session_id, std::move(peer_id));
         if (auto coroutine = task.get()) {
             auto& promise = coroutine.promise();
             if (promise.mOnCompleted != nullptr) {
                 CO_WQ_LOG_WARN(
                     "[proxy] connection task already has completion callback; skipping active session tracking");
+                unregister_active_session(session_id);
             } else {
-                promise.mUserData    = &g_active_sessions;
-                promise.mOnCompleted = &on_connection_task_completed;
+                auto* completion_ctx       = new SessionCompletionContext;
+                completion_ctx->counter    = &g_active_sessions;
+                completion_ctx->session_id = session_id;
+                promise.mUserData          = completion_ctx;
+                promise.mOnCompleted       = &on_connection_task_completed;
                 g_active_sessions.fetch_add(1, std::memory_order_acq_rel);
             }
         }
@@ -1147,18 +1290,66 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
 
     CO_WQ_LOG_INFO("[proxy] stopping");
 
-    listener.close();
-    g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
-    if (int remaining = g_active_sessions.load(std::memory_order_acquire); remaining > 0) {
-        CO_WQ_LOG_INFO("[proxy] waiting for %d active session(s) to drain", remaining);
+    int sig_count = g_sigint_count.load(std::memory_order_acquire);
+    if (sig_count > 0 || g_sigint_seen.load(std::memory_order_acquire)) {
+        if (!g_sigint_logged.exchange(true, std::memory_order_acq_rel))
+            CO_WQ_LOG_WARN("[proxy] received SIGINT (count=%d)", sig_count);
+        spdlog::default_logger_raw()->flush();
     }
-    while (g_active_sessions.load(std::memory_order_acquire) > 0) {
-        co_await co_wq::delay_ms(get_sys_timer(), 10);
+
+    listener.close();
+    g_listener_ptr.store(nullptr, std::memory_order_release);
+    g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
+    int remaining = g_active_sessions.load(std::memory_order_acquire);
+    if (remaining > 0) {
+        CO_WQ_LOG_INFO("[proxy] waiting for %d active session(s) to drain", remaining);
+        log_active_sessions("shutdown requested");
+
+        auto           wait_start  = std::chrono::steady_clock::now();
+        auto           next_report = wait_start + std::chrono::seconds(1);
+        constexpr auto kGrace      = std::chrono::seconds(5);
+
+        while ((remaining = g_active_sessions.load(std::memory_order_acquire)) > 0) {
+            co_await co_wq::delay_ms(get_sys_timer(), 50);
+            auto now = std::chrono::steady_clock::now();
+            if (now >= next_report) {
+                log_active_sessions("shutdown pending");
+                next_report = now + std::chrono::seconds(1);
+            }
+            if (now - wait_start >= kGrace) {
+                CO_WQ_LOG_WARN("[proxy] forcing shutdown with %d active session(s) still pending", remaining);
+                log_active_sessions("forcing shutdown");
+                break;
+            }
+        }
+    } else {
+        CO_WQ_LOG_INFO("[proxy] no active sessions pending at shutdown");
+    }
+
+    if (remaining == 0) {
+        log_active_sessions("shutdown complete");
     }
     co_return;
 }
 
 } // namespace
+
+// 在系统工作队列上轮询一次 SIGINT 标记，确保日志里能看到 Ctrl+C。
+Task<void, Work_Promise<SpinLock, void>> log_sigint_once()
+{
+    while (true) {
+        if (g_sigint_seen.load(std::memory_order_acquire)) {
+            int count = g_sigint_count.load(std::memory_order_acquire);
+            if (!g_sigint_logged.exchange(true, std::memory_order_acq_rel))
+                CO_WQ_LOG_WARN("[proxy] received SIGINT (count=%d)", count);
+            spdlog::default_logger_raw()->flush();
+            close_listener_from_signal();
+            break;
+        }
+        co_await co_wq::delay_ms(get_sys_timer(), 50);
+    }
+    co_return;
+}
 
 // 程序入口：解析命令行参数并启动主协程。
 int main(int argc, char* argv[])
@@ -1282,10 +1473,10 @@ int main(int argc, char* argv[])
             flag->store(true, std::memory_order_release);
     };
 
-    g_finished_ptr.store(&finished, std::memory_order_release);
     post_to(proxy_task, wq);
+    auto sigint_task = log_sigint_once();
+    post_to(sigint_task, wq);
 
     sys_wait_until(finished);
-    g_finished_ptr.store(nullptr, std::memory_order_release);
     return 0;
 }
