@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #endif
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -161,13 +162,24 @@ protected:
         /** @brief 构造目标地址的 provider。 */
         Provider provider;
         /** @brief connect 结果，0 表示成功，-1 表示失败。 */
-        int ret { 0 };
+        int                                        ret { 0 };
+        bool                                       timed_out { false };
+        static constexpr std::chrono::milliseconds kConnectTimeout { 10'000 };
         connect_awaiter(Derived& s, Provider p) : owner(s), provider(std::move(p))
         {
             auto& cbq = owner.callback_queue();
             this->store_route_guard(cbq.retain_guard());
             this->route_ctx  = cbq.context();
             this->route_post = &callback_wq<lock>::post_adapter;
+        }
+        static void timeout_cb(worknode* w)
+        {
+            auto* self = static_cast<connect_awaiter*>(w);
+            if (!self)
+                return;
+            self->timed_out = true;
+            self->ret       = -1;
+            self->clear_timeout_callback();
         }
         bool await_ready() const noexcept { return false; }
         void await_suspend(std::coroutine_handle<> resume_handle)
@@ -193,10 +205,18 @@ protected:
                 net::post_via_route(owner.exec(), *this);
                 return;
             }
-            owner.reactor()->add_waiter(owner.native_handle(), EPOLLOUT, this);
+            timed_out = false;
+            this->set_timeout_callback(&timeout_cb);
+            owner.reactor()->add_waiter_with_timeout(owner.native_handle(), EPOLLOUT, this, kConnectTimeout);
         }
         int await_resume() noexcept
         {
+            this->clear_timeout_callback();
+            if (timed_out) {
+                timed_out = false;
+                errno     = ETIMEDOUT;
+                return -1;
+            }
             if (ret == 0) {
                 int       err = 0;
                 socklen_t len = sizeof(err);

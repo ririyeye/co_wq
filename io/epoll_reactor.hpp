@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -88,6 +89,12 @@ public:
         register_waiter(fd, evmask, waiter, true);
     }
 
+    void add_waiter_with_timeout(fd_t fd, uint32_t evmask, io_waiter_base* waiter, std::chrono::milliseconds timeout)
+    {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        register_waiter(fd, evmask, waiter, false, true, deadline);
+    }
+
     void remove_fd(fd_t fd)
     {
         std::vector<waiter_item> to_resume;
@@ -107,23 +114,64 @@ public:
 
 private:
     struct waiter_item {
-        uint32_t        mask;
-        io_waiter_base* waiter;
+        uint32_t                              mask { 0 };
+        io_waiter_base*                       waiter { nullptr };
+        bool                                  has_timeout { false };
+        std::chrono::steady_clock::time_point deadline {};
     };
     struct fd_state {
         std::vector<waiter_item> waiters;
         uint32_t                 interest { 0 };
     };
 
-    void register_waiter(fd_t fd, uint32_t evmask, io_waiter_base* waiter, bool preserve_func)
+    void register_waiter(fd_t                                  fd,
+                         uint32_t                              evmask,
+                         io_waiter_base*                       waiter,
+                         bool                                  preserve_func,
+                         bool                                  has_timeout = false,
+                         std::chrono::steady_clock::time_point deadline    = {})
     {
         std::scoped_lock<lock> lk(_lk);
         if (!preserve_func)
             waiter->func = &io_waiter_base::resume_cb;
         INIT_LIST_HEAD(&waiter->ws_node);
         auto& st = _fds[fd];
-        st.waiters.push_back({ evmask, waiter });
+        st.waiters.push_back(waiter_item { evmask, waiter, has_timeout, deadline });
         update_fd_interest_unlocked(fd, st);
+    }
+
+    void collect_timeouts(std::vector<waiter_item>& timed_out)
+    {
+        if (timed_out.capacity() < 4)
+            timed_out.reserve(4);
+        auto                   now = std::chrono::steady_clock::now();
+        std::scoped_lock<lock> lk(_lk);
+        for (auto& entry : _fds) {
+            auto& st = entry.second;
+            auto  it = std::remove_if(st.waiters.begin(), st.waiters.end(), [&](waiter_item& wi) {
+                if (wi.has_timeout && wi.deadline <= now) {
+                    timed_out.push_back(wi);
+                    return true;
+                }
+                return false;
+            });
+            if (it != st.waiters.end()) {
+                st.waiters.erase(it, st.waiters.end());
+                update_fd_interest_unlocked(entry.first, st);
+            }
+        }
+    }
+
+    void handle_timeouts(std::vector<waiter_item>& timed_out)
+    {
+        for (auto& wi : timed_out) {
+            if (wi.waiter) {
+                if (wi.waiter->timeout_func)
+                    wi.waiter->timeout_func(static_cast<worknode*>(wi.waiter));
+                post_via_route(_exec, *wi.waiter);
+            }
+        }
+        timed_out.clear();
     }
 
     void update_fd_interest_unlocked(fd_t fd, fd_state& st)
@@ -151,7 +199,12 @@ private:
     {
         constexpr int            MAX_EVENTS = 32;
         std::vector<epoll_event> evs(MAX_EVENTS);
+        std::vector<waiter_item> timed_out;
         while (_running.load(std::memory_order_relaxed)) {
+            timed_out.clear();
+            collect_timeouts(timed_out);
+            if (!timed_out.empty())
+                handle_timeouts(timed_out);
             int n = ::epoll_wait(_epfd, evs.data(), MAX_EVENTS, 50);
             if (n < 0) {
                 if (errno == EINTR)
@@ -184,6 +237,10 @@ private:
                 for (auto& wi : to_resume)
                     post_via_route(_exec, *wi.waiter);
             }
+            timed_out.clear();
+            collect_timeouts(timed_out);
+            if (!timed_out.empty())
+                handle_timeouts(timed_out);
         }
     }
 

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <thread>
@@ -136,6 +137,12 @@ public:
     void add_waiter_custom(int fd, uint32_t evmask, io_waiter_base* waiter)
     {
         register_waiter(fd, evmask, waiter, true);
+    }
+
+    void add_waiter_with_timeout(int fd, uint32_t evmask, io_waiter_base* waiter, std::chrono::milliseconds timeout)
+    {
+        (void)timeout;
+        register_waiter(fd, evmask, waiter, false);
     }
 
     void remove_fd(int fd)

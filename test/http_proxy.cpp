@@ -881,11 +881,27 @@ Task<void, Work_Promise<SpinLock, void>> handle_connect(net::tcp_socket<SpinLock
 
     int rc = co_await upstream.connect(reinterpret_cast<const sockaddr*>(&dns_result.storage), dns_result.length);
     if (rc != 0) {
-        CO_WQ_LOG_WARN("[proxy] %s CONNECT upstream failed %s:%u rc=%d",
+        int         err = errno;
+        char        errbuf[128] {};
+        const char* errstr = nullptr;
+#if defined(_WIN32)
+        if (::strerror_s(errbuf, sizeof(errbuf), err) != 0)
+            std::snprintf(errbuf, sizeof(errbuf), "errno=%d", err);
+        errstr = errbuf;
+#elif defined(_GNU_SOURCE)
+        errstr = ::strerror_r(err, errbuf, sizeof(errbuf));
+#else
+        if (::strerror_r(err, errbuf, sizeof(errbuf)) != 0)
+            std::snprintf(errbuf, sizeof(errbuf), "errno=%d", err);
+        errstr = errbuf;
+#endif
+        CO_WQ_LOG_WARN("[proxy] %s CONNECT upstream failed %s:%u rc=%d errno=%d (%s)",
                        peer_id.c_str(),
                        target.host.c_str(),
                        static_cast<unsigned>(target.port),
-                       rc);
+                       rc,
+                       err,
+                       errstr ? errstr : "<unknown>");
         std::string response = build_http_response(502, "Bad Gateway", "Failed to connect upstream\n");
         (void)co_await client.send_all(response.data(), response.size());
         client.close();

@@ -24,6 +24,7 @@ struct io_waiter_base : worknode {
         this->func        = nullptr;
         this->debug_magic = debug_magic_value;
         this->debug_name  = "io_waiter_base";
+        timeout_func      = nullptr;
     }
     ~io_waiter_base() { this->debug_magic = 0; }
     std::coroutine_handle<> h; ///< 目标协程句柄
@@ -31,6 +32,7 @@ struct io_waiter_base : worknode {
     void* route_ctx { nullptr };
     void (*route_post)(void* ctx, worknode* node) { nullptr };
     using route_guard_ptr = std::shared_ptr<void>;
+    worknode::work_func_t timeout_func { nullptr };
 
 private:
     std::atomic<route_guard_ptr> route_guard_storage {};
@@ -74,12 +76,16 @@ public:
     }
     bool has_valid_magic() const { return debug_magic == debug_magic_value; }
 
+    void set_timeout_callback(worknode::work_func_t cb) noexcept { timeout_func = cb; }
+    void clear_timeout_callback() noexcept { timeout_func = nullptr; }
+
     /**
      * @brief workqueue 投递回调：恢复协程执行。
      */
     static void resume_cb(struct worknode* w)
     {
         auto* self = static_cast<io_waiter_base*>(w);
+
         if (!self) {
             CO_WQ_CBQ_WARN("[io_waiter] resume_cb invoked with null self\n");
             return;
@@ -111,6 +117,7 @@ public:
                         haddr,
                         name,
                         magic);
+        self->clear_timeout_callback();
         self->h.resume();
         CO_WQ_CBQ_TRACE("[io_waiter] resume_cb completed self=%p h=%p name=%s magic=%08x\n",
                         static_cast<void*>(self),
