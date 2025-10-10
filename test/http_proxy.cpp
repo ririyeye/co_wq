@@ -767,29 +767,6 @@ void unregister_active_session(uint64_t session_id)
     g_session_map.erase(session_id);
 }
 
-void log_active_sessions(std::string_view reason)
-{
-    std::lock_guard<std::mutex> lock(g_session_mutex);
-    if (g_session_map.empty()) {
-        CO_WQ_LOG_INFO("[proxy] no active sessions pending (%.*s)", static_cast<int>(reason.size()), reason.data());
-        return;
-    }
-
-    CO_WQ_LOG_INFO("[proxy] %zu active session(s) pending (%.*s)",
-                   g_session_map.size(),
-                   static_cast<int>(reason.size()),
-                   reason.data());
-    auto now = std::chrono::steady_clock::now();
-    for (const auto& [id, info] : g_session_map) {
-        auto lifetime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - info.start_time).count();
-        CO_WQ_LOG_INFO("[proxy] %s client=%s state=%s lifetime_ms=%lld",
-                       info.peer_id.c_str(),
-                       info.client_peer.c_str(),
-                       info.current_state.c_str(),
-                       static_cast<long long>(lifetime_ms));
-    }
-}
-
 void close_all_sessions(std::string_view reason)
 {
     std::vector<std::function<void()>> closers;
@@ -1540,34 +1517,11 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
     g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
     int remaining = g_active_sessions.load(std::memory_order_acquire);
     if (remaining > 0) {
-        CO_WQ_LOG_INFO("[proxy] waiting for %d active session(s) to drain", remaining);
-        log_active_sessions("shutdown requested");
-
-        auto           wait_start  = std::chrono::steady_clock::now();
-        auto           next_report = wait_start + std::chrono::seconds(1);
-        constexpr auto kGrace      = std::chrono::seconds(5);
-
-        while ((remaining = g_active_sessions.load(std::memory_order_acquire)) > 0) {
-            co_await co_wq::delay_ms(get_sys_timer(), 50);
-            auto now = std::chrono::steady_clock::now();
-            if (now >= next_report) {
-                log_active_sessions("shutdown pending");
-                next_report = now + std::chrono::seconds(1);
-            }
-            if (now - wait_start >= kGrace) {
-                g_force_shutdown.store(true, std::memory_order_release);
-                CO_WQ_LOG_WARN("[proxy] forcing shutdown with %d active session(s) still pending", remaining);
-                log_active_sessions("forcing shutdown");
-                close_all_sessions("forced shutdown");
-                break;
-            }
-        }
+        g_force_shutdown.store(true, std::memory_order_release);
+        CO_WQ_LOG_WARN("[proxy] forcing shutdown with %d active session(s) still pending", remaining);
+        close_all_sessions("forced shutdown");
     } else {
         CO_WQ_LOG_INFO("[proxy] no active sessions pending at shutdown");
-    }
-
-    if (remaining == 0) {
-        log_active_sessions("shutdown complete");
     }
     co_return;
 }
@@ -1696,28 +1650,33 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    co_wq::test::SysStatsLogger stats_logger("http_proxy");
-    auto&                       wq = get_sys_workqueue(0);
-    NetFdWorkqueue              fdwq(wq);
+    {
+        co_wq::test::SysStatsLogger stats_logger("http_proxy");
+        auto&                       wq = get_sys_workqueue(0);
+        NetFdWorkqueue              fdwq(wq);
 
-    CO_WQ_LOG_INFO("[proxy] starting on %s:%u", host.c_str(), static_cast<unsigned>(port));
+        CO_WQ_LOG_INFO("[proxy] starting on %s:%u", host.c_str(), static_cast<unsigned>(port));
 
-    auto  proxy_task = proxy_server(fdwq, host, port);
-    auto  coroutine  = proxy_task.get();
-    auto& promise    = coroutine.promise();
+        auto  proxy_task = proxy_server(fdwq, host, port);
+        auto  coroutine  = proxy_task.get();
+        auto& promise    = coroutine.promise();
 
-    std::atomic_bool finished { false };
-    promise.mUserData    = &finished;
-    promise.mOnCompleted = [](Promise_base& pb) {
-        auto* flag = static_cast<std::atomic_bool*>(pb.mUserData);
-        if (flag)
-            flag->store(true, std::memory_order_release);
-    };
+        std::atomic_bool finished { false };
+        promise.mUserData    = &finished;
+        promise.mOnCompleted = [](Promise_base& pb) {
+            auto* flag = static_cast<std::atomic_bool*>(pb.mUserData);
+            if (flag)
+                flag->store(true, std::memory_order_release);
+        };
 
-    post_to(proxy_task, wq);
-    auto sigint_task = log_sigint_once();
-    post_to(sigint_task, wq);
+        post_to(proxy_task, wq);
+        auto sigint_task = log_sigint_once();
+        post_to(sigint_task, wq);
 
-    sys_wait_until(finished);
+        sys_wait_until(finished);
+    }
+
+    CO_WQ_LOG_INFO("[proxy] main exiting");
+    spdlog::default_logger_raw()->flush();
     return 0;
 }
