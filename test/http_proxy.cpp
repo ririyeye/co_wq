@@ -8,6 +8,7 @@
 
 #include "dns_resolver.hpp"
 #include "fd_base.hpp"
+#include "task.hpp"
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
 #include "when_all.hpp"
@@ -1526,6 +1527,23 @@ Task<void, Work_Promise<SpinLock, void>> proxy_server(NetFdWorkqueue& fdwq, cons
     co_return;
 }
 
+void log_task_alloc_stats()
+{
+    CO_WQ_LOG_INFO("[proxy] malloc_cnt=%d free_cnt=%d buckets: <=100=%d <=500=%d <=1k=%d <=5k=%d <=10k=%d <=20k=%d "
+                   "<=50k=%d <=100k=%d >100k=%d",
+                   sys_sta.malloc_cnt,
+                   sys_sta.free_cnt,
+                   sys_sta.bucket_le_100,
+                   sys_sta.bucket_le_500,
+                   sys_sta.bucket_le_1k,
+                   sys_sta.bucket_le_5k,
+                   sys_sta.bucket_le_10k,
+                   sys_sta.bucket_le_20k,
+                   sys_sta.bucket_le_50k,
+                   sys_sta.bucket_le_100k,
+                   sys_sta.bucket_gt_100k);
+}
+
 } // namespace
 
 // 在系统工作队列上轮询一次 SIGINT 标记，确保日志里能看到 Ctrl+C。
@@ -1674,6 +1692,7 @@ int main(int argc, char* argv[])
         post_to(sigint_task, wq);
 
         sys_wait_until(finished);
+        log_task_alloc_stats();
     }
 
     CO_WQ_LOG_INFO("[proxy] main exiting");

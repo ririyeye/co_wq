@@ -3,12 +3,46 @@
 #include "previous_awaiter.hpp"
 #include "uninitialized.hpp"
 #include <coroutine>
+#include <cstddef>
 #include <cstdlib>
 #include <utility>
 
 struct task_stat {
-    int malloc_cnt = 0;
-    int free_cnt   = 0;
+    int malloc_cnt     = 0;
+    int free_cnt       = 0;
+    int bucket_le_100  = 0;
+    int bucket_le_500  = 0;
+    int bucket_le_1k   = 0;
+    int bucket_le_5k   = 0;
+    int bucket_le_10k  = 0;
+    int bucket_le_20k  = 0;
+    int bucket_le_50k  = 0;
+    int bucket_le_100k = 0;
+    int bucket_gt_100k = 0;
+
+    void record_alloc(std::size_t size)
+    {
+        ++malloc_cnt;
+        if (size <= 100) {
+            ++bucket_le_100;
+        } else if (size <= 500) {
+            ++bucket_le_500;
+        } else if (size <= 1024) {
+            ++bucket_le_1k;
+        } else if (size <= 5120) {
+            ++bucket_le_5k;
+        } else if (size <= 10'240) {
+            ++bucket_le_10k;
+        } else if (size <= 20'480) {
+            ++bucket_le_20k;
+        } else if (size <= 51'200) {
+            ++bucket_le_50k;
+        } else if (size <= 102'400) {
+            ++bucket_le_100k;
+        } else {
+            ++bucket_gt_100k;
+        }
+    }
 };
 
 inline task_stat sys_sta;
@@ -115,7 +149,7 @@ public:
 template <class BasePromise, taskalloc Alloc> struct promise_with_alloc : BasePromise {
     static void* operator new(std::size_t sz)
     {
-        ++sys_sta.malloc_cnt;
+        sys_sta.record_alloc(sz);
         return Alloc {}.alloc(sz);
     }
     static void operator delete(void* p, std::size_t sz) noexcept
