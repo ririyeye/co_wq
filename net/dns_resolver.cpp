@@ -84,8 +84,7 @@ namespace {
         for (auto* ai = result_list; ai; ai = ai->ai_next) {
             if (ai->ai_addr && ai->ai_addrlen > 0) {
                 if (static_cast<size_t>(ai->ai_addrlen) <= sizeof(resolve_result::endpoint_entry {}.addr)) {
-                    resolve_result::endpoint_entry ep;
-                    std::memset(&ep, 0, sizeof(ep));
+                    resolve_result::endpoint_entry ep {};
                     std::memcpy(&ep.addr, ai->ai_addr, ai->ai_addrlen);
                     ep.len = static_cast<socklen_t>(ai->ai_addrlen);
                     result.endpoints.push_back(ep);

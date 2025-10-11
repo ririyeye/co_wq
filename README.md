@@ -1,4 +1,5 @@
 # co_wq
+<!-- markdownlint-disable MD007 MD014 MD022 MD023 MD029 MD031 MD032 -->
 
 协程友好的工作队列与网络原语集合，基于 C++20 coroutine 实现跨平台（Linux/Windows）任务调度、同步与 IO 封装。本库核心围绕 `co_wq::workqueue`、`co_wq::Task` 以及一组可组合的同步/网络 awaiter，帮助你用接近同步的代码风格组织异步逻辑。
 
@@ -42,7 +43,7 @@ PS> python .\script\xmk.py build
 
 默认 `build` 子命令会：
 1. 以 `releasedbg` 模式写入配置并将输出目录固定为 `build/`；
-2. 根据 “full” 预设启用 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USE_BUNDLED_NGHTTP2/USING_USB/USING_EXAMPLE` 与 `ENABLE_LOGGING`；
+2. 根据 “full” 预设启用 `USING_NET/USING_SSL/USE_BUNDLED_LLHTTP/USE_BUNDLED_NGHTTP2/USING_EXAMPLE` 与 `ENABLE_LOGGING`（USB 需显式 `--with-usb` 才会拉取依赖 `libusb`）；
 3. 生成 `compile_commands.json`；
 4. 构建并安装产物到 `install/`。
 
@@ -55,23 +56,30 @@ PS> python .\script\xmk.py build
 - `--core`：仅构建最小核心（关闭网络/TLS/USB/示例与日志模块）。
 - `--debug` / `--releasedbg`：选择 xmake 构建模式（默认 `releasedbg`）。
 - `--msvc-iterator-debug`：在 Windows/MSVC 环境下启用 `_ITERATOR_DEBUG_LEVEL=2` 以捕获 STL 断言（默认关闭，可配合 `--no-msvc-iterator-debug` 还原）。
+- `--with-usb` / `--without-usb`：显式控制是否启用 USB 功能（默认关闭，避免自动拉取 LGPL `libusb` 依赖）。
 
 运行 `python script/xmk.py build --help` 查看完整选项列表。
 
 ### Windows（MSVC 工具链，本机）
+
 确保已加载 Visual Studio 工具链（如在“x64 Native Tools Command Prompt”或对应的 PowerShell 配置文件中），即可直接运行上述 Python 命令。脚本会自动在当前项目目录内设置 `XMAKE_GLOBALDIR`，无需额外环境变量。
 
 ### Linux/WSL
+
 在任何可用 `python3` 与 `xmake` 的 shell 中执行同样的命令即可，无需额外适配。
 
 > 🔍 若需排查 MSVC STL 迭代器越界，搭配 `python script/xmk.py build --msvc-iterator-debug` 使用即可。
 
 ### Windows（Wine + MSVC 工具链）
+
 参考 `script/xmk-wine-msvc.sh`：
+
 ```bash
-$ bash script/xmk-wine-msvc.sh
+bash script/xmk-wine-msvc.sh
 ```
+
 脚本默认以 `releasedbg` 模式仅构建核心库（关闭 `USING_NET/USING_SSL/USING_USB/USING_EXAMPLE` 且关闭日志模块），步骤包括：
+
 1. 写入 `--sdk=/opt/toolchain/msvc-wine/msvc` 等配置并使用 `build/` 作为输出目录；
 2. 构建并安装 `co_wq` 静态库；
 3. 生成 `compile_commands.json` 给 IDE 使用。
@@ -79,7 +87,7 @@ $ bash script/xmk-wine-msvc.sh
 若需要完整网络/TLS/USB + 示例，可追加 `--full`：
 
 ```bash
-$ bash script/xmk-wine-msvc.sh --full
+bash script/xmk-wine-msvc.sh --full
 ```
 
 `--full` 会重新启用网络/TLS/USB/示例及日志依赖；其余构建模式可参考脚本内置说明。
@@ -91,13 +99,15 @@ $ bash script/xmk-wine-msvc.sh --full
 > 💡 编译卡住时可运行 `wineserver -k` 重启 Wine。详细工具链搭建请参考脚本内联注释。
 
 ### 清理构建缓存
+
 ```bash
-$ python3 script/xmk.py clean
+python3 script/xmk.py clean
 ```
+
 或在 PowerShell 中：
 
 ```powershell
-PS> python .\script\xmk.py clean
+python .\script\xmk.py clean
 ```
 
 默认会移除 `.xmake/`、`build/`、`install/` 及 `.cache/`。若还需删除全局缓存，可附加 `--remove-global-cache`：
@@ -226,7 +236,7 @@ curl -k https://127.0.0.1:8443/
 > ⚠️ 自签证书仅用于测试；生产环境请使用受信任的 CA 证书，并在服务端配置 `SSL_CTX_load_verify_locations` 等细节。
 
 ## 示例程序
-以下示例假设已通过 `python script/xmk.py build`（默认 full）或手动执行 `xmake f` 使 `USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_EXAMPLE=y`（以及按需开启 `USING_SSL/USING_USB`）。完成配置后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：
+以下示例假设已通过 `python script/xmk.py build`（默认 full）或手动执行 `xmake f` 使 `USING_NET=y --USE_BUNDLED_LLHTTP=y --USING_EXAMPLE=y`（以及按需开启 `USING_SSL`，若需要 USB 功能请额外加 `--with-usb` 或 `--USING_USB=y`）。完成配置后，可尝试 `test/echo.cpp` 内的 TCP/UDP echo 服务器与客户端：
 ```bash
 xmake run echo --both --host 127.0.0.1 --port 12345
 ```
@@ -425,6 +435,6 @@ xmake run co_uds --server --path /tmp/co_wq_uds.sock --max-conn 0
 - **自定义锁死循环**：若自定义锁实现使用阻塞等待（如 `std::mutex`），请确保在多线程环境中不会阻塞 reactor 线程。
 
 ## 许可证
-（请在此添加或确认项目的实际许可证信息。）
+项目遵循 [MIT License](LICENSE)。使用或分发时请保留原始版权与许可声明。
 
 

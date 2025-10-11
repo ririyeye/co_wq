@@ -61,7 +61,13 @@ def run_command(
     return subprocess.run(command, cwd=cwd, env=env, check=check)
 
 
-def configure_and_build(mode: str, build_mode: str, iterator_debug: bool, network_mode: str | None) -> None:
+def configure_and_build(
+    mode: str,
+    build_mode: str,
+    iterator_debug: bool,
+    network_mode: str | None,
+    enable_usb: bool,
+) -> None:
     env = os.environ.copy()
     env["XMAKE_GLOBALDIR"] = str(PROJECT_ROOT)
 
@@ -70,13 +76,15 @@ def configure_and_build(mode: str, build_mode: str, iterator_debug: bool, networ
         network_flag = [f"--network={network_mode}"]
 
     config_flags: list[str]
+    usb_flag = "y" if enable_usb else "n"
+
     if mode == "full":
         config_flags = [
             "--USING_NET=y",
             "--USING_SSL=y",
             "--USE_BUNDLED_LLHTTP=y",
             "--USE_BUNDLED_NGHTTP2=y",
-            "--USING_USB=y",
+            f"--USING_USB={usb_flag}",
             "--ENABLE_LOGGING=y",
             "--USING_EXAMPLE=y",
         ]
@@ -86,12 +94,13 @@ def configure_and_build(mode: str, build_mode: str, iterator_debug: bool, networ
             "--USING_SSL=n",
             "--USE_BUNDLED_LLHTTP=n",
             "--USE_BUNDLED_NGHTTP2=n",
-            "--USING_USB=n",
+            f"--USING_USB={usb_flag}",
             "--ENABLE_LOGGING=n",
             "--USING_EXAMPLE=n",
         ]
 
-    config_flags.append(f"--MSVC_ITERATOR_DEBUG={'y' if iterator_debug else 'n'}")
+    config_flags.append(
+        f"--MSVC_ITERATOR_DEBUG={'y' if iterator_debug else 'n'}")
 
     configure_cmd = [
         "xmake",
@@ -107,13 +116,16 @@ def configure_and_build(mode: str, build_mode: str, iterator_debug: bool, networ
     ]
 
     run_command(configure_cmd, cwd=PROJECT_ROOT, env=env)
-    run_command(["xmake", *network_flag, "project", "-k", "compile_commands"], cwd=PROJECT_ROOT, env=env)
+    run_command(["xmake", *network_flag, "project", "-k",
+                "compile_commands"], cwd=PROJECT_ROOT, env=env)
     run_command(["xmake", *network_flag, "-vD"], cwd=PROJECT_ROOT, env=env)
-    run_command(["xmake", *network_flag, "install", "-o", "install"], cwd=PROJECT_ROOT, env=env)
+    run_command(["xmake", *network_flag, "install", "-o",
+                "install"], cwd=PROJECT_ROOT, env=env)
 
 
 def clean_workspace(remove_global_cache: bool) -> None:
-    targets = [PROJECT_ROOT / name for name in (".xmake", "build", "install", ".cache")]
+    targets = [PROJECT_ROOT /
+               name for name in (".xmake", "build", "install", ".cache")]
     for path in targets:
         if path.exists():
             print(f"Removing {path}")
@@ -128,7 +140,8 @@ def clean_workspace(remove_global_cache: bool) -> None:
 
 def build_command(args: argparse.Namespace) -> None:
     network_mode = getattr(args, "network_mode", None)
-    configure_and_build(args.profile, args.mode, args.msvc_iterator_debug, network_mode)
+    configure_and_build(args.profile, args.mode,
+                        args.msvc_iterator_debug, network_mode, args.enable_usb)
 
 
 def clean_command(args: argparse.Namespace) -> None:
@@ -139,7 +152,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="co_wq build helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    build_parser = subparsers.add_parser("build", help="Configure and build co_wq")
+    build_parser = subparsers.add_parser(
+        "build", help="Configure and build co_wq")
     build_parser.add_argument(
         "--core",
         dest="profile",
@@ -183,6 +197,19 @@ def main(argv: list[str]) -> int:
         help="Disable MSVC iterator debug checks",
     )
     build_parser.set_defaults(msvc_iterator_debug=False)
+    build_parser.add_argument(
+        "--with-usb",
+        dest="enable_usb",
+        action="store_true",
+        help="Enable USB support (pulls libusb dependency)",
+    )
+    build_parser.add_argument(
+        "--without-usb",
+        dest="enable_usb",
+        action="store_false",
+        help="Disable USB support (default)",
+    )
+    build_parser.set_defaults(enable_usb=False)
     if _xmake_supports_network_flag():
         build_parser.add_argument(
             "--offline",
@@ -203,7 +230,8 @@ def main(argv: list[str]) -> int:
         build_parser.set_defaults(network_mode=None)
     build_parser.set_defaults(func=build_command)
 
-    clean_parser = subparsers.add_parser("clean", help="Remove build artifacts")
+    clean_parser = subparsers.add_parser(
+        "clean", help="Remove build artifacts")
     clean_parser.add_argument(
         "--remove-global-cache",
         action="store_true",
@@ -218,7 +246,8 @@ def main(argv: list[str]) -> int:
     try:
         args.func(args)
     except subprocess.CalledProcessError as exc:
-        print(f"Command failed with exit code {exc.returncode}", file=sys.stderr)
+        print(
+            f"Command failed with exit code {exc.returncode}", file=sys.stderr)
         return exc.returncode
     return 0
 
