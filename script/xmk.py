@@ -67,9 +67,16 @@ def configure_and_build(
     iterator_debug: bool,
     network_mode: str | None,
     enable_usb: bool,
+    proxy_url: str | None,
 ) -> None:
     env = os.environ.copy()
     env["XMAKE_GLOBALDIR"] = str(PROJECT_ROOT)
+
+    if proxy_url:
+        env["HTTP_PROXY"] = proxy_url
+        env["HTTPS_PROXY"] = proxy_url
+        env["http_proxy"] = proxy_url
+        env["https_proxy"] = proxy_url
 
     network_flag: list[str] = []
     if network_mode and _xmake_supports_network_flag():
@@ -124,12 +131,25 @@ def configure_and_build(
 
 
 def clean_workspace(remove_global_cache: bool) -> None:
-    targets = [PROJECT_ROOT /
-               name for name in (".xmake", "build", "install", ".cache")]
+    def _handle_remove_error(func, path, _exc):
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            return
+        func(path)
+
+    targets = [PROJECT_ROOT / name for name in (".xmake", "build", "install", ".cache")]
     for path in targets:
-        if path.exists():
-            print(f"Removing {path}")
-            shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            continue
+        print(f"Removing {path}")
+        if path.is_file() or path.is_symlink():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        shutil.rmtree(path, onerror=_handle_remove_error, ignore_errors=False)
 
     if remove_global_cache:
         global_cache = Path.home() / ".xmake"
@@ -141,7 +161,7 @@ def clean_workspace(remove_global_cache: bool) -> None:
 def build_command(args: argparse.Namespace) -> None:
     network_mode = getattr(args, "network_mode", None)
     configure_and_build(args.profile, args.mode,
-                        args.msvc_iterator_debug, network_mode, args.enable_usb)
+                        args.msvc_iterator_debug, network_mode, args.enable_usb, args.proxy_url)
 
 
 def clean_command(args: argparse.Namespace) -> None:
@@ -210,6 +230,13 @@ def main(argv: list[str]) -> int:
         help="Disable USB support (default)",
     )
     build_parser.set_defaults(enable_usb=False)
+    build_parser.add_argument(
+        "--proxy",
+        dest="proxy_url",
+        metavar="URL",
+        default=None,
+        help="Set HTTP(S) proxy for child processes",
+    )
     if _xmake_supports_network_flag():
         build_parser.add_argument(
             "--offline",
