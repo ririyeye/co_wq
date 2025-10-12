@@ -9,7 +9,8 @@
 #include "fd_base.hpp"
 #include "worker.hpp"
 
-#include <llhttp.h>
+#include "http/http_server.hpp"
+
 #include <nghttp2/nghttp2.h>
 #include <nlohmann/json.hpp>
 
@@ -36,39 +37,6 @@ using namespace co_wq;
 using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
 
 namespace {
-
-struct HttpRequestContext {
-    std::string                                  method;
-    std::string                                  url;
-    std::unordered_map<std::string, std::string> headers;
-    std::string                                  current_field;
-    std::string                                  current_value;
-    std::string                                  body;
-    bool                                         headers_complete { false };
-    bool                                         message_complete { false };
-
-    void reset()
-    {
-        method.clear();
-        url.clear();
-        headers.clear();
-        current_field.clear();
-        current_value.clear();
-        body.clear();
-        headers_complete = false;
-        message_complete = false;
-    }
-};
-
-std::string to_lower(std::string_view input)
-{
-    std::string out;
-    out.reserve(input.size());
-    for (char ch : input) {
-        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    }
-    return out;
-}
 
 #if defined(USING_SSL)
 int select_http_alpn(SSL*,
@@ -103,88 +71,12 @@ int select_http_alpn(SSL*,
     return SSL_TLSEXT_ERR_NOACK;
 }
 #endif
-
-int on_message_begin(llhttp_t* parser)
+net::http::HttpResponse make_app_response(const std::string&                                  method,
+                                          const std::string&                                  url,
+                                          const std::unordered_map<std::string, std::string>& headers,
+                                          const std::string&                                  body)
 {
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    if (ctx)
-        ctx->reset();
-    return 0;
-}
-
-int on_method(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    ctx->method.append(at, length);
-    return 0;
-}
-
-int on_url(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    ctx->url.append(at, length);
-    return 0;
-}
-
-int on_header_field(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    ctx->current_field.append(at, length);
-    return 0;
-}
-
-int on_header_value(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    ctx->current_value.append(at, length);
-    return 0;
-}
-
-int on_header_value_complete(llhttp_t* parser)
-{
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    if (!ctx->current_field.empty()) {
-        ctx->headers[to_lower(ctx->current_field)] = ctx->current_value;
-    }
-    ctx->current_field.clear();
-    ctx->current_value.clear();
-    return 0;
-}
-
-int on_headers_complete(llhttp_t* parser)
-{
-    auto* ctx             = static_cast<HttpRequestContext*>(parser->data);
-    ctx->headers_complete = true;
-    return 0;
-}
-
-int on_body(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* ctx = static_cast<HttpRequestContext*>(parser->data);
-    ctx->body.append(at, length);
-    return 0;
-}
-
-int on_message_complete(llhttp_t* parser)
-{
-    auto* ctx             = static_cast<HttpRequestContext*>(parser->data);
-    ctx->message_complete = true;
-    return 0;
-}
-
-struct AppResponse {
-    int         status_code { 0 };
-    std::string reason;
-    std::string body;
-    std::string content_type { "text/plain; charset=utf-8" };
-};
-
-AppResponse make_app_response(const std::string&                                  method,
-                              const std::string&                                  url,
-                              const std::unordered_map<std::string, std::string>& headers,
-                              const std::string&                                  body)
-{
-    AppResponse result;
+    net::http::HttpResponse result;
 
     if (method == "GET" && (url == "/" || url == "/index" || url == "/index.html")) {
         result.status_code = 200;
@@ -192,10 +84,12 @@ AppResponse make_app_response(const std::string&                                
         result.body        = "Hello from co_wq HTTP server!\n";
         result.body += "Method: " + method + "\n";
         result.body += "Path: " + url + "\n";
+        result.headers["content-type"] = "text/plain; charset=utf-8";
     } else if (method == "GET" && url == "/health") {
-        result.status_code = 200;
-        result.reason      = "OK";
-        result.body        = "OK\n";
+        result.status_code             = 200;
+        result.reason                  = "OK";
+        result.body                    = "OK\n";
+        result.headers["content-type"] = "text/plain; charset=utf-8";
     } else if (method == "POST" && url == "/echo-json") {
         try {
             nlohmann::json request_json;
@@ -215,49 +109,28 @@ AppResponse make_app_response(const std::string&                                
             if (auto it = headers.find("content-type"); it != headers.end())
                 response_json["request_content_type"] = it->second;
 
-            result.status_code  = 200;
-            result.reason       = "OK";
-            result.content_type = "application/json; charset=utf-8";
-            result.body         = response_json.dump();
+            result.status_code             = 200;
+            result.reason                  = "OK";
+            result.body                    = response_json.dump();
+            result.headers["content-type"] = "application/json; charset=utf-8";
         } catch (const nlohmann::json::exception& ex) {
             nlohmann::json error_json {
                 { "status", "error"   },
                 { "reason", ex.what() }
             };
-            result.status_code  = 400;
-            result.reason       = "Bad Request";
-            result.content_type = "application/json; charset=utf-8";
-            result.body         = error_json.dump();
+            result.status_code             = 400;
+            result.reason                  = "Bad Request";
+            result.body                    = error_json.dump();
+            result.headers["content-type"] = "application/json; charset=utf-8";
         }
     } else {
-        result.status_code = 404;
-        result.reason      = "Not Found";
-        result.body        = "Not Found\n";
+        result.status_code             = 404;
+        result.reason                  = "Not Found";
+        result.body                    = "Not Found\n";
+        result.headers["content-type"] = "text/plain; charset=utf-8";
     }
 
     return result;
-}
-
-std::string build_http_response(int              status_code,
-                                std::string_view reason,
-                                std::string_view body,
-                                std::string_view content_type = "text/plain; charset=utf-8")
-{
-    std::string response;
-    response.reserve(128 + body.size());
-    response.append("HTTP/1.1 ");
-    response.append(std::to_string(status_code));
-    response.push_back(' ');
-    response.append(reason);
-    response.append("\r\n");
-    response.append("Content-Type: ");
-    response.append(content_type);
-    response.append("\r\n");
-    response.append("Content-Length: ");
-    response.append(std::to_string(body.size()));
-    response.append("\r\nConnection: close\r\n\r\n");
-    response.append(body);
-    return response;
 }
 
 std::atomic_bool               g_stop { false };
@@ -293,41 +166,20 @@ void sigint_handler(int)
 template <typename Socket>
 Task<void, Work_Promise<SpinLock, void>> handle_http1_connection(Socket sock, std::string initial_data)
 {
-    llhttp_settings_t settings;
-    llhttp_settings_init(&settings);
-    settings.on_message_begin         = on_message_begin;
-    settings.on_method                = on_method;
-    settings.on_url                   = on_url;
-    settings.on_header_field          = on_header_field;
-    settings.on_header_value          = on_header_value;
-    settings.on_header_value_complete = on_header_value_complete;
-    settings.on_headers_complete      = on_headers_complete;
-    settings.on_body                  = on_body;
-    settings.on_message_complete      = on_message_complete;
-
-    llhttp_t parser;
-    llhttp_init(&parser, HTTP_REQUEST, &settings);
-
-    HttpRequestContext ctx;
-    parser.data = &ctx;
-
-    std::array<char, 4096> buffer {};
-    bool                   parse_error  = false;
-    std::string            error_reason = "";
-    bool                   received_any_data { false };
-    bool                   client_disconnected_early { false };
+    net::http::Http1RequestParser parser;
+    std::array<char, 4096>        buffer {};
+    bool                          parse_error  = false;
+    std::string                   error_reason = "";
+    bool                          received_any_data { false };
+    bool                          client_disconnected_early { false };
 
     if (!initial_data.empty()) {
-        received_any_data  = true;
-        llhttp_errno_t err = llhttp_execute(&parser, initial_data.data(), initial_data.size());
-        if (err != HPE_OK) {
-            parse_error        = true;
-            const char* reason = llhttp_get_error_reason(&parser);
-            error_reason       = (reason && *reason) ? reason : llhttp_errno_name(err);
-        }
+        received_any_data = true;
+        if (!parser.feed(std::string_view(initial_data.data(), initial_data.size()), &error_reason))
+            parse_error = true;
     }
 
-    while (!ctx.message_complete && !parse_error) {
+    while (!parser.message_complete() && !parse_error) {
         ssize_t n = co_await sock.recv(buffer.data(), buffer.size());
         if (n < 0) {
             parse_error  = true;
@@ -338,25 +190,14 @@ Task<void, Work_Promise<SpinLock, void>> handle_http1_connection(Socket sock, st
             if (!received_any_data) {
                 client_disconnected_early = true;
             } else {
-                llhttp_errno_t finish_err = llhttp_finish(&parser);
-                if (finish_err != HPE_OK) {
-                    parse_error  = true;
-                    error_reason = llhttp_errno_name(finish_err);
-                }
+                if (!parser.finish(&error_reason))
+                    parse_error = true;
             }
             break;
         }
-        received_any_data  = true;
-        llhttp_errno_t err = llhttp_execute(&parser, buffer.data(), static_cast<size_t>(n));
-        if (err != HPE_OK) {
-            parse_error        = true;
-            const char* reason = llhttp_get_error_reason(&parser);
-            if (reason && *reason)
-                error_reason = reason;
-            else
-                error_reason = llhttp_errno_name(err);
-            break;
-        }
+        received_any_data = true;
+        if (!parser.feed(std::string_view(buffer.data(), static_cast<size_t>(n)), &error_reason))
+            parse_error = true;
     }
 
     if (client_disconnected_early) {
@@ -364,22 +205,29 @@ Task<void, Work_Promise<SpinLock, void>> handle_http1_connection(Socket sock, st
         co_return;
     }
 
-    if (!ctx.message_complete && !parse_error) {
-        parse_error  = true;
-        error_reason = "incomplete request";
+    if (!parser.message_complete() && !parse_error) {
+        if (!parser.finish(&error_reason))
+            parse_error = true;
     }
 
     std::string response_body;
     std::string response;
 
     if (parse_error) {
-        response_body = "Bad Request\n";
-        response      = build_http_response(400, "Bad Request", response_body);
-        CO_WQ_LOG_ERROR("[http] parse error: %s", error_reason.c_str());
+        net::http::HttpResponse error_resp;
+        error_resp.status_code             = 400;
+        error_resp.reason                  = "Bad Request";
+        error_resp.body                    = "Bad Request\n";
+        error_resp.headers["content-type"] = "text/plain; charset=utf-8";
+        response_body                      = error_resp.body;
+        response                           = net::http::build_http1_response(error_resp);
+        CO_WQ_LOG_ERROR("[http] parse error: %s",
+                        error_reason.empty() ? parser.last_error().c_str() : error_reason.c_str());
     } else {
-        AppResponse app = make_app_response(ctx.method, ctx.url, ctx.headers, ctx.body);
+        const auto& req = parser.request();
+        auto        app = make_app_response(req.method, req.target, req.headers, req.body);
         response_body   = app.body;
-        response        = build_http_response(app.status_code, app.reason, response_body, app.content_type);
+        response        = net::http::build_http1_response(app);
     }
 
     (void)co_await sock.send_all(response.data(), response.size());
@@ -406,12 +254,12 @@ struct Http2ServerSession {
     std::unordered_map<int32_t, Http2ServerResponseData> responses;
 };
 
-[[maybe_unused]] static ssize_t
+[[maybe_unused]] static nghttp2_ssize
 h2_server_send_callback(nghttp2_session*, const uint8_t* data, size_t length, int, void* user_data)
 {
     auto* state = static_cast<Http2ServerSession*>(user_data);
     state->send_buffer.insert(state->send_buffer.end(), data, data + length);
-    return static_cast<ssize_t>(length);
+    return static_cast<nghttp2_ssize>(length);
 }
 
 [[maybe_unused]] static int h2_server_on_begin_headers(nghttp2_session*, const nghttp2_frame* frame, void* user_data)
@@ -448,7 +296,7 @@ h2_server_send_callback(nghttp2_session*, const uint8_t* data, size_t length, in
     } else if (key == ":scheme" || key == ":authority") {
         // ignore
     } else {
-        stream.headers[to_lower(key)] = std::move(val);
+        stream.headers[net::http::to_lower(key)] = std::move(val);
     }
     return 0;
 }
@@ -464,13 +312,13 @@ h2_server_on_data_chunk(nghttp2_session*, uint8_t, int32_t stream_id, const uint
     return 0;
 }
 
-[[maybe_unused]] static ssize_t h2_server_data_read(nghttp2_session*,
-                                                    int32_t,
-                                                    uint8_t*             buf,
-                                                    size_t               length,
-                                                    uint32_t*            data_flags,
-                                                    nghttp2_data_source* source,
-                                                    void*)
+[[maybe_unused]] static nghttp2_ssize h2_server_data_read(nghttp2_session*,
+                                                          int32_t,
+                                                          uint8_t*             buf,
+                                                          size_t               length,
+                                                          uint32_t*            data_flags,
+                                                          nghttp2_data_source* source,
+                                                          void*)
 {
     auto* payload = static_cast<Http2ServerResponseData*>(source->ptr);
     if (!payload)
@@ -483,7 +331,7 @@ h2_server_on_data_chunk(nghttp2_session*, uint8_t, int32_t stream_id, const uint
     }
     if (payload->offset >= payload->body.size())
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    return static_cast<ssize_t>(to_copy);
+    return static_cast<nghttp2_ssize>(to_copy);
 }
 
 static int h2_server_submit_response(nghttp2_session* session, Http2ServerSession& state, int32_t stream_id)
@@ -495,14 +343,23 @@ static int h2_server_submit_response(nghttp2_session* session, Http2ServerSessio
     if (stream.responded)
         return 0;
 
-    AppResponse app            = make_app_response(stream.method, stream.path, stream.headers, stream.body);
+    auto        app            = make_app_response(stream.method, stream.path, stream.headers, stream.body);
     std::string status         = std::to_string(app.status_code);
     std::string content_length = std::to_string(app.body.size());
 
     std::vector<std::pair<std::string, std::string>> header_pairs;
     header_pairs.emplace_back(":status", std::move(status));
-    header_pairs.emplace_back("content-type", app.content_type);
+    std::string content_type = "text/plain; charset=utf-8";
+    if (auto it = app.headers.find("content-type"); it != app.headers.end())
+        content_type = it->second;
+    header_pairs.emplace_back("content-type", content_type);
     header_pairs.emplace_back("content-length", content_length);
+    for (const auto& kv : app.headers) {
+        if (net::http::iequals(kv.first, "content-type") || net::http::iequals(kv.first, "content-length")
+            || net::http::iequals(kv.first, "connection"))
+            continue;
+        header_pairs.emplace_back(kv.first, kv.second);
+    }
 
     std::vector<nghttp2_nv> nva;
     nva.reserve(header_pairs.size());

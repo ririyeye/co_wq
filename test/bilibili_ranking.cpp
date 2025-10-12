@@ -13,7 +13,9 @@
 
 #include "semaphore.hpp"
 
-#include <llhttp.h>
+#include "http/http_client.hpp"
+#include "http/http_common.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -57,6 +59,8 @@ using namespace std::string_view_literals;
 #endif
 
 using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
+namespace http       = co_wq::net::http;
+using http::SimpleResponse;
 
 namespace {
 
@@ -87,15 +91,6 @@ struct SharedState {
 std::atomic_bool               g_stop { false };
 std::atomic<net::os::fd_t>     g_listener_fd { net::os::invalid_fd() };
 std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
-
-std::string to_lower(std::string_view in)
-{
-    std::string out;
-    out.reserve(in.size());
-    for (char ch : in)
-        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    return out;
-}
 
 std::string format_http_date(std::chrono::system_clock::time_point tp)
 {
@@ -225,93 +220,6 @@ std::string describe_remote_endpoint(const net::tcp_socket<SpinLock>& socket)
     return host_str + ":" + std::string(serv);
 }
 
-struct SimpleResponse {
-    llhttp_t                                     parser {};
-    llhttp_settings_t                            settings {};
-    std::string                                  current_field;
-    std::string                                  current_value;
-    std::unordered_map<std::string, std::string> headers;
-    std::string                                  body;
-    int                                          status_code { 0 };
-    bool                                         message_complete { false };
-
-    SimpleResponse()
-    {
-        llhttp_settings_init(&settings);
-        settings.on_header_field          = &SimpleResponse::on_header_field_cb;
-        settings.on_header_value          = &SimpleResponse::on_header_value_cb;
-        settings.on_header_value_complete = &SimpleResponse::on_header_value_complete_cb;
-        settings.on_headers_complete      = &SimpleResponse::on_headers_complete_cb;
-        settings.on_body                  = &SimpleResponse::on_body_cb;
-        settings.on_message_complete      = &SimpleResponse::on_message_complete_cb;
-        llhttp_init(&parser, HTTP_RESPONSE, &settings);
-        parser.data = this;
-    }
-
-    void reset()
-    {
-        llhttp_reset(&parser);
-        current_field.clear();
-        current_value.clear();
-        headers.clear();
-        body.clear();
-        status_code      = 0;
-        message_complete = false;
-    }
-
-    static int on_header_field_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* self = static_cast<SimpleResponse*>(parser->data);
-        if (!self->current_value.empty())
-            self->store_header();
-        self->current_field.append(at, length);
-        return 0;
-    }
-
-    static int on_header_value_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* self = static_cast<SimpleResponse*>(parser->data);
-        self->current_value.append(at, length);
-        return 0;
-    }
-
-    static int on_header_value_complete_cb(llhttp_t* parser)
-    {
-        auto* self = static_cast<SimpleResponse*>(parser->data);
-        self->store_header();
-        return 0;
-    }
-
-    static int on_headers_complete_cb(llhttp_t* parser)
-    {
-        auto* self        = static_cast<SimpleResponse*>(parser->data);
-        self->status_code = parser->status_code;
-        return 0;
-    }
-
-    static int on_body_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* self = static_cast<SimpleResponse*>(parser->data);
-        self->body.append(at, length);
-        return 0;
-    }
-
-    static int on_message_complete_cb(llhttp_t* parser)
-    {
-        auto* self             = static_cast<SimpleResponse*>(parser->data);
-        self->message_complete = true;
-        return 0;
-    }
-
-    void store_header()
-    {
-        if (!current_field.empty())
-            headers[to_lower(current_field)] = current_value;
-        current_field.clear();
-        current_value.clear();
-    }
-};
-
 #if defined(_WIN32)
 static BOOL WINAPI console_ctrl_handler(DWORD type)
 {
@@ -431,6 +339,7 @@ http_get(NetFdWorkqueue&                                     fdwq,
 
     SimpleResponse         response;
     std::array<char, 8192> buffer {};
+    std::string            parse_error;
     while (true) {
         ssize_t n = co_await tls_socket.recv(buffer.data(), buffer.size());
         if (n < 0) {
@@ -439,24 +348,16 @@ http_get(NetFdWorkqueue&                                     fdwq,
         }
         if (n == 0)
             break;
-        llhttp_errno_t err = llhttp_execute(&response.parser, buffer.data(), static_cast<size_t>(n));
-        if (err != HPE_OK) {
-            const char* reason = llhttp_get_error_reason(&response.parser);
-            if (!reason || *reason == '\0')
-                reason = llhttp_errno_name(err);
-            CO_WQ_LOG_ERROR("[bili] parse error: %s", reason);
+        if (!response.feed(std::string_view(buffer.data(), static_cast<size_t>(n)), &parse_error)) {
+            CO_WQ_LOG_ERROR("[bili] parse error: %s", parse_error.c_str());
             co_return std::nullopt;
         }
         if (response.message_complete)
             break;
     }
     if (!response.message_complete) {
-        llhttp_errno_t finish_err = llhttp_finish(&response.parser);
-        if (finish_err != HPE_OK && finish_err != HPE_PAUSED_UPGRADE) {
-            const char* reason = llhttp_get_error_reason(&response.parser);
-            if (!reason || *reason == '\0')
-                reason = llhttp_errno_name(finish_err);
-            CO_WQ_LOG_ERROR("[bili] parse error at EOF: %s", reason);
+        if (!response.finish(&parse_error)) {
+            CO_WQ_LOG_ERROR("[bili] parse error at EOF: %s", parse_error.c_str());
             co_return std::nullopt;
         }
     }

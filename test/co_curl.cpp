@@ -8,7 +8,9 @@
 #include "tls.hpp"
 #endif
 
-#include <llhttp.h>
+#include "http/http_client.hpp"
+#include "http/http_common.hpp"
+
 #include <nghttp2/nghttp2.h>
 
 #include <algorithm>
@@ -27,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -37,6 +40,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <ws2tcpip.h>
 #else
 #include <csignal>
 #endif
@@ -44,6 +48,10 @@
 using namespace co_wq;
 
 using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
+
+namespace http = co_wq::net::http;
+using http::HeaderEntry;
+using http::ResponseContext;
 
 #if defined(USING_SSL)
 #include <openssl/asn1.h>
@@ -55,6 +63,62 @@ using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
 #endif
 
 namespace {
+
+int verbose_printf(bool enabled, const char* fmt, ...)
+{
+    if (!enabled)
+        return 0;
+    va_list args;
+    va_start(args, fmt);
+    const int rc = std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    return rc;
+}
+
+std::string errno_message(int err)
+{
+    if (err == 0)
+        return {};
+    std::error_code ec(err, std::system_category());
+    return ec.message();
+}
+
+std::string format_endpoint(const sockaddr* addr)
+{
+    if (!addr)
+        return "unknown";
+
+    socklen_t len = 0;
+    switch (addr->sa_family) {
+    case AF_INET:
+        len = static_cast<socklen_t>(sizeof(sockaddr_in));
+        break;
+    case AF_INET6:
+        len = static_cast<socklen_t>(sizeof(sockaddr_in6));
+        break;
+    default:
+        len = static_cast<socklen_t>(sizeof(sockaddr_storage));
+        break;
+    }
+
+    char host[NI_MAXHOST] = {};
+    char serv[NI_MAXSERV] = {};
+    int  rc = ::getnameinfo(addr, len, host, sizeof(host), serv, sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (rc != 0)
+        return "unknown";
+
+    std::string host_str(host);
+    std::string serv_str(serv);
+
+    if (addr->sa_family == AF_INET6 && !host_str.empty())
+        host_str = "[" + host_str + "]";
+    if (host_str.empty())
+        host_str = "unknown";
+
+    if (!serv_str.empty())
+        return host_str + ':' + serv_str;
+    return host_str;
+}
 
 #if defined(USING_SSL)
 
@@ -76,39 +140,21 @@ std::string asn1_time_to_string(const ASN1_TIME* time)
     return result;
 }
 
-std::string x509_name_to_string(X509_NAME* name)
+std::string x509_name_to_string(const X509_NAME* name)
 {
     if (!name)
         return {};
+    BIO* bio = BIO_new(BIO_s_mem());
+    if (!bio)
+        return {};
     std::string result;
-    const int   count = X509_NAME_entry_count(name);
-    for (int i = 0; i < count; ++i) {
-        X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, i);
-        if (!entry)
-            continue;
-        ASN1_OBJECT* obj  = X509_NAME_ENTRY_get_object(entry);
-        ASN1_STRING* data = X509_NAME_ENTRY_get_data(entry);
-        if (!obj || !data)
-            continue;
-        unsigned char* utf8 = nullptr;
-        int            len  = ASN1_STRING_to_UTF8(&utf8, data);
-        if (len <= 0 || !utf8)
-            continue;
-        if (!result.empty())
-            result.append("; ");
-        const int   nid = OBJ_obj2nid(obj);
-        const char* sn  = (nid != NID_undef) ? OBJ_nid2sn(nid) : nullptr;
-        if (sn)
-            result.append(sn);
-        else {
-            char obj_buf[64] = {};
-            OBJ_obj2txt(obj_buf, sizeof(obj_buf), obj, 0);
-            result.append(obj_buf);
-        }
-        result.append("=");
-        result.append(reinterpret_cast<const char*>(utf8), static_cast<size_t>(len));
-        OPENSSL_free(utf8);
+    if (X509_NAME_print_ex(bio, const_cast<X509_NAME*>(name), 0, XN_FLAG_RFC2253) >= 0) {
+        BUF_MEM* mem = nullptr;
+        BIO_get_mem_ptr(bio, &mem);
+        if (mem && mem->data)
+            result.assign(mem->data, mem->length);
     }
+    BIO_free(bio);
     return result;
 }
 
@@ -178,62 +224,6 @@ std::string describe_signature_algorithm(const X509* cert)
     return name ? name : "unknown";
 }
 
-#endif // defined(USING_SSL)
-
-void verbose_printf(bool enabled, const char* fmt, ...)
-{
-    if (!enabled)
-        return;
-    va_list args;
-    va_start(args, fmt);
-    std::vfprintf(stderr, fmt, args);
-    va_end(args);
-}
-
-std::string format_endpoint(const sockaddr* addr)
-{
-    if (!addr)
-        return {};
-#if defined(_WIN32)
-    return "[address unavailable on Windows]";
-#else
-    char     host[INET6_ADDRSTRLEN] = {};
-    uint16_t port                   = 0;
-    switch (addr->sa_family) {
-    case AF_INET: {
-        auto* in = reinterpret_cast<const sockaddr_in*>(addr);
-        if (!inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host)))
-            std::strncpy(host, "0.0.0.0", sizeof(host) - 1);
-        port = ntohs(in->sin_port);
-        std::string out(host);
-        out.append(":");
-        out.append(std::to_string(port));
-        return out;
-    }
-    case AF_INET6: {
-        auto* in6 = reinterpret_cast<const sockaddr_in6*>(addr);
-        if (!inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host)))
-            std::strncpy(host, "::", sizeof(host) - 1);
-        port = ntohs(in6->sin6_port);
-        std::string out("[");
-        out.append(host);
-        out.append("]:");
-        out.append(std::to_string(port));
-        return out;
-    }
-    default:
-        return "[unknown family]";
-    }
-#endif
-}
-
-std::string errno_message(int err)
-{
-    return std::error_code(err, std::generic_category()).message();
-}
-
-#if defined(USING_SSL)
-
 void log_tls_session_details(SSL* ssl, const std::string& host, bool verbose)
 {
     if (!verbose || !ssl)
@@ -250,36 +240,42 @@ void log_tls_session_details(SSL* ssl, const std::string& host, bool verbose)
     unsigned int         alpn_len = 0;
     SSL_get0_alpn_selected(ssl, &alpn, &alpn_len);
     if (alpn && alpn_len > 0)
-        verbose_printf(verbose, "* ALPN: server accepted %.*s\n", static_cast<int>(alpn_len), alpn);
+        verbose_printf(verbose,
+                       "* ALPN negotiated protocol: %.*s\n",
+                       static_cast<int>(alpn_len),
+                       reinterpret_cast<const char*>(alpn));
     else
-        verbose_printf(verbose, "* ALPN: no protocol negotiated\n");
+        verbose_printf(verbose, "* ALPN negotiated protocol: (none)\n");
 
     X509* leaf = SSL_get1_peer_certificate(ssl);
     if (leaf) {
-        verbose_printf(verbose, "* Server certificate:\n");
-        const auto subject = x509_name_to_string(X509_get_subject_name(leaf));
-        const auto issuer  = x509_name_to_string(X509_get_issuer_name(leaf));
+        std::string subject    = x509_name_to_string(X509_get_subject_name(leaf));
+        std::string issuer     = x509_name_to_string(X509_get_issuer_name(leaf));
+        std::string not_before = asn1_time_to_string(X509_get0_notBefore(leaf));
+        std::string not_after  = asn1_time_to_string(X509_get0_notAfter(leaf));
+
         verbose_printf(verbose, "*  subject: %s\n", subject.empty() ? "<unknown>" : subject.c_str());
-        const auto not_before = asn1_time_to_string(X509_get0_notBefore(leaf));
-        const auto not_after  = asn1_time_to_string(X509_get0_notAfter(leaf));
+        verbose_printf(verbose, "*  issuer: %s\n", issuer.empty() ? "<unknown>" : issuer.c_str());
         verbose_printf(verbose, "*  start date: %s\n", not_before.empty() ? "<unknown>" : not_before.c_str());
         verbose_printf(verbose, "*  expire date: %s\n", not_after.empty() ? "<unknown>" : not_after.c_str());
+
         if (!host.empty()) {
-            const int host_match = X509_check_host(leaf, host.c_str(), host.size(), 0, nullptr);
-            if (host_match == 1)
+            const int match = X509_check_host(leaf, host.c_str(), host.size(), 0, nullptr);
+            if (match == 1)
                 verbose_printf(verbose, "*  subjectAltName: host \"%s\" matched certificate\n", host.c_str());
-            else if (host_match == 0)
+            else if (match == 0)
                 verbose_printf(verbose, "*  subjectAltName: host \"%s\" did not match certificate\n", host.c_str());
         }
+
         if (auto san = collect_subject_alt_names(leaf); !san.empty())
             verbose_printf(verbose, "*  subjectAltName: %s\n", san.c_str());
-        verbose_printf(verbose, "*  issuer: %s\n", issuer.empty() ? "<unknown>" : issuer.c_str());
 
         if (EVP_PKEY* key = X509_get_pubkey(leaf)) {
             auto key_desc = describe_public_key(key);
             EVP_PKEY_free(key);
             verbose_printf(verbose, "*   Public key: %s\n", key_desc.c_str());
         }
+
         auto sig_desc = describe_signature_algorithm(leaf);
         verbose_printf(verbose, "*   Signature algorithm: %s\n", sig_desc.c_str());
         X509_free(leaf);
@@ -318,25 +314,66 @@ void log_tls_session_details(SSL* ssl, const std::string& host, bool verbose)
 
 #endif // defined(USING_SSL)
 
-struct HeaderEntry {
-    std::string name;
-    std::string value;
-};
+bool parse_port(std::string_view input, uint16_t& port_out)
+{
+    if (input.empty() || input.size() > 5)
+        return false;
 
-struct CommandLineOptions {
-    std::string                method { "GET" };
-    bool                       method_explicit { false };
-    std::string                url;
-    std::vector<HeaderEntry>   headers;
-    std::string                body;
-    bool                       verbose { false };
-    bool                       include_headers { false };
-    bool                       follow_redirects { false };
-    int                        max_redirects { 10 };
-    std::optional<std::string> output_path;
-    bool                       insecure { false };
-    bool                       prefer_http2 { false };
-};
+    uint32_t value = 0;
+    for (unsigned char ch : input) {
+        if (!std::isdigit(ch))
+            return false;
+        value = value * 10 + static_cast<uint32_t>(ch - '0');
+        if (value > std::numeric_limits<uint16_t>::max())
+            return false;
+    }
+    port_out = static_cast<uint16_t>(value);
+    return true;
+}
+
+bool split_host_port(std::string_view input, uint16_t default_port, std::string& host_out, uint16_t& port_out)
+{
+    host_out.clear();
+    port_out = default_port;
+
+    if (input.empty())
+        return false;
+
+    if (input.front() == '[') {
+        auto closing = input.find(']');
+        if (closing == std::string_view::npos)
+            return false;
+        host_out.assign(input.substr(1, closing - 1));
+        if (closing + 1 == input.size())
+            return true;
+        if (input[closing + 1] != ':')
+            return false;
+        std::string_view port_part = input.substr(closing + 2);
+        uint16_t         port      = 0;
+        if (!parse_port(port_part, port))
+            return false;
+        port_out = port;
+        return true;
+    }
+
+    auto first_colon = input.find(':');
+    auto last_colon  = input.rfind(':');
+    if (first_colon != std::string_view::npos && first_colon == last_colon) {
+        std::string_view host_part = input.substr(0, first_colon);
+        std::string_view port_part = input.substr(first_colon + 1);
+        if (host_part.empty())
+            return false;
+        uint16_t port = 0;
+        if (!parse_port(port_part, port))
+            return false;
+        host_out.assign(host_part);
+        port_out = port;
+        return true;
+    }
+
+    host_out.assign(input);
+    return true;
+}
 
 struct ParsedUrl {
     std::string scheme;
@@ -351,90 +388,20 @@ struct RequestState {
     bool        drop_content_headers { false };
 };
 
-std::string to_lower(std::string_view input)
-{
-    std::string out;
-    out.reserve(input.size());
-    for (char ch : input)
-        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
-    return out;
-}
-
-void to_upper_inplace(std::string& input)
-{
-    for (char& ch : input)
-        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-}
-
-std::string trim_leading_spaces(std::string_view input)
-{
-    size_t pos = 0;
-    while (pos < input.size() && (input[pos] == ' ' || input[pos] == '\t'))
-        ++pos;
-    return std::string(input.substr(pos));
-}
-
-bool iequals(std::string_view a, std::string_view b)
-{
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
-            return false;
-    }
-    return true;
-}
-
-bool split_host_port(std::string_view input, uint16_t default_port, std::string& host_out, uint16_t& port_out)
-{
-    if (input.empty())
-        return false;
-
-    std::string host;
-    std::string port_str;
-
-    if (input.front() == '[') {
-        auto end = input.find(']');
-        if (end == std::string_view::npos)
-            return false;
-        host = std::string(input.substr(1, end - 1));
-        if (end + 1 < input.size()) {
-            if (input[end + 1] != ':')
-                return false;
-            port_str = std::string(input.substr(end + 2));
-        }
-    } else {
-        auto colon = input.rfind(':');
-        if (colon != std::string_view::npos && input.find(':', colon + 1) == std::string_view::npos) {
-            host     = std::string(input.substr(0, colon));
-            port_str = std::string(input.substr(colon + 1));
-        } else {
-            host = std::string(input);
-        }
-    }
-
-    if (host.empty())
-        return false;
-
-    uint16_t port_value = default_port;
-    if (!port_str.empty()) {
-        if (port_str.size() > 5)
-            return false;
-        unsigned int value = 0;
-        for (char ch : port_str) {
-            if (!std::isdigit(static_cast<unsigned char>(ch)))
-                return false;
-            value = value * 10 + (ch - '0');
-            if (value > 65535)
-                return false;
-        }
-        port_value = static_cast<uint16_t>(value);
-    }
-
-    host_out = std::move(host);
-    port_out = port_value;
-    return true;
-}
+struct CommandLineOptions {
+    std::string                url;
+    std::string                method { "GET" };
+    bool                       method_explicit { false };
+    std::vector<HeaderEntry>   headers;
+    std::string                body;
+    bool                       verbose { false };
+    bool                       include_headers { false };
+    bool                       follow_redirects { false };
+    int                        max_redirects { 10 };
+    bool                       insecure { false };
+    bool                       prefer_http2 { false };
+    std::optional<std::string> output_path;
+};
 
 std::optional<ParsedUrl> parse_url(const std::string& url)
 {
@@ -442,7 +409,7 @@ std::optional<ParsedUrl> parse_url(const std::string& url)
     if (scheme_pos == std::string::npos)
         return std::nullopt;
     ParsedUrl result;
-    result.scheme = to_lower(url.substr(0, scheme_pos));
+    result.scheme = http::to_lower(url.substr(0, scheme_pos));
     if (result.scheme != "http" && result.scheme != "https")
         return std::nullopt;
 
@@ -466,27 +433,6 @@ std::optional<ParsedUrl> parse_url(const std::string& url)
     return result;
 }
 
-bool header_exists(const std::vector<HeaderEntry>& headers, std::string_view name)
-{
-    for (const auto& h : headers) {
-        if (iequals(h.name, name))
-            return true;
-    }
-    return false;
-}
-
-void remove_content_headers(std::vector<HeaderEntry>& headers)
-{
-    headers.erase(std::remove_if(headers.begin(),
-                                 headers.end(),
-                                 [](const HeaderEntry& h) {
-                                     auto lower = to_lower(h.name);
-                                     return lower == "content-length" || lower == "content-type"
-                                         || lower == "transfer-encoding";
-                                 }),
-                  headers.end());
-}
-
 struct BuiltRequest {
     std::string              payload;
     std::vector<HeaderEntry> headers;
@@ -497,11 +443,11 @@ BuiltRequest build_http_request(const CommandLineOptions& base, const RequestSta
     BuiltRequest result;
     result.headers = base.headers;
     if (state.drop_content_headers)
-        remove_content_headers(result.headers);
+        http::remove_content_headers(result.headers);
 
     const bool has_body = !state.body.empty();
 
-    if (!header_exists(result.headers, "Host")) {
+    if (!http::header_exists(result.headers, "Host")) {
         std::string value           = url.host;
         const bool  is_https        = url.scheme == "https";
         const bool  is_default_port = (is_https && url.port == 443) || (!is_https && url.port == 80);
@@ -512,17 +458,17 @@ BuiltRequest build_http_request(const CommandLineOptions& base, const RequestSta
         result.headers.push_back({ "Host", std::move(value) });
     }
 
-    if (!header_exists(result.headers, "User-Agent"))
+    if (!http::header_exists(result.headers, "User-Agent"))
         result.headers.push_back({ "User-Agent", "co_curl/1.0" });
 
-    if (!header_exists(result.headers, "Accept"))
+    if (!http::header_exists(result.headers, "Accept"))
         result.headers.push_back({ "Accept", "*/*" });
 
-    if (!header_exists(result.headers, "Connection"))
+    if (!http::header_exists(result.headers, "Connection"))
         result.headers.push_back({ "Connection", "close" });
 
-    if (has_body && !header_exists(result.headers, "Content-Length")
-        && !header_exists(result.headers, "Transfer-Encoding")) {
+    if (has_body && !http::header_exists(result.headers, "Content-Length")
+        && !http::header_exists(result.headers, "Transfer-Encoding")) {
         result.headers.push_back({ "Content-Length", std::to_string(state.body.size()) });
     }
 
@@ -568,7 +514,7 @@ bool parse_header_line(const std::string& line, HeaderEntry& out)
     if (pos == std::string::npos)
         return false;
     out.name  = line.substr(0, pos);
-    out.value = trim_leading_spaces(std::string_view(line).substr(pos + 1));
+    out.value = http::trim_leading_spaces(std::string_view(line).substr(pos + 1));
     return !out.name.empty();
 }
 
@@ -623,7 +569,7 @@ std::optional<CommandLineOptions> parse_arguments(int argc, char* argv[])
             if (!require_value(idx, arg.data()))
                 return std::nullopt;
             options.method = argv[++idx];
-            to_upper_inplace(options.method);
+            http::to_upper_inplace(options.method);
             options.method_explicit = true;
         } else if (arg == "-H" || arg == "--header") {
             if (!require_value(idx, arg.data()))
@@ -669,7 +615,7 @@ std::optional<CommandLineOptions> parse_arguments(int argc, char* argv[])
     options.url = argv[idx++];
     if (!options.method_explicit && !options.body.empty())
         options.method = "POST";
-    to_upper_inplace(options.method);
+    http::to_upper_inplace(options.method);
 
     if (idx < argc) {
         std::fprintf(stderr, "co_curl: ignoring unexpected trailing arguments\n");
@@ -677,189 +623,6 @@ std::optional<CommandLineOptions> parse_arguments(int argc, char* argv[])
 
     return options;
 }
-
-struct ResponseContext {
-    llhttp_t                                     parser;
-    llhttp_settings_t                            settings;
-    std::string                                  status_text;
-    int                                          status_code { 0 };
-    int                                          http_major { 1 };
-    int                                          http_minor { 1 };
-    std::vector<HeaderEntry>                     header_sequence;
-    std::unordered_map<std::string, std::string> header_lookup;
-    std::string                                  current_field;
-    std::string                                  current_value;
-    bool                                         headers_complete { false };
-    bool                                         message_complete { false };
-    bool                                         verbose { false };
-    bool                                         include_headers { false };
-    bool                                         buffer_body { false };
-    std::string                                  header_block;
-    std::string                                  body_buffer;
-    std::FILE*                                   output { nullptr };
-
-    ResponseContext()
-    {
-        llhttp_settings_init(&settings);
-        settings.on_status                = &ResponseContext::on_status_cb;
-        settings.on_header_field          = &ResponseContext::on_header_field_cb;
-        settings.on_header_value          = &ResponseContext::on_header_value_cb;
-        settings.on_header_value_complete = &ResponseContext::on_header_value_complete_cb;
-        settings.on_headers_complete      = &ResponseContext::on_headers_complete_cb;
-        settings.on_body                  = &ResponseContext::on_body_cb;
-        settings.on_message_complete      = &ResponseContext::on_message_complete_cb;
-        llhttp_init(&parser, HTTP_RESPONSE, &settings);
-        parser.data = this;
-    }
-
-    std::optional<std::string> header(std::string_view name) const
-    {
-        auto it = header_lookup.find(to_lower(name));
-        if (it == header_lookup.end())
-            return std::nullopt;
-        return it->second;
-    }
-
-    void reset()
-    {
-        llhttp_reset(&parser);
-        status_text.clear();
-        status_code = 0;
-        http_major  = 1;
-        http_minor  = 1;
-        header_sequence.clear();
-        header_lookup.clear();
-        current_field.clear();
-        current_value.clear();
-        headers_complete = false;
-        message_complete = false;
-        header_block.clear();
-        body_buffer.clear();
-    }
-
-    void flush_buffered_output()
-    {
-        if (!output)
-            return;
-        if (!header_block.empty() && include_headers)
-            std::fwrite(header_block.data(), 1, header_block.size(), output);
-        if (!body_buffer.empty())
-            std::fwrite(body_buffer.data(), 1, body_buffer.size(), output);
-        std::fflush(output);
-    }
-
-    static int on_status_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* ctx = static_cast<ResponseContext*>(parser->data);
-        ctx->status_text.append(at, length);
-        return 0;
-    }
-
-    static int on_header_field_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* ctx = static_cast<ResponseContext*>(parser->data);
-        if (!ctx->current_value.empty()) {
-            ctx->store_header();
-        }
-        ctx->current_field.append(at, length);
-        return 0;
-    }
-
-    static int on_header_value_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* ctx = static_cast<ResponseContext*>(parser->data);
-        ctx->current_value.append(at, length);
-        return 0;
-    }
-
-    static int on_header_value_complete_cb(llhttp_t* parser)
-    {
-        auto* ctx = static_cast<ResponseContext*>(parser->data);
-        ctx->store_header();
-        return 0;
-    }
-
-    static int on_headers_complete_cb(llhttp_t* parser)
-    {
-        auto* ctx             = static_cast<ResponseContext*>(parser->data);
-        ctx->status_code      = parser->status_code;
-        ctx->http_major       = parser->http_major;
-        ctx->http_minor       = parser->http_minor;
-        ctx->headers_complete = true;
-
-        ctx->header_block.clear();
-        if (ctx->include_headers) {
-            ctx->header_block.reserve(64 + ctx->header_sequence.size() * 32);
-            ctx->header_block.append("HTTP/");
-            ctx->header_block.append(std::to_string(ctx->http_major));
-            ctx->header_block.push_back('.');
-            ctx->header_block.append(std::to_string(ctx->http_minor));
-            ctx->header_block.push_back(' ');
-            ctx->header_block.append(std::to_string(ctx->status_code));
-            if (!ctx->status_text.empty()) {
-                ctx->header_block.push_back(' ');
-                ctx->header_block.append(ctx->status_text);
-            }
-            ctx->header_block.append("\r\n");
-            for (const auto& header : ctx->header_sequence) {
-                ctx->header_block.append(header.name);
-                ctx->header_block.append(": ");
-                ctx->header_block.append(header.value);
-                ctx->header_block.append("\r\n");
-            }
-            ctx->header_block.append("\r\n");
-            if (!ctx->buffer_body && ctx->output)
-                std::fwrite(ctx->header_block.data(), 1, ctx->header_block.size(), ctx->output);
-        }
-
-        if (ctx->verbose) {
-            std::fprintf(stderr,
-                         "< HTTP/%d.%d %d %s\n",
-                         ctx->http_major,
-                         ctx->http_minor,
-                         ctx->status_code,
-                         ctx->status_text.c_str());
-            for (const auto& header : ctx->header_sequence) {
-                std::fprintf(stderr, "< %s: %s\n", header.name.c_str(), header.value.c_str());
-            }
-            std::fprintf(stderr, "<\n");
-        }
-
-        return 0;
-    }
-
-    static int on_body_cb(llhttp_t* parser, const char* at, size_t length)
-    {
-        auto* ctx = static_cast<ResponseContext*>(parser->data);
-        if (ctx->buffer_body) {
-            ctx->body_buffer.append(at, length);
-        } else if (ctx->output) {
-            std::fwrite(at, 1, length, ctx->output);
-        }
-        return 0;
-    }
-
-    static int on_message_complete_cb(llhttp_t* parser)
-    {
-        auto* ctx             = static_cast<ResponseContext*>(parser->data);
-        ctx->message_complete = true;
-        return 0;
-    }
-
-private:
-    void store_header()
-    {
-        if (current_field.empty())
-            return;
-        HeaderEntry entry;
-        entry.name  = std::move(current_field);
-        entry.value = trim_leading_spaces(current_value);
-        header_sequence.push_back(entry);
-        header_lookup[to_lower(header_sequence.back().name)] = header_sequence.back().value;
-        current_field.clear();
-        current_value.clear();
-    }
-};
 
 namespace http2_client {
 
@@ -884,7 +647,7 @@ namespace http2_client {
 
         std::optional<std::string> header(std::string_view name) const
         {
-            auto it = header_lookup.find(to_lower(name));
+            auto it = header_lookup.find(http::to_lower(name));
             if (it == header_lookup.end())
                 return std::nullopt;
             return it->second;
@@ -893,7 +656,7 @@ namespace http2_client {
         void append_header(std::string name, std::string value)
         {
             HeaderEntry entry { std::move(name), std::move(value) };
-            header_lookup[to_lower(entry.name)] = entry.value;
+            header_lookup[http::to_lower(entry.name)] = entry.value;
             headers.push_back(std::move(entry));
         }
 
@@ -939,12 +702,12 @@ namespace http2_client {
         bool                 failed { false };
     };
 
-    [[maybe_unused]] static ssize_t
+    [[maybe_unused]] static nghttp2_ssize
     send_callback(nghttp2_session*, const uint8_t* data, size_t length, int, void* user_data)
     {
         auto* state = static_cast<SessionState*>(user_data);
         state->send_buffer.insert(state->send_buffer.end(), data, data + length);
-        return static_cast<ssize_t>(length);
+        return static_cast<nghttp2_ssize>(length);
     }
 
     [[maybe_unused]] static int on_header_callback(nghttp2_session*,
@@ -1044,13 +807,13 @@ namespace http2_client {
         return 0;
     }
 
-    [[maybe_unused]] static ssize_t request_body_read_callback(nghttp2_session*,
-                                                               int32_t,
-                                                               uint8_t*             buf,
-                                                               size_t               length,
-                                                               uint32_t*            data_flags,
-                                                               nghttp2_data_source* source,
-                                                               void*                user_data)
+    [[maybe_unused]] static nghttp2_ssize request_body_read_callback(nghttp2_session*,
+                                                                     int32_t,
+                                                                     uint8_t*             buf,
+                                                                     size_t               length,
+                                                                     uint32_t*            data_flags,
+                                                                     nghttp2_data_source* source,
+                                                                     void*                user_data)
     {
         auto* state = static_cast<SessionState*>(user_data);
         if (!state->has_request_body)
@@ -1064,7 +827,7 @@ namespace http2_client {
         }
         if (body->offset >= body->data->size())
             *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        return static_cast<ssize_t>(to_copy);
+        return static_cast<nghttp2_ssize>(to_copy);
     }
 
     template <typename Socket>
@@ -1131,7 +894,7 @@ namespace http2_client {
         header_pairs.emplace_back(":authority", std::move(authority));
 
         for (const auto& header : built.headers) {
-            std::string lower = to_lower(header.name);
+            std::string lower = http::to_lower(header.name);
             if (lower == "host" || lower == "connection" || lower == "proxy-connection" || lower == "upgrade"
                 || lower == "keep-alive" || lower == "transfer-encoding")
                 continue;
@@ -1304,23 +1067,22 @@ perform_request_http1(Socket& socket, const BuiltRequest& built, ResponseContext
         }
         if (n == 0)
             break;
-        llhttp_errno_t err = llhttp_execute(&ctx.parser, buffer.data(), static_cast<size_t>(n));
-        if (err != HPE_OK) {
-            const char* reason = llhttp_get_error_reason(&ctx.parser);
-            if (reason == nullptr || *reason == '\0')
-                reason = llhttp_errno_name(err);
-            CO_WQ_LOG_ERROR("[co_curl] parse error: %s", reason);
+        std::string_view chunk(buffer.data(), static_cast<size_t>(n));
+        std::string      parse_error;
+        if (!ctx.feed(chunk, &parse_error)) {
+            if (parse_error.empty())
+                parse_error = "unknown parser error";
+            CO_WQ_LOG_ERROR("[co_curl] parse error: %s", parse_error.c_str());
             co_return -1;
         }
     }
 
     if (!ctx.message_complete) {
-        llhttp_errno_t finish_err = llhttp_finish(&ctx.parser);
-        if (finish_err != HPE_OK && finish_err != HPE_PAUSED_UPGRADE) {
-            const char* reason = llhttp_get_error_reason(&ctx.parser);
-            if (reason == nullptr || *reason == '\0')
-                reason = llhttp_errno_name(finish_err);
-            CO_WQ_LOG_ERROR("[co_curl] parse error at EOF: %s", reason);
+        std::string parse_error;
+        if (!ctx.finish(&parse_error)) {
+            if (parse_error.empty())
+                parse_error = "unknown parser error";
+            CO_WQ_LOG_ERROR("[co_curl] parse error at EOF: %s", parse_error.c_str());
             co_return -1;
         }
     }

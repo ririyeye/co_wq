@@ -102,8 +102,10 @@ end
 if get_config("USING_NET") then
     add_includedirs("io", { public = true })
     add_includedirs("net", { public = true })
+    add_includedirs("net/http", { public = true })
     add_defines("USING_NET", { public = true })
     add_files("net/dns_resolver.cpp")
+    add_files("net/http/http_common.cpp", "net/http/http_server.cpp", "net/http/http_client.cpp")
     if is_plat("windows") then
         add_links("Ws2_32")
         add_files("io/wepoll/wepoll.c")
