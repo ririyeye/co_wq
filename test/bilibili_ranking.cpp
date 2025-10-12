@@ -6,9 +6,12 @@
 #include "tcp_listener.hpp"
 #include "tcp_socket.hpp"
 #include "timer.hpp"
+#include "worker.hpp"
 #if defined(USING_SSL)
 #include "tls.hpp"
 #endif
+
+#include "semaphore.hpp"
 
 #include <llhttp.h>
 #include <nlohmann/json.hpp>
@@ -43,6 +46,7 @@
 #include <utility>
 #include <vector>
 
+#include <limits>
 #include <system_error>
 
 using namespace co_wq;
@@ -77,6 +81,7 @@ struct SharedState {
     size_t                                total_items { 0 };
     size_t                                completed_items { 0 };
     bool                                  fetching { false };
+    bool                                  initial_fetch_done { false };
 };
 
 std::atomic_bool               g_stop { false };
@@ -560,87 +565,178 @@ fetch_ranking(NetFdWorkqueue& fdwq, bool verify_peer)
     co_return std::move(entries);
 }
 
-Task<void, Work_Promise<SpinLock, void>> fetch_online_counts(NetFdWorkqueue&                     fdwq,
-                                                             std::vector<RankingEntry>&          entries,
-                                                             bool                                verify_peer,
-                                                             const std::shared_ptr<SharedState>& state)
+struct Slot_guard {
+    Semaphore<SpinLock>* slot { nullptr };
+    Semaphore<SpinLock>* done { nullptr };
+    bool                 slot_acquired { false };
+    bool                 keep_slots { false };
+
+    ~Slot_guard()
+    {
+        if (done)
+            done->release();
+        if (slot && slot_acquired && !keep_slots)
+            slot->release();
+    }
+};
+
+Task<void, Work_Promise<SpinLock, void>> fetch_online_count_entry(NetFdWorkqueue&                     fdwq,
+                                                                  RankingEntry&                       entry,
+                                                                  bool                                verify_peer,
+                                                                  const std::shared_ptr<SharedState>& state,
+                                                                  size_t                              index,
+                                                                  size_t                              total,
+                                                                  std::atomic_size_t*                 completed_counter)
 {
+    if (g_stop.load(std::memory_order_acquire))
+        co_return;
+
     constexpr const char* host = "api.bilibili.com";
     constexpr uint16_t    port = 443;
 
-    size_t       index = 0;
-    const size_t total = entries.size();
-    for (auto& entry : entries) {
-        std::string path        = "/x/player/online/total?bvid=" + entry.bvid + "&cid=" + std::to_string(entry.cid);
-        auto        online_json = co_await http_get_json(
-            fdwq,
-            host,
-            port,
-            path,
-            {
-                { "Referer", "https://www.bilibili.com/video/" + entry.bvid           },
-                { "Origin",  "https://www.bilibili.com"                               },
-                { "Cookie",  "buvid3=2D4B09A5-0E5F-4537-9F7C-E293CE7324F7167646infoc" }
-        },
-            verify_peer);
-        if (online_json.has_value() && online_json->contains("code") && (*online_json)["code"].get<int>() == 0) {
-            try {
-                const auto& total_field = (*online_json)["data"]["total"];
-                if (total_field.is_number_integer()) {
-                    entry.online_total = total_field.get<int64_t>();
-                } else if (total_field.is_number_float()) {
-                    entry.online_total = static_cast<int64_t>(total_field.get<double>());
-                } else if (total_field.is_string()) {
-                    const std::string str_value = total_field.get<std::string>();
-                    if (auto parsed = parse_online_total_string(str_value); parsed.has_value()) {
-                        entry.online_total = *parsed;
-                    } else {
-                        entry.online_total = 0;
-                        CO_WQ_LOG_WARN("[bili] online total parse failed for %s: %s",
-                                       entry.bvid.c_str(),
-                                       str_value.c_str());
-                    }
+    std::string path        = "/x/player/online/total?bvid=" + entry.bvid + "&cid=" + std::to_string(entry.cid);
+    auto        online_json = co_await http_get_json(
+        fdwq,
+        host,
+        port,
+        path,
+        {
+            { "Referer", "https://www.bilibili.com/video/" + entry.bvid           },
+            { "Origin",  "https://www.bilibili.com"                               },
+            { "Cookie",  "buvid3=2D4B09A5-0E5F-4537-9F7C-E293CE7324F7167646infoc" }
+    },
+        verify_peer);
+    if (online_json.has_value() && online_json->contains("code") && (*online_json)["code"].get<int>() == 0) {
+        try {
+            const auto& total_field = (*online_json)["data"]["total"];
+            if (total_field.is_number_integer()) {
+                entry.online_total = total_field.get<int64_t>();
+            } else if (total_field.is_number_float()) {
+                entry.online_total = static_cast<int64_t>(total_field.get<double>());
+            } else if (total_field.is_string()) {
+                const std::string str_value = total_field.get<std::string>();
+                if (auto parsed = parse_online_total_string(str_value); parsed.has_value()) {
+                    entry.online_total = *parsed;
                 } else {
                     entry.online_total = 0;
-                    CO_WQ_LOG_WARN("[bili] unexpected total type for %s", entry.bvid.c_str());
+                    CO_WQ_LOG_WARN("[bili] online total parse failed for %s: %s",
+                                   entry.bvid.c_str(),
+                                   str_value.c_str());
                 }
-            } catch (const std::exception& ex) {
-                entry.online_total = 0;
-                CO_WQ_LOG_WARN("[bili] online total parse failed for %s: %s", entry.bvid.c_str(), ex.what());
-            }
-        } else {
-            entry.online_total = 0;
-            if (online_json.has_value()) {
-                std::string dump = online_json->dump();
-                CO_WQ_LOG_WARN("[bili] online api returned non-zero code for %s: %s", entry.bvid.c_str(), dump.c_str());
             } else {
-                CO_WQ_LOG_WARN("[bili] online api request failed for %s", entry.bvid.c_str());
+                entry.online_total = 0;
+                CO_WQ_LOG_WARN("[bili] unexpected total type for %s", entry.bvid.c_str());
             }
+        } catch (const std::exception& ex) {
+            entry.online_total = 0;
+            CO_WQ_LOG_WARN("[bili] online total parse failed for %s: %s", entry.bvid.c_str(), ex.what());
         }
+    } else {
+        entry.online_total = 0;
+        if (online_json.has_value()) {
+            std::string dump = online_json->dump();
+            CO_WQ_LOG_WARN("[bili] online api returned non-zero code for %s: %s", entry.bvid.c_str(), dump.c_str());
+        } else {
+            CO_WQ_LOG_WARN("[bili] online api request failed for %s", entry.bvid.c_str());
+        }
+    }
+
+    size_t completed = completed_counter ? completed_counter->fetch_add(1, std::memory_order_acq_rel) + 1
+                                         : std::min(index + 1, total);
+    if (state) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->completed_items  = std::max(state->completed_items, completed);
+        state->progress_updated = std::chrono::system_clock::now();
+    }
+    if (total > 0) {
+        double percent = static_cast<double>(completed) / static_cast<double>(total) * 100.0;
+        CO_WQ_LOG_INFO("[bili] progress %.0f%% (%zu/%zu)", percent, completed, total);
+    }
+    co_return;
+}
+
+Task<void, Work_Promise<SpinLock, void>> fetch_online_count_worker(NetFdWorkqueue&                     fdwq,
+                                                                   RankingEntry&                       entry,
+                                                                   bool                                verify_peer,
+                                                                   const std::shared_ptr<SharedState>& state,
+                                                                   size_t                              index,
+                                                                   size_t                              total,
+                                                                   std::atomic_size_t&  completed_counter,
+                                                                   Semaphore<SpinLock>& slot_sem,
+                                                                   Semaphore<SpinLock>& done_sem,
+                                                                   bool                 keep_slot)
+{
+    Slot_guard guard { &slot_sem, &done_sem, false, keep_slot };
+
+    if (!keep_slot) {
+        co_await wait_sem(slot_sem);
+        guard.slot_acquired = true;
+    }
+
+    if (!g_stop.load(std::memory_order_acquire))
+        co_await fetch_online_count_entry(fdwq, entry, verify_peer, state, index, total, &completed_counter);
+
+    co_return;
+}
+
+Task<void, Work_Promise<SpinLock, void>> fetch_online_counts(NetFdWorkqueue&                     fdwq,
+                                                             std::vector<RankingEntry>&          entries,
+                                                             bool                                verify_peer,
+                                                             const std::shared_ptr<SharedState>& state,
+                                                             bool                                rapid_mode)
+{
+    const size_t total = entries.size();
+    if (total == 0) {
         if (state) {
             std::lock_guard<std::mutex> lock(state->mutex);
-            state->completed_items  = std::min(index + 1, total);
+            state->completed_items  = 0;
             state->progress_updated = std::chrono::system_clock::now();
+            state->fetching         = false;
         }
-        ++index;
-        if (total > 0) {
-            double percent = static_cast<double>(index) / static_cast<double>(total) * 100.0;
-            CO_WQ_LOG_INFO("[bili] progress %.0f%% (%zu/%zu)", percent, index, total);
-        }
-        if (g_stop.load(std::memory_order_acquire)) {
-            if (state) {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->fetching         = false;
-                state->progress_updated = std::chrono::system_clock::now();
-            }
-            co_return;
-        }
-        co_await delay_ms(get_sys_timer(), 200);
+        co_return;
     }
+
+    size_t final_completed = 0;
+
+    if (rapid_mode) {
+        Semaphore<SpinLock> slot_sem(fdwq.base(), 20, 20);
+        Semaphore<SpinLock> done_sem(fdwq.base(), 0, static_cast<int>(std::max<size_t>(total, 1)));
+        std::atomic_size_t  completed_counter { 0 };
+
+        for (size_t idx = 0; idx < total; ++idx) {
+            auto task = fetch_online_count_worker(fdwq,
+                                                  entries[idx],
+                                                  verify_peer,
+                                                  state,
+                                                  idx,
+                                                  total,
+                                                  completed_counter,
+                                                  slot_sem,
+                                                  done_sem,
+                                                  false);
+            post_to(task, fdwq.base());
+        }
+
+        for (size_t i = 0; i < total; ++i)
+            co_await wait_sem(done_sem);
+
+        final_completed = completed_counter.load(std::memory_order_acquire);
+    } else {
+        size_t index = 0;
+        for (auto& entry : entries) {
+            co_await fetch_online_count_entry(fdwq, entry, verify_peer, state, index, total, nullptr);
+            ++index;
+            if (g_stop.load(std::memory_order_acquire))
+                break;
+            co_await delay_ms(get_sys_timer(), 200);
+        }
+        final_completed = index;
+    }
+
     if (state) {
         std::lock_guard<std::mutex> lock(state->mutex);
         state->fetching         = false;
-        state->completed_items  = total;
+        state->completed_items  = std::min(final_completed, total);
         state->progress_updated = std::chrono::system_clock::now();
     }
     co_return;
@@ -671,15 +767,17 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
     while (!g_stop.load(std::memory_order_acquire)) {
         auto ranking = co_await fetch_ranking(fdwq, verify_peer);
         if (ranking.has_value()) {
-            auto entries = std::move(*ranking);
+            auto entries    = std::move(*ranking);
+            bool rapid_mode = false;
             if (state) {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 state->fetching         = true;
                 state->total_items      = entries.size();
                 state->completed_items  = 0;
                 state->progress_updated = std::chrono::system_clock::now();
+                rapid_mode              = !state->initial_fetch_done;
             }
-            co_await fetch_online_counts(fdwq, entries, verify_peer, state);
+            co_await fetch_online_counts(fdwq, entries, verify_peer, state, rapid_mode);
             if (!entries.empty()) {
                 auto        json_payload = build_result_payload(entries);
                 auto        now          = std::chrono::system_clock::now();
@@ -687,9 +785,10 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
                 std::string last_mod     = format_http_date(now);
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
-                    state->json_payload  = serialized;
-                    state->last_modified = last_mod;
-                    state->updated_at    = now;
+                    state->json_payload       = serialized;
+                    state->last_modified      = last_mod;
+                    state->updated_at         = now;
+                    state->initial_fetch_done = true;
                 }
                 std::error_code ec;
                 std::filesystem::create_directories(data_path.parent_path(), ec);
@@ -699,6 +798,9 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
                     ofs.flush();
                 }
                 CO_WQ_LOG_INFO("[bili] ranking updated, %zu entries", entries.size());
+            } else if (state) {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->initial_fetch_done = true;
             }
         } else if (state) {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -709,7 +811,12 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
         }
         if (g_stop.load(std::memory_order_acquire))
             break;
-        co_await delay_ms(get_sys_timer(), static_cast<int64_t>(interval.count()) * 1000);
+        int64_t wait_ms = static_cast<int64_t>(interval.count()) * 1000;
+        if (wait_ms < 0)
+            wait_ms = 0;
+        uint32_t clamped_wait = static_cast<uint32_t>(
+            std::min<int64_t>(wait_ms, static_cast<int64_t>(std::numeric_limits<uint32_t>::max())));
+        co_await delay_ms(get_sys_timer(), clamped_wait);
     }
     co_return;
 }
