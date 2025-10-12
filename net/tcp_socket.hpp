@@ -186,7 +186,7 @@ public:
     auto connect(const sockaddr* addr, socklen_t len)
     {
         raw_endpoint endpoint;
-        if (addr && len > 0 && len <= sizeof(endpoint.address)) {
+        if (addr && len > 0 && len <= static_cast<socklen_t>(sizeof(endpoint.address))) {
             std::memcpy(&endpoint.address, addr, len);
             endpoint.length = len;
         }

@@ -85,3 +85,15 @@ if is_plat("linux") then
     add_files("syswork.cpp")
     target_end()
 end
+
+if has_config("USING_SSL") then
+    target("co_bili")
+    set_kind("binary")
+    add_deps("co_wq")
+    add_rules("utils.bin2c", { linewidth = 16, extensions = { ".html" } })
+    add_files("index.html")
+    add_files("bilibili_ranking.cpp")
+    add_files("syswork.cpp")
+    add_packages("nlohmann_json")
+    target_end()
+end
