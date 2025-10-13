@@ -6,21 +6,21 @@
 
 namespace co_wq::net::http {
 
-ResponseContext::ResponseContext()
+Http1ResponseParser::Http1ResponseParser()
 {
     llhttp_settings_init(&settings_);
-    settings_.on_status                = &ResponseContext::on_status_cb;
-    settings_.on_header_field          = &ResponseContext::on_header_field_cb;
-    settings_.on_header_value          = &ResponseContext::on_header_value_cb;
-    settings_.on_header_value_complete = &ResponseContext::on_header_value_complete_cb;
-    settings_.on_headers_complete      = &ResponseContext::on_headers_complete_cb;
-    settings_.on_body                  = &ResponseContext::on_body_cb;
-    settings_.on_message_complete      = &ResponseContext::on_message_complete_cb;
+    settings_.on_status                = &Http1ResponseParser::on_status_cb;
+    settings_.on_header_field          = &Http1ResponseParser::on_header_field_cb;
+    settings_.on_header_value          = &Http1ResponseParser::on_header_value_cb;
+    settings_.on_header_value_complete = &Http1ResponseParser::on_header_value_complete_cb;
+    settings_.on_headers_complete      = &Http1ResponseParser::on_headers_complete_cb;
+    settings_.on_body                  = &Http1ResponseParser::on_body_cb;
+    settings_.on_message_complete      = &Http1ResponseParser::on_message_complete_cb;
     llhttp_init(&parser_, HTTP_RESPONSE, &settings_);
     parser_.data = this;
 }
 
-std::optional<std::string> ResponseContext::header(std::string_view name) const
+std::optional<std::string> Http1ResponseParser::header(std::string_view name) const
 {
     auto it = header_lookup.find(to_lower(name));
     if (it == header_lookup.end())
@@ -28,7 +28,7 @@ std::optional<std::string> ResponseContext::header(std::string_view name) const
     return it->second;
 }
 
-void ResponseContext::reset()
+void Http1ResponseParser::reset()
 {
     llhttp_reset(&parser_);
     status_text.clear();
@@ -37,15 +37,19 @@ void ResponseContext::reset()
     http_minor  = 1;
     header_sequence.clear();
     header_lookup.clear();
-    current_field_.clear();
-    current_value_.clear();
+    reset_header_state();
     headers_complete = false;
     message_complete = false;
+    has_error_       = false;
+    last_error_.clear();
     header_block.clear();
     body_buffer.clear();
+    response_.reset();
+    response_.status_code = 0;
+    response_.reason.clear();
 }
 
-void ResponseContext::flush_buffered_output()
+void Http1ResponseParser::flush_buffered_output()
 {
     if (!output)
         return;
@@ -56,74 +60,75 @@ void ResponseContext::flush_buffered_output()
     std::fflush(output);
 }
 
-bool ResponseContext::feed(std::string_view data, std::string* error_reason)
+bool Http1ResponseParser::feed(std::string_view data, std::string* error_reason)
 {
     auto err = llhttp_execute(&parser_, data.data(), data.size());
     if (err == HPE_OK)
         return true;
-    if (error_reason) {
-        const char* reason = llhttp_get_error_reason(&parser_);
-        if (reason && *reason)
-            *error_reason = reason;
-        else
-            *error_reason = llhttp_errno_name(err);
-    }
+    const char* reason = llhttp_get_error_reason(&parser_);
+    if (reason && *reason)
+        last_error_ = reason;
+    else
+        last_error_ = llhttp_errno_name(err);
+    if (error_reason)
+        *error_reason = last_error_;
+    has_error_ = true;
     return false;
 }
 
-bool ResponseContext::finish(std::string* error_reason)
+bool Http1ResponseParser::finish(std::string* error_reason)
 {
     auto err = llhttp_finish(&parser_);
     if (err == HPE_OK || err == HPE_PAUSED_UPGRADE)
         return true;
-    if (error_reason) {
-        const char* reason = llhttp_get_error_reason(&parser_);
-        if (reason && *reason)
-            *error_reason = reason;
-        else
-            *error_reason = llhttp_errno_name(err);
-    }
+    const char* reason = llhttp_get_error_reason(&parser_);
+    if (reason && *reason)
+        last_error_ = reason;
+    else
+        last_error_ = llhttp_errno_name(err);
+    if (error_reason)
+        *error_reason = last_error_;
+    has_error_ = true;
     return false;
 }
 
-int ResponseContext::on_status_cb(llhttp_t* parser, const char* at, size_t length)
+int Http1ResponseParser::on_status_cb(llhttp_t* parser, const char* at, size_t length)
 {
-    auto* ctx = static_cast<ResponseContext*>(parser->data);
+    auto* ctx = static_cast<Http1ResponseParser*>(parser->data);
     ctx->status_text.append(at, length);
     return 0;
 }
 
-int ResponseContext::on_header_field_cb(llhttp_t* parser, const char* at, size_t length)
+int Http1ResponseParser::on_header_field_cb(llhttp_t* parser, const char* at, size_t length)
 {
-    auto* ctx = static_cast<ResponseContext*>(parser->data);
-    if (!ctx->current_value_.empty()) {
-        ctx->store_header();
-    }
-    ctx->current_field_.append(at, length);
+    auto* ctx = static_cast<Http1ResponseParser*>(parser->data);
+    ctx->collect_header_field(at, length);
     return 0;
 }
 
-int ResponseContext::on_header_value_cb(llhttp_t* parser, const char* at, size_t length)
+int Http1ResponseParser::on_header_value_cb(llhttp_t* parser, const char* at, size_t length)
 {
-    auto* ctx = static_cast<ResponseContext*>(parser->data);
-    ctx->current_value_.append(at, length);
+    auto* ctx = static_cast<Http1ResponseParser*>(parser->data);
+    ctx->collect_header_value(at, length);
     return 0;
 }
 
-int ResponseContext::on_header_value_complete_cb(llhttp_t* parser)
+int Http1ResponseParser::on_header_value_complete_cb(llhttp_t* parser)
 {
-    auto* ctx = static_cast<ResponseContext*>(parser->data);
-    ctx->store_header();
+    auto* ctx = static_cast<Http1ResponseParser*>(parser->data);
+    ctx->finalize_header_value();
     return 0;
 }
 
-int ResponseContext::on_headers_complete_cb(llhttp_t* parser)
+int Http1ResponseParser::on_headers_complete_cb(llhttp_t* parser)
 {
-    auto* ctx             = static_cast<ResponseContext*>(parser->data);
+    auto* ctx             = static_cast<Http1ResponseParser*>(parser->data);
     ctx->status_code      = parser->status_code;
     ctx->http_major       = parser->http_major;
     ctx->http_minor       = parser->http_minor;
     ctx->headers_complete = true;
+    ctx->response_.set_http_version(parser->http_major, parser->http_minor);
+    ctx->response_.set_status(ctx->status_code, ctx->status_text);
 
     ctx->header_block.clear();
     if (ctx->include_headers) {
@@ -166,142 +171,37 @@ int ResponseContext::on_headers_complete_cb(llhttp_t* parser)
     return 0;
 }
 
-int ResponseContext::on_body_cb(llhttp_t* parser, const char* at, size_t length)
+int Http1ResponseParser::on_body_cb(llhttp_t* parser, const char* at, size_t length)
 {
-    auto* ctx = static_cast<ResponseContext*>(parser->data);
+    auto* ctx = static_cast<Http1ResponseParser*>(parser->data);
     if (ctx->buffer_body) {
         ctx->body_buffer.append(at, length);
+        ctx->response_.append_body(std::string_view(at, length));
     } else if (ctx->output) {
         std::fwrite(at, 1, length, ctx->output);
     }
     return 0;
 }
 
-int ResponseContext::on_message_complete_cb(llhttp_t* parser)
+int Http1ResponseParser::on_message_complete_cb(llhttp_t* parser)
 {
-    auto* ctx             = static_cast<ResponseContext*>(parser->data);
-    ctx->message_complete = true;
+    auto* ctx                       = static_cast<Http1ResponseParser*>(parser->data);
+    ctx->message_complete           = true;
+    ctx->response_.close_connection = (llhttp_should_keep_alive(parser) == 0);
     return 0;
 }
 
-void ResponseContext::store_header()
+void Http1ResponseParser::handle_header(std::string&& name, std::string&& value)
 {
-    if (current_field_.empty())
+    if (name.empty())
         return;
     HeaderEntry entry;
-    entry.name  = std::move(current_field_);
-    entry.value = trim_leading_spaces(current_value_);
+    entry.name             = std::move(name);
+    entry.value            = trim_leading_spaces(value);
+    std::string lower_name = to_lower(entry.name);
     header_sequence.push_back(entry);
-    header_lookup[to_lower(header_sequence.back().name)] = header_sequence.back().value;
-    current_field_.clear();
-    current_value_.clear();
-}
-
-SimpleResponse::SimpleResponse()
-{
-    llhttp_settings_init(&settings_);
-    settings_.on_header_field          = &SimpleResponse::on_header_field_cb;
-    settings_.on_header_value          = &SimpleResponse::on_header_value_cb;
-    settings_.on_header_value_complete = &SimpleResponse::on_header_value_complete_cb;
-    settings_.on_headers_complete      = &SimpleResponse::on_headers_complete_cb;
-    settings_.on_body                  = &SimpleResponse::on_body_cb;
-    settings_.on_message_complete      = &SimpleResponse::on_message_complete_cb;
-    llhttp_init(&parser_, HTTP_RESPONSE, &settings_);
-    parser_.data = this;
-}
-
-void SimpleResponse::reset()
-{
-    llhttp_reset(&parser_);
-    current_field_.clear();
-    current_value_.clear();
-    headers.clear();
-    body.clear();
-    status_code      = 0;
-    message_complete = false;
-}
-
-bool SimpleResponse::feed(std::string_view data, std::string* error_reason)
-{
-    auto err = llhttp_execute(&parser_, data.data(), data.size());
-    if (err == HPE_OK)
-        return true;
-    if (error_reason) {
-        const char* reason = llhttp_get_error_reason(&parser_);
-        if (reason && *reason)
-            *error_reason = reason;
-        else
-            *error_reason = llhttp_errno_name(err);
-    }
-    return false;
-}
-
-bool SimpleResponse::finish(std::string* error_reason)
-{
-    auto err = llhttp_finish(&parser_);
-    if (err == HPE_OK || err == HPE_PAUSED_UPGRADE)
-        return true;
-    if (error_reason) {
-        const char* reason = llhttp_get_error_reason(&parser_);
-        if (reason && *reason)
-            *error_reason = reason;
-        else
-            *error_reason = llhttp_errno_name(err);
-    }
-    return false;
-}
-
-int SimpleResponse::on_header_field_cb(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* self = static_cast<SimpleResponse*>(parser->data);
-    if (!self->current_value_.empty())
-        self->store_header();
-    self->current_field_.append(at, length);
-    return 0;
-}
-
-int SimpleResponse::on_header_value_cb(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* self = static_cast<SimpleResponse*>(parser->data);
-    self->current_value_.append(at, length);
-    return 0;
-}
-
-int SimpleResponse::on_header_value_complete_cb(llhttp_t* parser)
-{
-    auto* self = static_cast<SimpleResponse*>(parser->data);
-    self->store_header();
-    return 0;
-}
-
-int SimpleResponse::on_headers_complete_cb(llhttp_t* parser)
-{
-    auto* self        = static_cast<SimpleResponse*>(parser->data);
-    self->status_code = parser->status_code;
-    return 0;
-}
-
-int SimpleResponse::on_body_cb(llhttp_t* parser, const char* at, size_t length)
-{
-    auto* self = static_cast<SimpleResponse*>(parser->data);
-    self->body.append(at, length);
-    return 0;
-}
-
-int SimpleResponse::on_message_complete_cb(llhttp_t* parser)
-{
-    auto* self             = static_cast<SimpleResponse*>(parser->data);
-    self->message_complete = true;
-    return 0;
-}
-
-void SimpleResponse::store_header()
-{
-    if (current_field_.empty())
-        return;
-    headers[to_lower(current_field_)] = current_value_;
-    current_field_.clear();
-    current_value_.clear();
+    header_lookup[lower_name] = header_sequence.back().value;
+    response_.set_header(lower_name, header_sequence.back().value);
 }
 
 bool header_exists(const std::vector<HeaderEntry>& headers, std::string_view name)

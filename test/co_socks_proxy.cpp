@@ -5,8 +5,8 @@
 // bridging data bidirectionally using the workqueue reactor.
 //
 
-#include "syswork.hpp"
-#include "test_sys_stats_logger.hpp"
+#include "co_syswork.hpp"
+#include "co_test_sys_stats_logger.hpp"
 
 #include "dns_resolver.hpp"
 #include "tcp_listener.hpp"

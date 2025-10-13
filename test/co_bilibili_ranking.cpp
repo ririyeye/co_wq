@@ -1,5 +1,5 @@
-#include "syswork.hpp"
-#include "test_sys_stats_logger.hpp"
+﻿#include "co_syswork.hpp"
+#include "co_test_sys_stats_logger.hpp"
 
 #include "dns_resolver.hpp"
 #include "fd_base.hpp"
@@ -14,7 +14,7 @@
 #include "semaphore.hpp"
 
 #include "http/http_client.hpp"
-#include "http/http_common.hpp"
+#include "http/http_easy_server.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -60,7 +60,10 @@ using namespace std::string_view_literals;
 
 using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
 namespace http       = co_wq::net::http;
-using http::SimpleResponse;
+using http::Http1ResponseParser;
+using http::HttpEasyServer;
+using http::HttpRequest;
+using http::HttpResponse;
 
 namespace {
 
@@ -89,8 +92,8 @@ struct SharedState {
 };
 
 std::atomic_bool               g_stop { false };
-std::atomic<net::os::fd_t>     g_listener_fd { net::os::invalid_fd() };
 std::atomic<std::atomic_bool*> g_finished_ptr { nullptr };
+std::atomic<HttpEasyServer*>   g_server_ptr { nullptr };
 
 std::string format_http_date(std::chrono::system_clock::time_point tp)
 {
@@ -195,39 +198,14 @@ std::optional<int64_t> parse_online_total_string(std::string_view value)
     }
 }
 
-std::string describe_remote_endpoint(const net::tcp_socket<SpinLock>& socket)
-{
-    sockaddr_storage addr {};
-    socklen_t        len = sizeof(addr);
-    if (::getpeername(socket.native_handle(), reinterpret_cast<sockaddr*>(&addr), &len) != 0)
-        return {};
-
-    char host[NI_MAXHOST] = {};
-    char serv[NI_MAXSERV] = {};
-    int  rc               = ::getnameinfo(reinterpret_cast<const sockaddr*>(&addr),
-                           len,
-                           host,
-                           sizeof(host),
-                           serv,
-                           sizeof(serv),
-                           NI_NUMERICHOST | NI_NUMERICSERV);
-    if (rc != 0)
-        return {};
-
-    std::string host_str = host;
-    if (addr.ss_family == AF_INET6 && host_str.find(':') != std::string::npos)
-        host_str = "[" + host_str + "]";
-    return host_str + ":" + std::string(serv);
-}
-
 #if defined(_WIN32)
 static BOOL WINAPI console_ctrl_handler(DWORD type)
 {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        CO_WQ_LOG_INFO("[bili] console control signal=%lu", static_cast<unsigned long>(type));
         g_stop.store(true, std::memory_order_release);
-        auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
-        if (fd != net::os::invalid_fd())
-            net::os::close_fd(fd);
+        if (auto* srv = g_server_ptr.load(std::memory_order_acquire))
+            srv->request_stop();
         if (auto ptr = g_finished_ptr.load(std::memory_order_acquire))
             ptr->store(true, std::memory_order_release);
         return TRUE;
@@ -237,10 +215,10 @@ static BOOL WINAPI console_ctrl_handler(DWORD type)
 #else
 void sigint_handler(int)
 {
+    CO_WQ_LOG_INFO("[bili] console control signal caught");
     g_stop.store(true, std::memory_order_release);
-    auto fd = g_listener_fd.exchange(net::os::invalid_fd(), std::memory_order_acq_rel);
-    if (fd != net::os::invalid_fd())
-        net::os::close_fd(fd);
+    if (auto* srv = g_server_ptr.load(std::memory_order_acquire))
+        srv->request_stop();
     if (auto ptr = g_finished_ptr.load(std::memory_order_acquire))
         ptr->store(true, std::memory_order_release);
 }
@@ -261,7 +239,7 @@ static std::string errno_message(int err)
 }
 #endif
 
-Task<std::optional<SimpleResponse>, Work_Promise<SpinLock, std::optional<SimpleResponse>>>
+Task<std::optional<Http1ResponseParser>, Work_Promise<SpinLock, std::optional<Http1ResponseParser>>>
 http_get(NetFdWorkqueue&                                     fdwq,
          const std::string&                                  host,
          uint16_t                                            port,
@@ -337,7 +315,8 @@ http_get(NetFdWorkqueue&                                     fdwq,
         co_return std::nullopt;
     }
 
-    SimpleResponse         response;
+    Http1ResponseParser response;
+    response.buffer_body = true;
     std::array<char, 8192> buffer {};
     std::string            parse_error;
     while (true) {
@@ -383,7 +362,7 @@ http_get_json(NetFdWorkqueue&                                     fdwq,
         co_return std::nullopt;
     }
     try {
-        auto json = nlohmann::json::parse(response.body);
+        auto json = nlohmann::json::parse(response.body_buffer);
         co_return std::move(json);
     } catch (const std::exception& ex) {
         CO_WQ_LOG_ERROR("[bili] json parse failed for %s: %s", target.c_str(), ex.what());
@@ -484,6 +463,7 @@ struct Slot_guard {
 Task<void, Work_Promise<SpinLock, void>> fetch_online_count_entry(NetFdWorkqueue&                     fdwq,
                                                                   RankingEntry&                       entry,
                                                                   bool                                verify_peer,
+                                                                  bool                                log_error_json,
                                                                   const std::shared_ptr<SharedState>& state,
                                                                   size_t                              index,
                                                                   size_t                              total,
@@ -535,8 +515,13 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_count_entry(NetFdWorkqueue
     } else {
         entry.online_total = 0;
         if (online_json.has_value()) {
-            std::string dump = online_json->dump();
-            CO_WQ_LOG_WARN("[bili] online api returned non-zero code for %s: %s", entry.bvid.c_str(), dump.c_str());
+            if (log_error_json) {
+                std::string dump = online_json->dump();
+                CO_WQ_LOG_WARN("[bili] online api returned non-zero code for %s: %s", entry.bvid.c_str(), dump.c_str());
+            } else {
+                CO_WQ_LOG_WARN("[bili] online api returned non-zero code for %s (use --log-json to dump payload)",
+                               entry.bvid.c_str());
+            }
         } else {
             CO_WQ_LOG_WARN("[bili] online api request failed for %s", entry.bvid.c_str());
         }
@@ -559,6 +544,7 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_count_entry(NetFdWorkqueue
 Task<void, Work_Promise<SpinLock, void>> fetch_online_count_worker(NetFdWorkqueue&                     fdwq,
                                                                    RankingEntry&                       entry,
                                                                    bool                                verify_peer,
+                                                                   bool                                log_error_json,
                                                                    const std::shared_ptr<SharedState>& state,
                                                                    size_t                              index,
                                                                    size_t                              total,
@@ -575,7 +561,14 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_count_worker(NetFdWorkqueu
     }
 
     if (!g_stop.load(std::memory_order_acquire))
-        co_await fetch_online_count_entry(fdwq, entry, verify_peer, state, index, total, &completed_counter);
+        co_await fetch_online_count_entry(fdwq,
+                                          entry,
+                                          verify_peer,
+                                          log_error_json,
+                                          state,
+                                          index,
+                                          total,
+                                          &completed_counter);
 
     co_return;
 }
@@ -584,7 +577,8 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_counts(NetFdWorkqueue&    
                                                              std::vector<RankingEntry>&          entries,
                                                              bool                                verify_peer,
                                                              const std::shared_ptr<SharedState>& state,
-                                                             bool                                rapid_mode)
+                                                             bool                                rapid_mode,
+                                                             bool                                log_error_json)
 {
     const size_t total = entries.size();
     if (total == 0) {
@@ -608,6 +602,7 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_counts(NetFdWorkqueue&    
             auto task = fetch_online_count_worker(fdwq,
                                                   entries[idx],
                                                   verify_peer,
+                                                  log_error_json,
                                                   state,
                                                   idx,
                                                   total,
@@ -625,7 +620,7 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_counts(NetFdWorkqueue&    
     } else {
         size_t index = 0;
         for (auto& entry : entries) {
-            co_await fetch_online_count_entry(fdwq, entry, verify_peer, state, index, total, nullptr);
+            co_await fetch_online_count_entry(fdwq, entry, verify_peer, log_error_json, state, index, total, nullptr);
             ++index;
             if (g_stop.load(std::memory_order_acquire))
                 break;
@@ -663,7 +658,8 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
                                                       std::shared_ptr<SharedState> state,
                                                       std::filesystem::path        data_path,
                                                       std::chrono::seconds         interval,
-                                                      bool                         verify_peer)
+                                                      bool                         verify_peer,
+                                                      bool                         log_error_json)
 {
     while (!g_stop.load(std::memory_order_acquire)) {
         auto ranking = co_await fetch_ranking(fdwq, verify_peer);
@@ -678,7 +674,7 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
                 state->progress_updated = std::chrono::system_clock::now();
                 rapid_mode              = !state->initial_fetch_done;
             }
-            co_await fetch_online_counts(fdwq, entries, verify_peer, state, rapid_mode);
+            co_await fetch_online_counts(fdwq, entries, verify_peer, state, rapid_mode, log_error_json);
             if (!entries.empty()) {
                 auto        json_payload = build_result_payload(entries);
                 auto        now          = std::chrono::system_clock::now();
@@ -722,265 +718,93 @@ Task<void, Work_Promise<SpinLock, void>> polling_task(NetFdWorkqueue&           
     co_return;
 }
 
-std::string detect_content_type(const std::filesystem::path& file)
+// (removed legacy helper utilities for static file serving)
+
+// Helper response builders for HttpEasyServer routes
+HttpResponse make_index_response()
 {
-    auto ext = file.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (ext == ".html" || ext == ".htm")
-        return "text/html; charset=utf-8";
-    if (ext == ".css")
-        return "text/css; charset=utf-8";
-    if (ext == ".js")
-        return "application/javascript";
-    if (ext == ".json")
-        return "application/json";
-    if (ext == ".png")
-        return "image/png";
-    if (ext == ".jpg" || ext == ".jpeg")
-        return "image/jpeg";
-    if (ext == ".svg")
-        return "image/svg+xml";
-    return "application/octet-stream";
+    HttpResponse resp;
+    resp.set_status(200, "OK");
+    resp.set_header("content-type", "text/html; charset=utf-8");
+    resp.set_header("cache-control", "no-store");
+    resp.set_body(std::string(kIndexHtmlView));
+    return resp;
 }
 
-std::optional<std::filesystem::path> resolve_static_path(const std::filesystem::path& root,
-                                                         std::string_view             request_path)
+HttpResponse make_data_response(const std::shared_ptr<SharedState>& state)
 {
-    std::filesystem::path clean = root;
-    if (request_path.empty() || request_path == "/")
-        clean /= "index.html";
-    else {
-        std::string segment(request_path);
-        if (!segment.empty() && segment.front() == '/')
-            segment.erase(segment.begin());
-        clean /= segment;
-    }
-    std::error_code ec;
-    auto            canonical = std::filesystem::weakly_canonical(clean, ec);
-    if (ec)
-        return std::nullopt;
-    auto canonical_str = canonical.generic_u8string();
-    auto root_str      = root.generic_u8string();
-    if (canonical_str.size() < root_str.size() || canonical_str.compare(0, root_str.size(), root_str) != 0)
-        return std::nullopt;
-    if (!std::filesystem::is_regular_file(canonical, ec))
-        return std::nullopt;
-    return canonical;
-}
-
-// NOTE: socket 以值传递，确保协程帧持有 fd 生命周期，避免调用处作用域结束时被提早关闭。
-Task<void, Work_Promise<SpinLock, void>>
-handle_client(net::tcp_socket<SpinLock> socket, std::shared_ptr<SharedState> state, std::filesystem::path static_root)
-{
-    std::string request;
-    request.reserve(1024);
-    std::array<char, 1024> buffer {};
-    while (request.find("\r\n\r\n") == std::string::npos) {
-        ssize_t n = co_await socket.recv(buffer.data(), buffer.size());
-        if (n <= 0)
-            break;
-        request.append(buffer.data(), static_cast<size_t>(n));
-        if (request.size() > 8192)
-            break;
-    }
-
-    std::string_view method;
-    std::string_view path;
+    HttpResponse resp;
+    std::string  payload;
+    std::string  last_modified;
     {
-        auto pos = request.find(" ");
-        if (pos != std::string::npos)
-            method = std::string_view(request.data(), pos);
-        auto pos2 = request.find(' ', pos + 1);
-        if (pos != std::string::npos && pos2 != std::string::npos)
-            path = std::string_view(request.data() + pos + 1, pos2 - pos - 1);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        payload       = state->json_payload;
+        last_modified = state->last_modified;
     }
 
-    std::string body;
-    std::string headers;
-    std::string status_line;
-    auto        path_view = path;
-    if (!path_view.empty()) {
-        auto qpos = path_view.find('?');
-        if (qpos != std::string_view::npos)
-            path_view = path_view.substr(0, qpos);
+    if (payload.empty()) {
+        resp.set_status(503, "Service Unavailable");
+        resp.set_header("content-type", "application/json; charset=utf-8");
+        resp.set_header("cache-control", "no-store");
+        resp.set_body("{\"error\":\"data not ready\"}");
+        return resp;
     }
 
-    std::string method_str(method);
-    if (method_str.empty())
-        method_str = "UNKNOWN";
-    std::string path_str(path);
-    if (path_str.empty())
-        path_str = std::string(path_view);
-    if (path_str.empty())
-        path_str = "/";
-    std::string client_desc = describe_remote_endpoint(socket);
-    if (client_desc.empty())
-        client_desc = "unknown";
-    CO_WQ_LOG_INFO("[bili] request %s %s from %s", method_str.c_str(), path_str.c_str(), client_desc.c_str());
-
-    if (method != "GET"sv) {
-        status_line = "HTTP/1.1 405 Method Not Allowed\r\n";
-        headers     = "Content-Length: 0\r\nConnection: close\r\n\r\n";
-    } else if (path_view == "/data.json"sv) {
-        std::string payload;
-        std::string last_modified;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (!state->json_payload.empty()) {
-                payload       = state->json_payload;
-                last_modified = state->last_modified;
-            }
-        }
-        if (payload.empty()) {
-            status_line = "HTTP/1.1 503 Service Unavailable\r\n";
-            body        = "{"
-                          "error"
-                          ":"
-                          "data not ready"
-                          "}";
-            headers     = "Content-Type: application/json\r\n";
-        } else {
-            status_line = "HTTP/1.1 200 OK\r\n";
-            body        = std::move(payload);
-            headers     = "Content-Type: application/json\r\n";
-            if (!last_modified.empty()) {
-                headers.append("Last-Modified: ");
-                headers.append(last_modified);
-                headers.append("\r\n");
-            }
-        }
-        headers.append("Cache-Control: no-store\r\n");
-        headers.append("Content-Length: ");
-        headers.append(std::to_string(body.size()));
-        headers.append("\r\nConnection: close\r\n\r\n");
-    } else if (path_view == "/progress"sv || path_view == "/progress.json"sv || path_view == "/status"sv) {
-        size_t                                total_items { 0 };
-        size_t                                completed_items { 0 };
-        bool                                  fetching { false };
-        std::string                           last_data_time;
-        std::string                           last_progress_time;
-        std::chrono::system_clock::time_point progress_tp { std::chrono::system_clock::time_point::min() };
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            total_items     = state->total_items;
-            completed_items = state->completed_items;
-            fetching        = state->fetching;
-            progress_tp     = state->progress_updated;
-            last_data_time  = state->last_modified;
-        }
-        if (progress_tp != std::chrono::system_clock::time_point::min())
-            last_progress_time = format_http_date(progress_tp);
-        double percent = 0.0;
-        if (total_items > 0)
-            percent = static_cast<double>(completed_items) / static_cast<double>(total_items) * 100.0;
-        nlohmann::json status_json;
-        status_json["fetching"]       = fetching;
-        status_json["completed"]      = completed_items;
-        status_json["total"]          = total_items;
-        status_json["percent"]        = percent;
-        status_json["last_data_time"] = last_data_time;
-        status_json["progress_time"]  = last_progress_time;
-        body                          = status_json.dump();
-        status_line                   = "HTTP/1.1 200 OK\r\n";
-        headers                       = "Content-Type: application/json\r\n";
-        headers.append("Cache-Control: no-store\r\n");
-        headers.append("Content-Length: ");
-        headers.append(std::to_string(body.size()));
-        headers.append("\r\nConnection: close\r\n\r\n");
-    } else if (path_view == "/"sv || path_view == "/index.html"sv) {
-        status_line = "HTTP/1.1 200 OK\r\n";
-        headers     = "Content-Type: text/html; charset=utf-8\r\n";
-        headers.append("Cache-Control: no-store\r\n");
-        headers.append("Content-Length: ");
-        headers.append(std::to_string(kIndexHtmlView.size()));
-        headers.append("\r\nConnection: close\r\n\r\n");
-        body.assign(kIndexHtmlView.data(), kIndexHtmlView.size());
-    } else {
-        auto resolved = resolve_static_path(static_root, path_view);
-        if (!resolved.has_value()) {
-            status_line = "HTTP/1.1 404 Not Found\r\n";
-            body        = "Not found";
-            headers     = "Content-Type: text/plain; charset=utf-8\r\n";
-            headers.append("Content-Length: ");
-            headers.append(std::to_string(body.size()));
-            headers.append("\r\nConnection: close\r\n\r\n");
-        } else {
-            std::ifstream ifs(*resolved, std::ios::binary);
-            if (!ifs.is_open()) {
-                status_line = "HTTP/1.1 404 Not Found\r\n";
-                body        = "Not found";
-                headers     = "Content-Type: text/plain; charset=utf-8\r\n";
-                headers.append("Content-Length: ");
-                headers.append(std::to_string(body.size()));
-                headers.append("\r\nConnection: close\r\n\r\n");
-            } else {
-                std::ostringstream oss;
-                oss << ifs.rdbuf();
-                body        = oss.str();
-                status_line = "HTTP/1.1 200 OK\r\n";
-                headers     = "Content-Type: ";
-                headers.append(detect_content_type(*resolved));
-                headers.append("\r\n");
-                if (path_view == "/index.html"sv || path_view.empty()) {
-                    std::error_code ec;
-                    auto            ftime = std::filesystem::last_write_time(*resolved, ec);
-                    if (!ec) {
-                        auto sys_time = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
-                        headers.append("Last-Modified: ");
-                        headers.append(format_http_date(sys_time));
-                        headers.append("\r\n");
-                    }
-                }
-                headers.append("Content-Length: ");
-                headers.append(std::to_string(body.size()));
-                headers.append("\r\nConnection: close\r\n\r\n");
-            }
-        }
-    }
-
-    std::string response_head;
-    response_head.reserve(status_line.size() + headers.size());
-    response_head.append(status_line);
-    response_head.append(headers);
-    if (!response_head.empty())
-        co_await socket.send_all(response_head.data(), response_head.size());
-    if (!body.empty())
-        co_await socket.send_all(body.data(), body.size());
-    socket.close();
-    co_return;
+    resp.set_status(200, "OK");
+    resp.set_header("content-type", "application/json; charset=utf-8");
+    resp.set_header("cache-control", "no-store");
+    if (!last_modified.empty())
+        resp.set_header("last-modified", last_modified);
+    resp.set_body(std::move(payload));
+    return resp;
 }
 
-Task<void, Work_Promise<SpinLock, void>> server_task(NetFdWorkqueue&              fdwq,
-                                                     std::shared_ptr<SharedState> state,
-                                                     std::filesystem::path        static_root,
-                                                     std::string                  host,
-                                                     uint16_t                     port)
+HttpResponse make_progress_response(const std::shared_ptr<SharedState>& state)
 {
-    net::tcp_listener<SpinLock> listener(fdwq.base(), fdwq.reactor());
-    listener.bind_listen(host, port, 128);
-    g_listener_fd.store(listener.native_handle(), std::memory_order_release);
+    size_t                                total_items { 0 };
+    size_t                                completed_items { 0 };
+    bool                                  fetching { false };
+    std::string                           last_data_time;
+    std::string                           last_progress_time;
+    std::chrono::system_clock::time_point progress_tp { std::chrono::system_clock::time_point::min() };
 
-    CO_WQ_LOG_INFO("[bili] http server listening on %s:%u", host.c_str(), static_cast<unsigned>(port));
-
-    while (!g_stop.load(std::memory_order_acquire)) {
-        int fd = co_await listener.accept();
-        if (fd == net::k_accept_fatal) {
-            CO_WQ_LOG_ERROR("[bili] accept fatal error, shutting down");
-            break;
-        }
-        if (fd < 0)
-            continue;
-        auto socket = fdwq.adopt_tcp_socket(fd);
-        auto task   = handle_client(std::move(socket), state, static_root);
-        post_to(task, fdwq.base());
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        total_items     = state->total_items;
+        completed_items = state->completed_items;
+        fetching        = state->fetching;
+        progress_tp     = state->progress_updated;
+        last_data_time  = state->last_modified;
     }
 
-    listener.close();
-    g_listener_fd.store(net::os::invalid_fd(), std::memory_order_release);
-    co_return;
+    if (progress_tp != std::chrono::system_clock::time_point::min())
+        last_progress_time = format_http_date(progress_tp);
+
+    double percent = 0.0;
+    if (total_items > 0)
+        percent = static_cast<double>(completed_items) / static_cast<double>(total_items) * 100.0;
+
+    nlohmann::json status_json;
+    status_json["fetching"]       = fetching;
+    status_json["completed"]      = completed_items;
+    status_json["total"]          = total_items;
+    status_json["percent"]        = percent;
+    status_json["last_data_time"] = last_data_time;
+    status_json["progress_time"]  = last_progress_time;
+
+    HttpResponse resp;
+    resp.set_status(200, "OK");
+    resp.set_header("content-type", "application/json; charset=utf-8");
+    resp.set_header("cache-control", "no-store");
+    resp.set_body(status_json.dump());
+    return resp;
 }
+
+// (removed unused make_static_file_response helper)
+
+// (removed legacy handle_client coroutine)
+
+// server_task removed: using HttpEasyServer in main instead
 
 struct Options {
     std::string           host { "0.0.0.0" };
@@ -988,12 +812,14 @@ struct Options {
     std::chrono::seconds  interval { 300 };
     std::filesystem::path static_root { "bilibili-online-ranking" };
     bool                  verify_peer { false };
+    bool                  log_error_json { false };
 };
 
 void print_usage(const char* argv0)
 {
     std::fprintf(stderr,
-                 "Usage: %s [--host HOST] [--port PORT] [--interval SECONDS] [--static-root PATH] [--verify]\n",
+                 "Usage: %s [--host HOST] [--port PORT] [--interval SECONDS] [--static-root PATH] [--verify]"
+                 " [--log-json]\n",
                  argv0);
 }
 
@@ -1017,6 +843,8 @@ std::optional<Options> parse_options(int argc, char* argv[])
             opts.verify_peer = true;
         } else if (arg == "--insecure") {
             opts.verify_peer = false;
+        } else if (arg == "--log-json") {
+            opts.log_error_json = true;
         } else if (arg == "--help") {
             print_usage(argv[0]);
             return std::nullopt;
@@ -1092,14 +920,43 @@ int main(int argc, char* argv[])
 
     auto state = std::make_shared<SharedState>();
 
-    auto poll_task = polling_task(fdwq, state, data_path, opts.interval, opts.verify_peer);
-    auto srv_task  = server_task(fdwq, state, static_root, opts.host, opts.port);
+    auto poll_task = polling_task(fdwq, state, data_path, opts.interval, opts.verify_peer, opts.log_error_json);
+
+    // Start HttpEasyServer and register routes
+    net::http::HttpEasyServer server(fdwq);
+    auto&                     router = server.router();
+    router.get("/", [state](const HttpRequest&) { return make_index_response(); });
+    router.get("/index.html", [state](const HttpRequest&) { return make_index_response(); });
+    router.get("/data.json", [state](const HttpRequest&) { return make_data_response(state); });
+    router.get("/progress", [state](const HttpRequest&) { return make_progress_response(state); });
+    router.get("/progress.json", [state](const HttpRequest&) { return make_progress_response(state); });
+    router.get("/status", [state](const HttpRequest&) { return make_progress_response(state); });
+    router.serve_static("/static", static_root);
+
+    router.add_middleware([](const HttpRequest&, HttpResponse& resp) {
+        if (!resp.has_header("content-type"))
+            resp.set_header("content-type", "text/plain; charset=utf-8");
+        resp.set_header("server", "co_wq-http");
+    });
+
+    HttpEasyServer::Config cfg;
+    cfg.host            = opts.host;
+    cfg.port            = opts.port;
+    cfg.verbose_logging = true;
+#if defined(USING_SSL)
+    // keep options default (no TLS) unless configured via env or args
+#endif
+
+    if (!server.start(cfg)) {
+        CO_WQ_LOG_ERROR("[bili] failed to start HttpEasyServer");
+        return 1;
+    }
+
+    g_server_ptr.store(&server, std::memory_order_release);
 
     auto             poll_coroutine = poll_task.get();
     auto&            poll_promise   = poll_coroutine.promise();
-    auto             srv_coroutine  = srv_task.get();
-    auto&            srv_promise    = srv_coroutine.promise();
-    std::atomic_int  pending { 2 };
+    std::atomic_int  pending { 1 };
     std::atomic_bool finished { false };
     struct CompletionState {
         std::atomic_int*  pending;
@@ -1116,19 +973,23 @@ int main(int argc, char* argv[])
         if (state->pending->fetch_sub(1, std::memory_order_acq_rel) == 1)
             state->finished->store(true, std::memory_order_release);
     };
-    srv_promise.mUserData    = &completion;
-    srv_promise.mOnCompleted = [](Promise_base& pb) {
-        auto* state = static_cast<CompletionState*>(pb.mUserData);
-        if (!state || !state->pending || !state->finished)
-            return;
-        if (state->pending->fetch_sub(1, std::memory_order_acq_rel) == 1)
-            state->finished->store(true, std::memory_order_release);
-    };
 
-    post_to(poll_task, wq);
-    post_to(srv_task, wq);
+    bool stop_requested_early = g_stop.load(std::memory_order_acquire);
+    if (stop_requested_early) {
+        finished.store(true, std::memory_order_release);
+        server.request_stop();
+    } else {
+        post_to(poll_task, wq);
+    }
 
+    // wait until polling task finishes or signal triggers stop
     sys_wait_until(finished);
+
+    // request server stop and wait for it
+    server.request_stop();
+    server.wait();
+
+    g_server_ptr.store(nullptr, std::memory_order_release);
     g_finished_ptr.store(nullptr, std::memory_order_release);
 
     return 0;

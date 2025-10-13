@@ -3,13 +3,16 @@
 #include "callback_wq.hpp"
 #include "io_serial.hpp"
 #include "tcp_socket.hpp"
+#include "tls_utils.hpp"
 #include "udp_socket.hpp"
 #include "worker.hpp"
+
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -17,12 +20,19 @@
 #include <string>
 #include <utility>
 
+#ifdef max
+#undef max
+#endif
+#ifdef min
+#undef min
+#endif
+
 namespace co_wq::net {
 
 enum class tls_mode { Client, Server };
 enum class dtls_mode { Client, Server };
 
-using os::ssize_t;
+using ssize_type = std::ptrdiff_t;
 
 namespace detail {
 
@@ -68,15 +78,7 @@ namespace detail {
      */
     inline std::string collect_errors()
     {
-        BIO* bio = BIO_new(BIO_s_mem());
-        if (!bio)
-            return "unknown";
-        ERR_print_errors(bio);
-        BUF_MEM* mem = nullptr;
-        BIO_get_mem_ptr(bio, &mem);
-        std::string out = (mem && mem->data) ? std::string(mem->data, mem->length) : std::string {};
-        BIO_free(bio);
-        return out;
+        return tls_utils::collect_error_stack();
     }
 
     /**
@@ -382,7 +384,7 @@ public:
         void*             buf;
         size_t            len;
         size_t            recvd { 0 };
-        ssize_t           err { 0 };
+        ssize_type        err { 0 };
         bool              full { false };
         uint32_t          wait_mask { 0 };
 
@@ -432,11 +434,11 @@ public:
             return 0;
         }
 
-        ssize_t await_resume() const noexcept
+        ssize_type await_resume() const noexcept
         {
             if (err < 0 && recvd == 0)
                 return err;
-            return static_cast<ssize_t>(recvd);
+            return static_cast<ssize_type>(recvd);
         }
     };
 
@@ -448,7 +450,7 @@ public:
         const void*       buf;
         size_t            len;
         size_t            sent { 0 };
-        ssize_t           err { 0 };
+        ssize_type        err { 0 };
         bool              full { false };
         uint32_t          wait_mask { 0 };
 
@@ -498,11 +500,11 @@ public:
             return 0;
         }
 
-        ssize_t await_resume() const noexcept
+        ssize_type await_resume() const noexcept
         {
             if (err < 0 && sent == 0)
                 return err;
-            return static_cast<ssize_t>(sent);
+            return static_cast<ssize_type>(sent);
         }
     };
 

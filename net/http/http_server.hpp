@@ -1,6 +1,8 @@
 #pragma once
 
-#include "http_common.hpp"
+#include "http1_common.hpp"
+#include "http_message.hpp"
+#include "parser.hpp"
 
 #include <llhttp.h>
 
@@ -9,26 +11,21 @@
 
 namespace co_wq::net::http {
 
-struct HttpRequest {
-    std::string method;
-    std::string target;
-    Headers     headers;
-    std::string body;
-};
-
-class Http1RequestParser {
+class Http1RequestParser : public IHttpRequestParser, protected Http1HeaderCollector {
 public:
     Http1RequestParser();
 
-    void reset();
-    bool feed(std::string_view data, std::string* error_reason = nullptr);
-    bool finish(std::string* error_reason = nullptr);
+    ParserProtocol protocol() const override { return ParserProtocol::Http1; }
 
-    bool               headers_complete() const { return headers_complete_; }
-    bool               message_complete() const { return message_complete_; }
-    const HttpRequest& request() const { return request_; }
-    bool               has_error() const { return has_error_; }
-    const std::string& last_error() const { return error_reason_; }
+    void reset() override;
+    bool feed(std::string_view data, std::string* error_reason = nullptr) override;
+    bool finish(std::string* error_reason = nullptr) override;
+
+    bool               is_headers_complete() const override { return headers_complete_; }
+    bool               is_message_complete() const override { return message_complete_; }
+    const HttpRequest& request() const override { return request_; }
+    bool               has_error() const override { return has_error_; }
+    const std::string& last_error() const override { return error_reason_; }
 
 private:
     static int on_message_begin(llhttp_t* parser);
@@ -41,25 +38,16 @@ private:
     static int on_body(llhttp_t* parser, const char* at, size_t length);
     static int on_message_complete(llhttp_t* parser);
 
-    void store_header();
+    void handle_header(std::string&& name, std::string&& value) override;
     void clear_state();
 
     llhttp_t          parser_ {};
     llhttp_settings_t settings_ {};
     HttpRequest       request_ {};
-    std::string       current_field_;
-    std::string       current_value_;
     bool              headers_complete_ { false };
     bool              message_complete_ { false };
     bool              has_error_ { false };
     std::string       error_reason_;
-};
-
-struct HttpResponse {
-    int         status_code { 200 };
-    std::string reason { "OK" };
-    std::string body;
-    Headers     headers;
 };
 
 std::string build_http1_response(const HttpResponse& response, bool close_connection = true);

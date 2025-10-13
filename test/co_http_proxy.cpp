@@ -3,8 +3,8 @@
 // 支持常见的 HTTP/1.1 正向代理语义（绝对 URI + CONNECT 隧道），示例演示如何
 // 使用 fd_workqueue 接受客户端连接、解析请求并桥接到上游服务器。
 
-#include "syswork.hpp"
-#include "test_sys_stats_logger.hpp"
+#include "co_syswork.hpp"
+#include "co_test_sys_stats_logger.hpp"
 
 #include "dns_resolver.hpp"
 #include "fd_base.hpp"
@@ -13,13 +13,15 @@
 #include "when_all.hpp"
 #include "worker.hpp"
 
+#include "http/http_client.hpp"
+#include "http/http_common.hpp"
+
 #include <llhttp.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -27,7 +29,6 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -57,82 +58,16 @@ using namespace co_wq;
 
 using NetFdWorkqueue = net::fd_workqueue<SpinLock, net::epoll_reactor>;
 
+namespace http = co_wq::net::http;
+
 namespace {
 
 std::string to_lower(std::string_view input)
 {
-    std::string result;
-    result.reserve(input.size());
-    for (unsigned char ch : input)
-        result.push_back(static_cast<char>(std::tolower(ch)));
-    return result;
+    return http::to_lower(input);
 }
 
-bool parse_port(std::string_view input, uint16_t& port_out)
-{
-    if (input.empty() || input.size() > 5)
-        return false;
-
-    uint32_t value = 0;
-    for (unsigned char ch : input) {
-        if (!std::isdigit(ch))
-            return false;
-        value = value * 10 + static_cast<uint32_t>(ch - '0');
-        if (value > std::numeric_limits<uint16_t>::max())
-            return false;
-    }
-    port_out = static_cast<uint16_t>(value);
-    return true;
-}
-
-bool split_host_port(std::string_view input, uint16_t default_port, std::string& host_out, uint16_t& port_out)
-{
-    host_out.clear();
-    port_out = default_port;
-
-    if (input.empty())
-        return false;
-
-    if (input.front() == '[') {
-        auto closing = input.find(']');
-        if (closing == std::string_view::npos)
-            return false;
-        host_out.assign(input.substr(1, closing - 1));
-        if (closing + 1 == input.size())
-            return true;
-        if (input[closing + 1] != ':')
-            return false;
-        std::string_view port_part = input.substr(closing + 2);
-        uint16_t         port      = 0;
-        if (!parse_port(port_part, port))
-            return false;
-        port_out = port;
-        return true;
-    }
-
-    auto first_colon = input.find(':');
-    auto last_colon  = input.rfind(':');
-    if (first_colon != std::string_view::npos && first_colon == last_colon) {
-        std::string_view host_part = input.substr(0, first_colon);
-        std::string_view port_part = input.substr(first_colon + 1);
-        if (host_part.empty())
-            return false;
-        uint16_t port = 0;
-        if (!parse_port(port_part, port))
-            return false;
-        host_out.assign(host_part);
-        port_out = port;
-        return true;
-    }
-
-    host_out.assign(input);
-    return true;
-}
-
-struct HeaderEntry {
-    std::string name;
-    std::string value;
-};
+using HeaderEntry = http::HeaderEntry;
 
 struct HttpProxyContext {
     std::string                                  method;
@@ -420,42 +355,17 @@ Task<void, Work_Promise<SpinLock, void>> pipe_data(SrcSocket&   src,
     co_return;
 }
 
-struct UrlParts {
-    std::string host;
-    uint16_t    port { 80 };
-    std::string path { "/" };
-};
+using UrlParts = http::UrlParts;
 
 // 解析绝对形式的 HTTP URL（scheme://host[:port]/path）。
 std::optional<UrlParts> parse_http_url(const std::string& url)
 {
-    auto pos = url.find("://");
-    if (pos == std::string::npos)
+    auto parsed = http::parse_url(url);
+    if (!parsed)
         return std::nullopt;
-    std::string scheme = to_lower(url.substr(0, pos));
-    if (scheme != "http")
+    if (parsed->scheme != "http")
         return std::nullopt;
-    size_t rest_idx = pos + 3;
-    if (rest_idx >= url.size())
-        return std::nullopt;
-
-    auto        slash_pos = url.find('/', rest_idx);
-    std::string authority = slash_pos == std::string::npos ? url.substr(rest_idx)
-                                                           : url.substr(rest_idx, slash_pos - rest_idx);
-    std::string path      = slash_pos == std::string::npos ? std::string("/") : url.substr(slash_pos);
-    if (authority.empty())
-        return std::nullopt;
-    UrlParts    parts;
-    std::string host_value;
-    uint16_t    port_value = 80;
-    if (!split_host_port(authority, 80, host_value, port_value))
-        return std::nullopt;
-    parts.host = std::move(host_value);
-    parts.port = port_value;
-    if (parts.host.empty())
-        return std::nullopt;
-    parts.path = std::move(path);
-    return parts;
+    return parsed;
 }
 
 struct ConnectTarget {
@@ -471,7 +381,7 @@ std::optional<ConnectTarget> parse_connect_target(const std::string& target)
     std::string   host;
     uint16_t      port = 443;
     ConnectTarget ct;
-    if (!split_host_port(target, 443, host, port))
+    if (!http::split_host_port(target, 443, host, port))
         return std::nullopt;
     ct.host = std::move(host);
     ct.port = port;

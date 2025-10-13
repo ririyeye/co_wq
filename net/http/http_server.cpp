@@ -2,6 +2,8 @@
 
 #include <llhttp.h>
 
+#include <utility>
+
 namespace co_wq::net::http {
 
 Http1RequestParser::Http1RequestParser()
@@ -31,12 +33,8 @@ void Http1RequestParser::reset()
 
 void Http1RequestParser::clear_state()
 {
-    request_.method.clear();
-    request_.target.clear();
-    request_.headers.clear();
-    request_.body.clear();
-    current_field_.clear();
-    current_value_.clear();
+    request_.reset();
+    reset_header_state();
     headers_complete_ = false;
     message_complete_ = false;
 }
@@ -102,29 +100,28 @@ int Http1RequestParser::on_url(llhttp_t* parser, const char* at, size_t length)
 int Http1RequestParser::on_header_field(llhttp_t* parser, const char* at, size_t length)
 {
     auto* self = static_cast<Http1RequestParser*>(parser->data);
-    if (!self->current_value_.empty())
-        self->store_header();
-    self->current_field_.append(at, length);
+    self->collect_header_field(at, length);
     return 0;
 }
 
 int Http1RequestParser::on_header_value(llhttp_t* parser, const char* at, size_t length)
 {
     auto* self = static_cast<Http1RequestParser*>(parser->data);
-    self->current_value_.append(at, length);
+    self->collect_header_value(at, length);
     return 0;
 }
 
 int Http1RequestParser::on_header_value_complete(llhttp_t* parser)
 {
     auto* self = static_cast<Http1RequestParser*>(parser->data);
-    self->store_header();
+    self->finalize_header_value();
     return 0;
 }
 
 int Http1RequestParser::on_headers_complete(llhttp_t* parser)
 {
-    auto* self              = static_cast<Http1RequestParser*>(parser->data);
+    auto* self = static_cast<Http1RequestParser*>(parser->data);
+    self->request_.set_http_version(parser->http_major, parser->http_minor);
     self->headers_complete_ = true;
     return 0;
 }
@@ -143,20 +140,22 @@ int Http1RequestParser::on_message_complete(llhttp_t* parser)
     return 0;
 }
 
-void Http1RequestParser::store_header()
+void Http1RequestParser::handle_header(std::string&& name, std::string&& value)
 {
-    if (current_field_.empty())
+    if (name.empty())
         return;
-    request_.headers[to_lower(current_field_)] = current_value_;
-    current_field_.clear();
-    current_value_.clear();
+    request_.set_header(to_lower(name), std::move(value));
 }
 
 std::string build_http1_response(const HttpResponse& response, bool close_connection)
 {
     std::string out;
     out.reserve(128 + response.body.size() + response.headers.size() * 32);
-    out.append("HTTP/1.1 ");
+    out.append("HTTP/");
+    out.append(std::to_string(response.http_major()));
+    out.push_back('.');
+    out.append(std::to_string(response.http_minor()));
+    out.push_back(' ');
     out.append(std::to_string(response.status_code));
     out.push_back(' ');
     if (!response.reason.empty())
@@ -166,6 +165,7 @@ std::string build_http1_response(const HttpResponse& response, bool close_connec
     bool has_content_type   = false;
     bool has_content_length = false;
     bool has_connection     = false;
+    bool has_transfer_enc   = false;
 
     for (const auto& kv : response.headers) {
         if (iequals(kv.first, "content-type"))
@@ -174,6 +174,8 @@ std::string build_http1_response(const HttpResponse& response, bool close_connec
             has_content_length = true;
         if (iequals(kv.first, "connection"))
             has_connection = true;
+        if (iequals(kv.first, "transfer-encoding"))
+            has_transfer_enc = true;
         out.append(kv.first);
         out.append(": ");
         out.append(kv.second);
@@ -183,14 +185,18 @@ std::string build_http1_response(const HttpResponse& response, bool close_connec
     if (!has_content_type)
         out.append("Content-Type: text/plain; charset=utf-8\r\n");
 
-    if (!has_content_length) {
+    if (!has_content_length && !has_transfer_enc) {
         out.append("Content-Length: ");
         out.append(std::to_string(response.body.size()));
         out.append("\r\n");
     }
 
-    if (close_connection && !has_connection)
-        out.append("Connection: close\r\n");
+    bool want_close = close_connection || response.close_connection;
+    if (!has_connection) {
+        out.append("Connection: ");
+        out.append(want_close ? "close" : "keep-alive");
+        out.append("\r\n");
+    }
 
     out.append("\r\n");
     out.append(response.body);

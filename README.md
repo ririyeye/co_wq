@@ -22,6 +22,9 @@
 - `third_party/llhttp/`：HTTP 解析器子模块（来源于 [nodejs/llhttp](https://github.com/nodejs/llhttp.git)）。
 - `script/gen_selfsigned_cert.py`：跨平台生成 TLS 自签证书的辅助脚本。
 
+## 文档
+- [HTTP 模块设计概览](docs/http.md)：介绍 `HttpEasyClient`/`HttpEasyServer`、`HttpRouter` 与相关示例的使用方式，以及与 libhv 等实现的差异对比。
+
 ## 快速开始
 
 ### 依赖
@@ -121,15 +124,15 @@ python3 script/xmk.py clean --remove-global-cache
 ## 手动使用 xmake
 默认配置仅输出核心组件（`task/` 与 `sync/`），无额外第三方依赖。可通过下表开关选择性启用模块：
 
-| 选项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `USING_NET` | `false` | 启用网络相关头文件与依赖（TCP/UDP/TLS/WebSocket 等） |
-| `USING_SSL` | `false` | 链接 OpenSSL，暴露 TLS/DTLS/socket TLS awaiter |
-| `USE_BUNDLED_LLHTTP` | `true` | 使用内置 `llhttp` 包处理 HTTP/WebSocket 升级（仅在 `USING_NET=y` 时生效） |
-| `USE_BUNDLED_NGHTTP2` | `true` | 使用内置 `nghttp2` 包以启用 HTTP/2 相关能力（仅在 `USING_NET=y` 时生效） |
-| `USING_USB` | `false` | 启用基于 libusb 的 USB 协程封装 |
-| `USING_EXAMPLE` | `false` | 构建 `test/` 目录下示例程序（需要配合 `USING_NET=y`） |
-| `ENABLE_LOGGING` | `true` | 打开 fmt/spdlog 依赖与日志输出宏，若构建极简核心可设为 `false` |
+| 选项                  | 默认值  | 说明                                                                                      |
+|-----------------------|---------|-------------------------------------------------------------------------------------------|
+| `USING_NET`           | `false` | 启用网络相关头文件与依赖（TCP/UDP/TLS/WebSocket 等）                                        |
+| `USING_SSL`           | `false` | 链接 OpenSSL，暴露 TLS/DTLS/socket TLS awaiter                                             |
+| `USE_BUNDLED_LLHTTP`  | `true`  | 使用内置 `llhttp` 包处理 HTTP/WebSocket 升级（仅在 `USING_NET=y` 时生效）                   |
+| `USE_BUNDLED_NGHTTP2` | `true`  | 使用内置 `nghttp2` 包以启用 HTTP/2 相关能力（仅在 `USING_NET=y` 时生效）                    |
+| `USING_USB`           | `false` | 启用基于 libusb 的 USB 协程封装                                                           |
+| `USING_EXAMPLE`       | `false` | 构建 `test/` 目录下示例程序（需要配合 `USING_NET=y`）                                       |
+| `ENABLE_LOGGING`      | `true`  | 打开 fmt/spdlog 依赖与日志输出宏，若构建极简核心可设为 `false`                             |
 | `MSVC_ITERATOR_DEBUG` | `false` | Windows/MSVC 专用，启用 `_ITERATOR_DEBUG_LEVEL=2` 并关闭向量化算法，便于定位 STL 迭代器越界 |
 
 最小化构建示例：

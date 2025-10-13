@@ -90,6 +90,9 @@ add_includedirs(
     "sync", { public = true }
 )
 
+add_headerfiles("task/**.hpp", "task/**.h")
+add_headerfiles("sync/**.hpp", "sync/**.h")
+
 
 if has_config("ENABLE_LOGGING") then
     add_defines("CO_WQ_ENABLE_LOGGING=1", { public = true })
@@ -100,12 +103,26 @@ else
 end
 
 if get_config("USING_NET") then
+    add_headerfiles("io/**.hpp", "io/**.h")
+    add_headerfiles("net/**.hpp", "net/**.h")
     add_includedirs("io", { public = true })
     add_includedirs("net", { public = true })
     add_includedirs("net/http", { public = true })
     add_defines("USING_NET", { public = true })
     add_files("net/dns_resolver.cpp")
-    add_files("net/http/http_common.cpp", "net/http/http_server.cpp", "net/http/http_client.cpp")
+    add_files("net/http/http_common.cpp",
+        "net/http/http_server.cpp",
+        "net/http/http_client.cpp",
+        "net/http/http_router.cpp",
+        "net/http/http_easy_client.cpp",
+        "net/http/http_easy_server.cpp",
+        "net/http/http_message.cpp",
+        "net/http/http_cli.cpp",
+        "net/http/http1_parser.cpp",
+        "net/http/http2_parser.cpp",
+        "net/http/http2_session.cpp",
+        "net/http/http2_server_session.cpp",
+        "net/http/http2_client_session.cpp")
     if is_plat("windows") then
         add_links("Ws2_32")
         add_files("io/wepoll/wepoll.c")
@@ -123,6 +140,7 @@ if get_config("USING_NET") then
     if get_config("USING_SSL") then
         add_defines("USING_SSL", { public = true })
         add_packages("openssl3", { public = true })
+        add_files("net/tls_utils.cpp")
     end
 end
 
