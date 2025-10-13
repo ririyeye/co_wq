@@ -12,11 +12,16 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#if !defined(_WIN32)
+#include <netdb.h>
+#include <sys/socket.h>
+#endif
+#if !defined(USING_SSL)
 #include <stdexcept>
+#endif
 #include <string>
 #include <string_view>
 #include <utility>

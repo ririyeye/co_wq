@@ -24,6 +24,7 @@ typedef SSIZE_T ssize_t;
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdarg>
 #if !defined(_WIN32)
 #include <arpa/inet.h>

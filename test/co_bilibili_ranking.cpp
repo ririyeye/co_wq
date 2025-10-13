@@ -68,11 +68,7 @@ using http::HttpResponse;
 namespace {
 
 static const unsigned char kIndexHtmlData[] = {
-#if __has_include("index.html.h")
-#include "index.html.h"
-#else
-#include "index_html.h"
-#endif
+#include "bili_index.html.h"
 };
 
 static constexpr std::size_t  kIndexHtmlSize = sizeof(kIndexHtmlData);
@@ -387,16 +383,12 @@ fetch_ranking(NetFdWorkqueue& fdwq, bool verify_peer)
     constexpr uint16_t    port   = 443;
     constexpr const char* target = "/x/web-interface/ranking/v2?rid=0&type=all";
 
-    auto json_opt = co_await http_get_json(fdwq,
-                                           host,
-                                           port,
-                                           target,
-                                           {
-                                               { "Referer", "https://www.bilibili.com/v/popular/rank/all"            },
-                                               { "Origin",  "https://www.bilibili.com"                               },
-                                               { "Cookie",  "buvid3=2D4B09A5-0E5F-4537-9F7C-E293CE7324F7167646infoc" }
-    },
-                                           verify_peer);
+    const std::unordered_map<std::string, std::string> ranking_headers {
+        { "Referer", "https://www.bilibili.com/v/popular/rank/all"            },
+        { "Origin",  "https://www.bilibili.com"                               },
+        { "Cookie",  "buvid3=2D4B09A5-0E5F-4537-9F7C-E293CE7324F7167646infoc" }
+    };
+    auto json_opt = co_await http_get_json(fdwq, host, port, target, ranking_headers, verify_peer);
     if (!json_opt.has_value())
         co_return std::nullopt;
 
@@ -475,18 +467,13 @@ Task<void, Work_Promise<SpinLock, void>> fetch_online_count_entry(NetFdWorkqueue
     constexpr const char* host = "api.bilibili.com";
     constexpr uint16_t    port = 443;
 
-    std::string path        = "/x/player/online/total?bvid=" + entry.bvid + "&cid=" + std::to_string(entry.cid);
-    auto        online_json = co_await http_get_json(
-        fdwq,
-        host,
-        port,
-        path,
-        {
-            { "Referer", "https://www.bilibili.com/video/" + entry.bvid           },
-            { "Origin",  "https://www.bilibili.com"                               },
-            { "Cookie",  "buvid3=2D4B09A5-0E5F-4537-9F7C-E293CE7324F7167646infoc" }
-    },
-        verify_peer);
+    std::string path = "/x/player/online/total?bvid=" + entry.bvid + "&cid=" + std::to_string(entry.cid);
+    const std::unordered_map<std::string, std::string> online_headers {
+        { "Referer", "https://www.bilibili.com/video/" + entry.bvid           },
+        { "Origin",  "https://www.bilibili.com"                               },
+        { "Cookie",  "buvid3=2D4B09A5-0E5F-4537-9F7C-E293CE7324F7167646infoc" }
+    };
+    auto online_json = co_await http_get_json(fdwq, host, port, path, online_headers, verify_peer);
     if (online_json.has_value() && online_json->contains("code") && (*online_json)["code"].get<int>() == 0) {
         try {
             const auto& total_field = (*online_json)["data"]["total"];
