@@ -67,6 +67,7 @@ def configure_and_build(
     iterator_debug: bool,
     network_mode: str | None,
     enable_usb: bool,
+    enable_msquic: bool,
     proxy_url: str | None,
 ) -> None:
     env = os.environ.copy()
@@ -84,6 +85,7 @@ def configure_and_build(
 
     config_flags: list[str]
     usb_flag = "y" if enable_usb else "n"
+    msquic_flag = "y" if enable_msquic else "n"
 
     if mode == "full":
         config_flags = [
@@ -92,6 +94,7 @@ def configure_and_build(
             "--USE_BUNDLED_LLHTTP=y",
             "--USE_BUNDLED_NGHTTP2=y",
             f"--USING_USB={usb_flag}",
+            f"--USING_QUIC_MSQUIC={msquic_flag}",
             "--ENABLE_LOGGING=y",
             "--USING_EXAMPLE=y",
         ]
@@ -102,6 +105,7 @@ def configure_and_build(
             "--USE_BUNDLED_LLHTTP=n",
             "--USE_BUNDLED_NGHTTP2=n",
             f"--USING_USB={usb_flag}",
+            f"--USING_QUIC_MSQUIC={msquic_flag}",
             "--ENABLE_LOGGING=n",
             "--USING_EXAMPLE=n",
         ]
@@ -160,8 +164,15 @@ def clean_workspace(remove_global_cache: bool) -> None:
 
 def build_command(args: argparse.Namespace) -> None:
     network_mode = getattr(args, "network_mode", None)
-    configure_and_build(args.profile, args.mode,
-                        args.msvc_iterator_debug, network_mode, args.enable_usb, args.proxy_url)
+    configure_and_build(
+        args.profile,
+        args.mode,
+        args.msvc_iterator_debug,
+        network_mode,
+        args.enable_usb,
+        args.enable_msquic,
+        args.proxy_url,
+    )
 
 
 def clean_command(args: argparse.Namespace) -> None:
@@ -230,6 +241,19 @@ def main(argv: list[str]) -> int:
         help="Disable USB support (default)",
     )
     build_parser.set_defaults(enable_usb=False)
+    build_parser.add_argument(
+        "--with-msquic",
+        dest="enable_msquic",
+        action="store_true",
+        help="Enable MsQuic based QUIC support",
+    )
+    build_parser.add_argument(
+        "--without-msquic",
+        dest="enable_msquic",
+        action="store_false",
+        help="Disable MsQuic based QUIC support (default)",
+    )
+    build_parser.set_defaults(enable_msquic=False)
     build_parser.add_argument(
         "--proxy",
         dest="proxy_url",

@@ -35,6 +35,12 @@ option("USING_USB")
 set_default(false)
 option_end()
 
+option("USING_QUIC_MSQUIC")
+set_default(false)
+set_showmenu(true)
+set_description("Enable MsQuic based QUIC support")
+option_end()
+
 -- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
 set_default(false)
@@ -61,6 +67,9 @@ if get_config("USING_NET") then
     end
     if get_config("USING_SSL") then
         add_requires("openssl3")
+    end
+    if get_config("USING_QUIC_MSQUIC") then
+        add_requires("msquic")
     end
 end
 
@@ -141,6 +150,10 @@ if get_config("USING_NET") then
         add_defines("USING_SSL", { public = true })
         add_packages("openssl3", { public = true })
         add_files("net/tls_utils.cpp")
+    end
+    if get_config("USING_QUIC_MSQUIC") then
+        add_defines("USING_QUIC_MSQUIC", { public = true })
+        add_packages("msquic", { public = true })
     end
 end
 
