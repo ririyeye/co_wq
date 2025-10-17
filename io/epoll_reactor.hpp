@@ -112,6 +112,23 @@ public:
             post_via_route(_exec, *wi.waiter);
     }
 
+    bool cancel_waiter(fd_t fd, io_waiter_base* waiter)
+    {
+        if (!waiter)
+            return false;
+        std::scoped_lock<lock> lk(_lk);
+        auto                   it = _fds.find(fd);
+        if (it == _fds.end())
+            return false;
+        auto& vec = it->second.waiters;
+        auto  pos = std::find_if(vec.begin(), vec.end(), [&](const waiter_item& wi) { return wi.waiter == waiter; });
+        if (pos == vec.end())
+            return false;
+        vec.erase(pos);
+        update_fd_interest_unlocked(fd, it->second);
+        return true;
+    }
+
 private:
     struct waiter_item {
         uint32_t                              mask { 0 };
@@ -166,6 +183,9 @@ private:
     {
         for (auto& wi : timed_out) {
             if (wi.waiter) {
+                CO_WQ_LOG_WARN("[epoll reactor] waiter timeout waiter=%p mask=0x%x",
+                               static_cast<void*>(wi.waiter),
+                               wi.mask);
                 if (wi.waiter->timeout_func)
                     wi.waiter->timeout_func(static_cast<worknode*>(wi.waiter));
                 post_via_route(_exec, *wi.waiter);

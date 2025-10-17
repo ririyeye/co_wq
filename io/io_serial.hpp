@@ -167,6 +167,9 @@ template <class Derived, serial_owner Owner> struct two_phase_drain_awaiter : se
     static void drive_cb(worknode* w)
     {
         auto* self = static_cast<Derived*>(w);
+        if constexpr (requires(Owner& o, io_waiter_base* node) { o.on_waiter_resumed(node); }) {
+            self->owner.on_waiter_resumed(self);
+        }
         while (true) {
             int r = self->attempt_once();
             if (r > 0)

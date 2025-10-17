@@ -88,17 +88,30 @@ template <lockable lock> class callback_wq {
                 return snap;
             if (!is_pointer_plausible(waiter))
                 return snap;
-            snap.debug_name       = waiter->debug_name ? waiter->debug_name : "<null-name>";
-            snap.debug_magic      = waiter->debug_magic;
-            snap.route_ctx        = waiter->route_ctx;
-            snap.func_ptr         = reinterpret_cast<void*>(waiter->func);
-            snap.haddr            = waiter->h ? waiter->h.address() : nullptr;
-            snap.already_enqueued = waiter->callback_enqueued.load(std::memory_order_acquire);
-            auto guard            = waiter->load_route_guard();
-            if (guard) {
-                snap.guard_use = io_waiter_base::route_guard_use_count(guard);
-                snap.guard_ptr = guard.get();
+            snap.debug_magic = waiter->debug_magic;
+            bool magic_ok    = snap.debug_magic == io_waiter_base::debug_magic_value;
+
+            if (magic_ok) {
+                snap.debug_name       = waiter->debug_name ? waiter->debug_name : "<null-name>";
+                snap.route_ctx        = waiter->route_ctx;
+                snap.func_ptr         = reinterpret_cast<void*>(waiter->func);
+                snap.haddr            = waiter->h ? waiter->h.address() : nullptr;
+                snap.already_enqueued = waiter->callback_enqueued.load(std::memory_order_acquire);
+                auto guard            = waiter->load_route_guard();
+                if (guard) {
+                    snap.guard_use = io_waiter_base::route_guard_use_count(guard);
+                    snap.guard_ptr = guard.get();
+                }
+            } else {
+                snap.debug_name       = "<stale-waiter>";
+                snap.route_ctx        = nullptr;
+                snap.func_ptr         = nullptr;
+                snap.haddr            = nullptr;
+                snap.already_enqueued = false;
+                snap.guard_use        = 0;
+                snap.guard_ptr        = nullptr;
             }
+
             snap.captured = true;
             return snap;
         }
@@ -116,14 +129,6 @@ template <lockable lock> class callback_wq {
             if (!waiter)
                 return false;
             waiter->callback_enqueued.store(value, std::memory_order_release);
-            return true;
-        }
-
-        static bool reset_guard(io_waiter_base* waiter)
-        {
-            if (!waiter)
-                return false;
-            waiter->exchange_route_guard();
             return true;
         }
 
@@ -188,21 +193,11 @@ template <lockable lock> class callback_wq {
             }
             bool magic_ok = snap.debug_magic == io_waiter_base::debug_magic_value;
             if (!magic_ok) {
-                bool        guard_present = snap.guard_ptr != nullptr && snap.guard_use > 0;
-                const char* severity      = guard_present ? "warning" : "info";
-                CO_WQ_CBQ_WARN("[callback_wq] %s: post skip invalid magic node=%p waiter=%p func=%p magic=%08x "
-                               "guard_use=%ld guard_ptr=%p route_ctx=%p name=%s already=%d h=%p\n",
-                               severity,
-                               static_cast<void*>(&node),
-                               static_cast<void*>(waiter),
-                               reinterpret_cast<void*>(node.func),
-                               snap.debug_magic,
-                               snap.guard_use,
-                               snap.guard_ptr,
-                               snap.route_ctx,
-                               snap.debug_name,
-                               snap.already_enqueued ? 1 : 0,
-                               snap.haddr);
+                CO_WQ_CBQ_TRACE("[callback_wq] post skip stale waiter node=%p waiter=%p func=%p magic=%08x\n",
+                                static_cast<void*>(&node),
+                                static_cast<void*>(waiter),
+                                reinterpret_cast<void*>(node.func),
+                                snap.debug_magic);
                 return;
             }
             if (!node.func) {
@@ -391,8 +386,22 @@ template <lockable lock> class callback_wq {
                     }
 
                     bool magic_ok = snap.debug_magic == io_waiter_base::debug_magic_value;
+                    bool func_ok  = n && n->func;
+
+                    // 对已经析构的 waiter 节点不再写回 callback_enqueued，避免踩到释放或重用内存。
+                    if (!magic_ok) {
+                        CO_WQ_CBQ_TRACE("[callback_wq] drain skip stale waiter node=%p owner=%p state_id=%llu entry=%p "
+                                        "magic=%08x\n",
+                                        static_cast<void*>(n),
+                                        static_cast<void*>(this),
+                                        static_cast<unsigned long long>(id),
+                                        static_cast<void*>(entry),
+                                        snap.debug_magic);
+                        delete entry;
+                        continue;
+                    }
+
                     store_enqueued(n_waiter, false);
-                    bool func_ok = n && n->func;
 
                     if (!func_ok) {
                         CO_WQ_CBQ_WARN(
@@ -412,32 +421,6 @@ template <lockable lock> class callback_wq {
                         delete entry;
                         continue;
                     }
-                    if (!magic_ok) {
-                        CO_WQ_CBQ_WARN(
-                            "[callback_wq] warning: invalid magic node=%p func=%p owner=%p state_id=%llu route_ctx=%p "
-                            "h=%p name=%s magic=%08x guard_use=%ld entry=%p\n",
-                            static_cast<void*>(n),
-                            reinterpret_cast<void*>(n->func),
-                            static_cast<void*>(this),
-                            static_cast<unsigned long long>(id),
-                            snap.route_ctx,
-                            snap.haddr,
-                            snap.debug_name,
-                            snap.debug_magic,
-                            snap.guard_use,
-                            static_cast<void*>(entry));
-                        if (snap.guard_use > 0) {
-                            CO_WQ_CBQ_WARN(
-                                "[callback_wq] invalid magic guard reset attempt node=%p guard_use=%ld guard_ptr=%p\n",
-                                static_cast<void*>(n),
-                                snap.guard_use,
-                                snap.guard_ptr);
-                            reset_guard(n_waiter);
-                        }
-                        delete entry;
-                        continue;
-                    }
-
                     CO_WQ_CBQ_TRACE("[callback_wq] exec: node=%p func=%p owner=%p state_id=%llu route_ctx=%p h=%p "
                                     "name=%s magic=%08x "
                                     "entry=%p\n",
