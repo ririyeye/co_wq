@@ -6,6 +6,7 @@
 
 #ifdef _WIN32
 #include <BaseTsd.h>
+#include <processthreadsapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -189,6 +190,31 @@ inline int close_fd(fd_t fd)
         return -1;
     }
     return 0;
+}
+
+inline fd_t dup_fd(fd_t fd)
+{
+    ensure_wsa();
+    if (fd == invalid_fd()) {
+        errno = EBADF;
+        return invalid_fd();
+    }
+    WSAPROTOCOL_INFOW info {};
+    if (WSADuplicateSocketW(fd, GetCurrentProcessId(), &info) != 0) {
+        set_errno_from_wsa(WSAGetLastError());
+        return invalid_fd();
+    }
+    DWORD flags = WSA_FLAG_OVERLAPPED;
+#ifdef WSA_FLAG_NO_HANDLE_INHERIT
+    flags |= WSA_FLAG_NO_HANDLE_INHERIT;
+#endif
+    SOCKET dup_socket = WSASocketW(info.iAddressFamily, info.iSocketType, info.iProtocol, &info, 0, flags);
+    if (dup_socket == INVALID_SOCKET) {
+        set_errno_from_wsa(WSAGetLastError());
+        return invalid_fd();
+    }
+    SetHandleInformation(reinterpret_cast<HANDLE>(dup_socket), HANDLE_FLAG_INHERIT, 0);
+    return dup_socket;
 }
 
 inline int set_non_block(fd_t fd)
@@ -411,6 +437,21 @@ inline int close_fd(fd_t fd)
     if (fd < 0)
         return 0;
     return ::close(fd);
+}
+
+inline fd_t dup_fd(fd_t fd)
+{
+    if (fd < 0) {
+        errno = EBADF;
+        return invalid_fd();
+    }
+    fd_t duped = ::dup(fd);
+    if (duped < 0)
+        return invalid_fd();
+    int flags = ::fcntl(duped, F_GETFD);
+    if (flags >= 0)
+        ::fcntl(duped, F_SETFD, flags | FD_CLOEXEC);
+    return duped;
 }
 
 inline int set_non_block(fd_t fd)

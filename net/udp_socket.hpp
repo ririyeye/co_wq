@@ -89,6 +89,7 @@ private:
     friend class fd_workqueue<lock, Reactor>;
     /** @brief 由 fd 工作队列构造新的 UDP socket。 */
     explicit udp_socket(workqueue<lock>& exec, Reactor<lock>& reactor) : base(exec, reactor, AF_INET, SOCK_DGRAM) { }
+    explicit udp_socket(os::fd_t fd, workqueue<lock>& exec, Reactor<lock>& reactor) : base(fd, exec, reactor) { }
 
     static int inet_pton_ipv4(const std::string& host, void* addr)
     {

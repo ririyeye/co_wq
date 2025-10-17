@@ -108,4 +108,11 @@ if has_config("USING_SSL") then
     add_files("co_syswork.cpp")
     add_packages("nlohmann_json")
     target_end()
+
+    target("co_quic")
+    set_kind("binary")
+    add_deps("co_wq")
+    add_files("co_quic.cpp")
+    add_files("co_syswork.cpp")
+    target_end()
 end

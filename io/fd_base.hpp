@@ -152,9 +152,26 @@ public:
     {
         return tls_socket<lock, Reactor>(_base, _reactor, adopt_tcp_socket(fd), std::move(ctx), mode);
     }
+
+#if !defined(OPENSSL_NO_QUIC)
+    quic_socket<lock, Reactor> make_quic_socket(quic_context ctx, quic_mode mode)
+    {
+        return quic_socket<lock, Reactor>(_base, _reactor, make_udp_socket(), std::move(ctx), mode);
+    }
+#endif
 #endif
 
     udp_socket<lock, Reactor> make_udp_socket() { return udp_socket<lock, Reactor>(_base, _reactor); }
+
+    udp_socket<lock, Reactor> adopt_udp_socket(os::fd_t fd) { return udp_socket<lock, Reactor>(fd, _base, _reactor); }
+
+    udp_socket<lock, Reactor> duplicate_udp_socket(const udp_socket<lock, Reactor>& source)
+    {
+        auto dup_fd = os::dup_fd(source.native_handle());
+        if (dup_fd == os::invalid_fd())
+            throw std::runtime_error("dup udp socket failed");
+        return adopt_udp_socket(dup_fd);
+    }
 
 #if defined(_WIN32)
     file_handle<lock, Reactor> make_file(HANDLE h) { return file_handle<lock, Reactor>(_base, _reactor, h); }

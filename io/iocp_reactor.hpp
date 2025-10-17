@@ -166,6 +166,23 @@ public:
 
     void post_completion(io_waiter_base* w) { post_via_route(_exec, *w); }
 
+    bool cancel_waiter(int fd, io_waiter_base* waiter)
+    {
+        if (!waiter)
+            return false;
+        std::scoped_lock<lock> lk(_lk);
+        auto                   it = _fds.find(fd);
+        if (it == _fds.end())
+            return false;
+        auto& vec = it->second.waiters;
+        auto  pos = std::find_if(vec.begin(), vec.end(), [&](const waiter_item& wi) { return wi.waiter == waiter; });
+        if (pos == vec.end())
+            return false;
+        vec.erase(pos);
+        update_fd_interest_unlocked(fd, it->second);
+        return true;
+    }
+
 private:
     struct waiter_item {
         uint32_t        mask { 0 };
