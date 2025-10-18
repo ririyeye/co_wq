@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
 #include <mutex>
+#endif
 #include <string>
 
 #ifdef _WIN32
@@ -468,6 +470,23 @@ using ::iovec;
 inline fd_t invalid_fd() noexcept
 {
     return -1;
+}
+
+inline std::string format_errno(int err)
+{
+    if (err == 0)
+        return "success";
+    char buf[128] {};
+#if defined(_GNU_SOURCE)
+    char* msg = ::strerror_r(err, buf, sizeof(buf));
+    if (!msg)
+        std::snprintf(buf, sizeof(buf), "errno=%d", err);
+    return std::string(msg ? msg : buf);
+#else
+    if (::strerror_r(err, buf, sizeof(buf)) != 0)
+        std::snprintf(buf, sizeof(buf), "errno=%d", err);
+    return std::string(buf);
+#endif
 }
 
 inline fd_t create_socket(int domain, int type, int protocol)
