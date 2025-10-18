@@ -1,6 +1,6 @@
 #pragma once
 
-#include "http_client.hpp"
+#include "header_utils.hpp"
 #include "http_common.hpp"
 
 #include <optional>

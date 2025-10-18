@@ -111,6 +111,7 @@ if get_config("USING_NET") then
     add_defines("USING_NET", { public = true })
     add_files("net/dns_resolver.cpp")
     add_files("net/http/http_common.cpp",
+        "net/http/header_utils.cpp",
         "net/http/http_server.cpp",
         "net/http/http_client.cpp",
         "net/http/http_router.cpp",

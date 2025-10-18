@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <filesystem>
 #include <fstream>
 #include <iterator>
 
@@ -27,8 +26,7 @@ namespace {
 
     std::optional<std::string> read_file_to_string(std::string_view path)
     {
-        std::filesystem::path p { path };
-        std::ifstream         file(p, std::ios::binary);
+        std::ifstream file(std::string(path), std::ios::binary);
         if (!file.is_open())
             return std::nullopt;
         std::string buffer((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());

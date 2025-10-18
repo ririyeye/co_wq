@@ -1,5 +1,6 @@
 #pragma once
 
+#include "header_utils.hpp"
 #include "http1_common.hpp"
 #include "http_message.hpp"
 #include "parser.hpp"
@@ -14,11 +15,6 @@
 #include <vector>
 
 namespace co_wq::net::http {
-
-struct HeaderEntry {
-    std::string name;
-    std::string value;
-};
 
 class Http1ResponseParser : public IHttpResponseParser, protected Http1HeaderCollector {
 public:
@@ -72,9 +68,6 @@ private:
     llhttp_t          parser_ {};
     llhttp_settings_t settings_ {};
 };
-
-bool header_exists(const std::vector<HeaderEntry>& headers, std::string_view name);
-void remove_content_headers(std::vector<HeaderEntry>& headers);
 
 using ResponseContext = Http1ResponseParser;
 
