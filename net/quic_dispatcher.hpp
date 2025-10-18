@@ -1264,7 +1264,7 @@ private:
                                          reinterpret_cast<const sockaddr*>(&dest),
                                          dest_len);
             if (sent < 0) {
-                CO_WQ_LOG_ERROR("[quic dispatcher] sendto failed: %s", std::strerror(errno));
+                CO_WQ_LOG_ERROR("[quic dispatcher] sendto failed: %s", os::format_errno(errno).c_str());
                 if (errno == EINTR)
                     continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1418,9 +1418,9 @@ public:
 
     bool await_ready() const noexcept { return false; }
 
-    void await_suspend(std::coroutine_handle<> h)
+    void await_suspend(std::coroutine_handle<> handle)
     {
-        this->h = h;
+        this->h = handle;
         drive();
     }
 

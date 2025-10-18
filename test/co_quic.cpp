@@ -565,9 +565,9 @@ static Task<void, Work_Promise<SpinLock, void>> socket_to_stdout_task(Session& s
             LOG_VERBOSE("[quic] recv return=%zd shutdown_flags=0x%x rx_eof=%d", n, shut_flags, sock.rx_eof() ? 1 : 0);
             if (n < 0) {
                 int         err_code = static_cast<int>(-n);
-                const char* err_text = (err_code > 0) ? std::strerror(err_code) : "unknown";
+                std::string err_text = (err_code > 0) ? net::os::format_errno(err_code) : std::string("unknown");
                 CO_WQ_LOG_ERROR("[quic] recv failed: %s (%zd) stack=%s",
-                                err_text,
+                                err_text.c_str(),
                                 n,
                                 net::tls_utils::collect_error_stack().c_str());
             } else
@@ -646,7 +646,7 @@ static Task<void, Work_Promise<SpinLock, void>> run_interactive_session(Session&
                 if (err == EINTR)
                     continue;
 
-                CO_WQ_LOG_ERROR("[quic] stdin read failed: %s", std::strerror(err));
+                CO_WQ_LOG_ERROR("[quic] stdin read failed: %s", net::os::format_errno(err).c_str());
                 state.stop.store(true, std::memory_order_release);
                 break;
             }
@@ -690,7 +690,10 @@ static Task<void, Work_Promise<SpinLock, void>> run_quic_client(NetFdWorkqueue& 
 
     auto udp = fdwq.make_udp_socket();
     if (co_await udp.connect(opt.host, opt.port) != 0) {
-        CO_WQ_LOG_ERROR("[quic client] connect %s:%u failed: %s", opt.host.c_str(), opt.port, std::strerror(errno));
+        CO_WQ_LOG_ERROR("[quic client] connect %s:%u failed: %s",
+                        opt.host.c_str(),
+                        opt.port,
+                        net::os::format_errno(errno).c_str());
         co_return;
     }
 
@@ -771,7 +774,7 @@ static Task<void, Work_Promise<SpinLock, void>> run_quic_server(NetFdWorkqueue& 
     }
     auto udp = fdwq.make_udp_socket();
     if (::bind(udp.native_handle(), reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
-        CO_WQ_LOG_ERROR("[quic server] bind failed: %s", std::strerror(errno));
+        CO_WQ_LOG_ERROR("[quic server] bind failed: %s", net::os::format_errno(errno).c_str());
         co_return;
     }
 

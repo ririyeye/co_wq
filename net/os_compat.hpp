@@ -2,9 +2,34 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
 
 #ifdef _WIN32
+
+// 确保在包含 Windows SDK 头文件前声明目标架构宏，避免旧版头文件报错。
+#if defined(_M_AMD64) && !defined(_AMD64_)
+#define _AMD64_ 1
+#endif
+#if defined(_M_X64) && !defined(_AMD64_)
+#define _AMD64_ 1
+#endif
+#if defined(_M_IX86) && !defined(_X86_)
+#define _X86_ 1
+#endif
+#if defined(_M_ARM64) && !defined(_ARM64_)
+#define _ARM64_ 1
+#endif
+#if defined(_M_ARM) && !defined(_ARM_)
+#define _ARM_ 1
+#endif
+
+#ifndef NOMINMAX
+#define NOMINMAX 1
+#endif
+
 #include <BaseTsd.h>
 #include <processthreadsapi.h>
 #include <winsock2.h>
@@ -46,6 +71,27 @@
 #endif
 
 namespace co_wq::net::os {
+
+inline std::string format_errno(int err)
+{
+    if (err == 0)
+        return "success";
+    char buf[128] {};
+#if defined(_WIN32)
+    if (::strerror_s(buf, sizeof(buf), err) != 0)
+        std::snprintf(buf, sizeof(buf), "errno=%d", err);
+    return std::string(buf);
+#elif defined(_GNU_SOURCE)
+    char* msg = ::strerror_r(err, buf, sizeof(buf));
+    if (!msg)
+        std::snprintf(buf, sizeof(buf), "errno=%d", err);
+    return std::string(msg ? msg : buf);
+#else
+    if (::strerror_r(err, buf, sizeof(buf)) != 0)
+        std::snprintf(buf, sizeof(buf), "errno=%d", err);
+    return std::string(buf);
+#endif
+}
 
 using fd_t = SOCKET;
 #ifdef ssize_t

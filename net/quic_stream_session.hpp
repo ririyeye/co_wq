@@ -384,9 +384,9 @@ private:
 
         bool await_ready() const noexcept { return false; }
 
-        void await_suspend(std::coroutine_handle<> h)
+        void await_suspend(std::coroutine_handle<> handle)
         {
-            this->h = h;
+            this->h = handle;
             owner._dispatcher.track_waiter(this);
             owner._dispatcher.wait_with_timeout(this, mask, std::chrono::milliseconds(200));
         }
