@@ -1,8 +1,7 @@
 #include "http_client.hpp"
 
+#include "header_utils.hpp"
 #include "http_common.hpp"
-
-#include <algorithm>
 
 namespace co_wq::net::http {
 
@@ -202,26 +201,6 @@ void Http1ResponseParser::handle_header(std::string&& name, std::string&& value)
     header_sequence.push_back(entry);
     header_lookup[lower_name] = header_sequence.back().value;
     response_.set_header(lower_name, header_sequence.back().value);
-}
-
-bool header_exists(const std::vector<HeaderEntry>& headers, std::string_view name)
-{
-    for (const auto& h : headers) {
-        if (iequals(h.name, name))
-            return true;
-    }
-    return false;
-}
-
-void remove_content_headers(std::vector<HeaderEntry>& headers)
-{
-    headers.erase(std::remove_if(headers.begin(),
-                                 headers.end(),
-                                 [](const HeaderEntry& h) {
-                                     return iequals(h.name, "content-type") || iequals(h.name, "content-length")
-                                         || iequals(h.name, "transfer-encoding");
-                                 }),
-                  headers.end());
 }
 
 } // namespace co_wq::net::http
