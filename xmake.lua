@@ -60,7 +60,7 @@ if get_config("USING_NET") then
         add_requires("nghttp2")
     end
     if get_config("USING_SSL") then
-        add_requires("openssl3")
+        add_requires("openssl3 3.5.1")
     end
 end
 
