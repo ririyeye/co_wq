@@ -35,6 +35,18 @@ option("USING_USB")
 set_default(false)
 option_end()
 
+option("USING_MSQUIC")
+set_default(false)
+set_showmenu(true)
+set_description("Enable MsQuic dynamic loader support")
+option_end()
+
+option("USING_MSQUIC_TEST")
+set_default(false)
+set_showmenu(true)
+set_description("Build MsQuic example/test targets")
+option_end()
+
 -- 是否构建 examples（test 目录）
 option("USING_EXAMPLE")
 set_default(false)
@@ -142,6 +154,12 @@ if get_config("USING_NET") then
         add_defines("USING_SSL", { public = true })
         add_packages("openssl3", { public = true })
         add_files("net/tls_utils.cpp")
+    end
+    if get_config("USING_MSQUIC") then
+        add_defines("USING_MSQUIC", { public = true })
+        add_files("net/msquic_loader.cpp")
+        add_installfiles("msquic-install/lib/libmsquic.so*", { prefixdir = "lib" })
+        add_installfiles("certs/**", { prefixdir = "certs" })
     end
 end
 

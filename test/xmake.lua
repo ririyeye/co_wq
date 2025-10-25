@@ -104,3 +104,15 @@ if has_config("USING_SSL") then
     add_packages("nlohmann_json")
     target_end()
 end
+
+if has_config("USING_MSQUIC") and has_config("USING_MSQUIC_TEST") then
+    target("msquic_echo")
+    set_kind("binary")
+    add_deps("co_syswork_common")
+    add_files("msquic_echo.cpp")
+    add_includedirs("$(projectdir)/msquic-install/include", "$(projectdir)/third_party/msquic/src/inc")
+    if is_plat("linux") then
+        add_links("dl")
+    end
+    target_end()
+end

@@ -10,6 +10,8 @@
 - ``build`` 子命令负责完整的 xmake 配置流程，生成 ``compile_commands.json``，
     编译目标并安装到 ``install/``。命令行参数可切换功能档（``--core``/``--full``）、
     xmake 构建模式（``--debug``/``--releasedbg``）以及 MSVC 迭代器调试开关。
+- ``quictest`` 子命令仅为 MsQuic 示例做最小化构建；运行前请确保 ``msquic-install``
+    已由 ``script/build_msquic.sh`` 生成，以便动态加载。
 - 若当前 xmake 版本支持 ``--network`` 选项，构建流程会默认使用
     ``--network=private`` 阻止它在缓存目录外执行 ``git checkout`` 或远程拉取；
     若需要更新依赖，可显式传入 ``--online`` 切换为常规联网模式。
@@ -61,6 +63,31 @@ def run_command(
     return subprocess.run(command, cwd=cwd, env=env, check=check)
 
 
+def ensure_msquic_installation() -> None:
+    install_root = PROJECT_ROOT / "msquic-install"
+    if not install_root.is_dir():
+        raise FileNotFoundError("未找到 msquic-install 目录，请先构建 msquic")
+
+    lib_dir = install_root / "lib"
+    if not lib_dir.is_dir():
+        raise FileNotFoundError("msquic-install/lib 不存在")
+
+    has_shared_lib = any(
+        candidate.is_file()
+        for pattern in ("libmsquic.so", "libmsquic.so.*", "msquic.dll", "libmsquic.dylib")
+        for candidate in lib_dir.glob(pattern)
+    )
+    if not has_shared_lib:
+        raise FileNotFoundError("msquic-install/lib 下未找到 libmsquic 动态库")
+
+    include_dir = install_root / "include"
+    if not include_dir.is_dir():
+        raise FileNotFoundError("msquic-install/include 不存在")
+
+    if not any(path.name == "msquic.h" for path in include_dir.rglob("msquic.h")):
+        raise FileNotFoundError("msquic-install/include 下未找到 msquic.h 头文件")
+
+
 def configure_and_build(
     mode: str,
     build_mode: str,
@@ -68,6 +95,11 @@ def configure_and_build(
     network_mode: str | None,
     enable_usb: bool,
     proxy_url: str | None,
+    *,
+    enable_msquic: bool = False,
+    enable_msquic_tests: bool = False,
+    build_targets: list[str] | None = None,
+    run_install: bool = True,
 ) -> None:
     env = os.environ.copy()
     env["XMAKE_GLOBALDIR"] = str(PROJECT_ROOT)
@@ -82,8 +114,13 @@ def configure_and_build(
     if network_mode and _xmake_supports_network_flag():
         network_flag = [f"--network={network_mode}"]
 
+    if enable_msquic or enable_msquic_tests:
+        ensure_msquic_installation()
+
     config_flags: list[str]
-    usb_flag = "y" if enable_usb else "n"
+    usb_flag    = "y" if enable_usb else "n"
+    msquic_flag = "y" if enable_msquic else "n"
+    msquic_test_flag = "y" if enable_msquic_tests else "n"
 
     if mode == "full":
         config_flags = [
@@ -94,6 +131,8 @@ def configure_and_build(
             f"--USING_USB={usb_flag}",
             "--ENABLE_LOGGING=y",
             "--USING_EXAMPLE=y",
+            f"--USING_MSQUIC={msquic_flag}",
+            f"--USING_MSQUIC_TEST={msquic_test_flag}",
         ]
     else:
         config_flags = [
@@ -104,6 +143,8 @@ def configure_and_build(
             f"--USING_USB={usb_flag}",
             "--ENABLE_LOGGING=n",
             "--USING_EXAMPLE=n",
+            f"--USING_MSQUIC={msquic_flag}",
+            f"--USING_MSQUIC_TEST={msquic_test_flag}",
         ]
 
     config_flags.append(
@@ -125,9 +166,18 @@ def configure_and_build(
     run_command(configure_cmd, cwd=PROJECT_ROOT, env=env)
     run_command(["xmake", *network_flag, "project", "-k",
                 "compile_commands"], cwd=PROJECT_ROOT, env=env)
-    run_command(["xmake", *network_flag, "-vD"], cwd=PROJECT_ROOT, env=env)
-    run_command(["xmake", *network_flag, "install", "-o",
-                "install"], cwd=PROJECT_ROOT, env=env)
+
+    if build_targets:
+        for target in build_targets:
+            run_command(["xmake", *network_flag, "build", target],
+                        cwd=PROJECT_ROOT, env=env)
+    else:
+        run_command(["xmake", *network_flag, "-vD"],
+                    cwd=PROJECT_ROOT, env=env)
+
+    if run_install and not build_targets:
+        run_command(["xmake", *network_flag, "install", "-o",
+                    "install"], cwd=PROJECT_ROOT, env=env)
 
 
 def clean_workspace(remove_global_cache: bool) -> None:
@@ -161,11 +211,31 @@ def clean_workspace(remove_global_cache: bool) -> None:
 def build_command(args: argparse.Namespace) -> None:
     network_mode = getattr(args, "network_mode", None)
     configure_and_build(args.profile, args.mode,
-                        args.msvc_iterator_debug, network_mode, args.enable_usb, args.proxy_url)
+                        args.msvc_iterator_debug, network_mode, args.enable_usb, args.proxy_url,
+                        enable_msquic=True)
 
 
 def clean_command(args: argparse.Namespace) -> None:
     clean_workspace(args.remove_global_cache)
+
+
+def quictest_command(args: argparse.Namespace) -> None:
+    network_mode = getattr(args, "network_mode", None)
+    try:
+        configure_and_build(
+            mode="full",
+            build_mode=args.mode,
+            iterator_debug=args.msvc_iterator_debug,
+            network_mode=network_mode,
+            enable_usb=False,
+            proxy_url=args.proxy_url,
+            enable_msquic=True,
+            enable_msquic_tests=True,
+        )
+    except FileNotFoundError as exc:
+        print(f"MsQuic 依赖缺失: {exc}", file=sys.stderr)
+        print("请先执行 ./script/build_msquic.sh 生成 msquic-install", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def main(argv: list[str]) -> int:
@@ -256,6 +326,65 @@ def main(argv: list[str]) -> int:
     else:
         build_parser.set_defaults(network_mode=None)
     build_parser.set_defaults(func=build_command)
+
+    quic_parser = subparsers.add_parser(
+        "quictest",
+        help="仅构建 MsQuic 相关示例 (co_msquic_echo)",
+    )
+    quic_parser.add_argument(
+        "--debug",
+        dest="mode",
+        action="store_const",
+        const="debug",
+        default="releasedbg",
+        help="使用 xmake debug 模式",
+    )
+    quic_parser.add_argument(
+        "--releasedbg",
+        dest="mode",
+        action="store_const",
+        const="releasedbg",
+        help="使用 xmake releasedbg 模式 (默认)",
+    )
+    quic_parser.add_argument(
+        "--msvc-iterator-debug",
+        dest="msvc_iterator_debug",
+        action="store_true",
+        help="启用 MSVC 迭代器调试检查",
+    )
+    quic_parser.add_argument(
+        "--no-msvc-iterator-debug",
+        dest="msvc_iterator_debug",
+        action="store_false",
+        help="禁用 MSVC 迭代器调试检查 (默认)",
+    )
+    quic_parser.set_defaults(msvc_iterator_debug=False)
+    quic_parser.add_argument(
+        "--proxy",
+        dest="proxy_url",
+        metavar="URL",
+        default=None,
+        help="为子进程设置 HTTP(S) 代理",
+    )
+    if _xmake_supports_network_flag():
+        quic_parser.add_argument(
+            "--offline",
+            dest="network_mode",
+            action="store_const",
+            const="private",
+            default="private",
+            help="禁用 xmake 联网 (默认)",
+        )
+        quic_parser.add_argument(
+            "--online",
+            dest="network_mode",
+            action="store_const",
+            const="public",
+            help="允许 xmake 联网以更新依赖",
+        )
+    else:
+        quic_parser.set_defaults(network_mode=None)
+    quic_parser.set_defaults(func=quictest_command)
 
     clean_parser = subparsers.add_parser(
         "clean", help="Remove build artifacts")
