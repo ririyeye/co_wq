@@ -1,7 +1,5 @@
 #include "msquic_loader.hpp"
 
-#include "msquic.h"
-
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -19,16 +17,22 @@ namespace {
 constexpr const char* kDefaultAlpn = "http/1.0";
 constexpr uint16_t    kDefaultPort = 6121;
 
+constexpr co_wq::net::MsquicStatus kStatusNoMemory = 0xC0000017u;
+
 std::atomic<bool>     g_running { true };
-const QUIC_API_TABLE* g_msquic = nullptr;
+co_wq::net::MsquicApi g_msquic_api;
 
 using co_wq::net::quic_status_failed;
 
 struct StreamContext {
-    std::string payload;
-    QUIC_BUFFER send_buffer { 0, nullptr };
-    bool        send_pending { false };
-    bool        peer_shutdown { false };
+    std::string              payload;
+    co_wq::net::MsquicBuffer send_buffer { 0, nullptr };
+    bool                     send_pending { false };
+    bool                     peer_shutdown { false };
+};
+
+struct ListenerContext {
+    co_wq::net::MsquicConfigurationHandle configuration {};
 };
 
 std::string ResolveCertificatePath(const std::string& candidate, std::initializer_list<const char*> fallbacks)
@@ -133,123 +137,128 @@ void SignalHandler(int signum)
     g_running.store(false, std::memory_order_relaxed);
 }
 
-QUIC_STATUS QUIC_API EchoStreamCallback(HQUIC stream, void* context, QUIC_STREAM_EVENT* event)
+co_wq::net::MsquicStatus
+EchoStreamCallback(co_wq::net::MsquicStreamHandle stream, void* context, const co_wq::net::MsquicStreamEvent& event)
 {
     auto* streamCtx = static_cast<StreamContext*>(context);
 
-    switch (event->Type) {
-    case QUIC_STREAM_EVENT_RECEIVE: {
-        for (uint32_t i = 0; i < event->RECEIVE.BufferCount; ++i) {
-            const auto& buffer = event->RECEIVE.Buffers[i];
-            streamCtx->payload.append(reinterpret_cast<const char*>(buffer.Buffer), buffer.Length);
+    switch (event.type) {
+    case co_wq::net::MsquicStreamEventType::Receive: {
+        for (const auto& buffer : event.receive.buffers) {
+            streamCtx->payload.append(reinterpret_cast<const char*>(buffer.data), buffer.length);
         }
-        std::printf("[stream %p] received %u buffers, total=%zu fin=%u\n",
-                    static_cast<void*>(stream),
-                    event->RECEIVE.BufferCount,
+        std::printf("[stream %p] received %zu buffers, total=%zu fin=%u\n",
+                    stream.value,
+                    event.receive.buffers.size(),
                     streamCtx->payload.size(),
-                    (event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0);
-        if ((event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0) {
+                    event.receive.fin ? 1u : 0u);
+        if (event.receive.fin) {
             streamCtx->peer_shutdown = true;
             if (!streamCtx->payload.empty()) {
-                streamCtx->send_buffer.Length = static_cast<uint32_t>(streamCtx->payload.size());
-                streamCtx->send_buffer.Buffer = reinterpret_cast<uint8_t*>(
-                    const_cast<char*>(streamCtx->payload.data()));
-                streamCtx->send_pending = true;
+                streamCtx->send_pending       = true;
+                streamCtx->send_buffer.length = static_cast<std::uint32_t>(streamCtx->payload.size());
+                streamCtx->send_buffer.data   = reinterpret_cast<std::uint8_t*>(streamCtx->payload.data());
 
-                QUIC_STATUS status = g_msquic->StreamSend(stream,
-                                                          &streamCtx->send_buffer,
-                                                          1,
-                                                          QUIC_SEND_FLAG_FIN,
-                                                          nullptr);
+                co_wq::net::MsquicStatus status = g_msquic_api.stream_send(stream,
+                                                                           &streamCtx->send_buffer,
+                                                                           1,
+                                                                           co_wq::net::MsquicSendFlags::Fin,
+                                                                           nullptr);
                 std::printf("[stream %p] echo send length=%u status=0x%x\n",
-                            static_cast<void*>(stream),
-                            streamCtx->send_buffer.Length,
+                            stream.value,
+                            streamCtx->send_buffer.length,
                             status);
                 if (quic_status_failed(status)) {
                     streamCtx->send_pending = false;
                     return status;
                 }
             } else {
-                std::printf("[stream %p] empty payload, abort send\n", static_cast<void*>(stream));
-                return g_msquic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND, 0);
+                std::printf("[stream %p] empty payload, abort send\n", stream.value);
+                return g_msquic_api.stream_shutdown(stream, co_wq::net::MsquicStreamShutdownFlags::AbortSend, 0);
             }
         }
         break;
     }
-    case QUIC_STREAM_EVENT_SEND_COMPLETE:
+    case co_wq::net::MsquicStreamEventType::SendComplete:
         if (streamCtx != nullptr) {
             streamCtx->send_pending = false;
             streamCtx->payload.clear();
+            streamCtx->send_buffer.length = 0;
+            streamCtx->send_buffer.data   = nullptr;
         }
-        std::printf("[stream %p] send complete\n", static_cast<void*>(stream));
+        std::printf("[stream %p] send complete\n", stream.value);
         break;
-    case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+    case co_wq::net::MsquicStreamEventType::ShutdownComplete:
         delete streamCtx;
-        g_msquic->StreamClose(stream);
-        std::printf("[stream %p] shutdown complete\n", static_cast<void*>(stream));
+        g_msquic_api.stream_close(stream);
+        std::printf("[stream %p] shutdown complete\n", stream.value);
         break;
     default:
         break;
     }
 
-    return QUIC_STATUS_SUCCESS;
+    return 0;
 }
 
-QUIC_STATUS QUIC_API EchoConnectionCallback(HQUIC connection, void*, QUIC_CONNECTION_EVENT* event)
+co_wq::net::MsquicStatus EchoConnectionCallback(co_wq::net::MsquicConnectionHandle connection,
+                                                void*,
+                                                const co_wq::net::MsquicConnectionEvent& event)
 {
-    switch (event->Type) {
-    case QUIC_CONNECTION_EVENT_CONNECTED:
-        std::printf("[conn %p] connected\n", static_cast<void*>(connection));
+    switch (event.type) {
+    case co_wq::net::MsquicConnectionEventType::Connected:
+        std::printf("[conn %p] connected\n", connection.value);
         break;
-    case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
-        g_msquic->ConnectionClose(connection);
-        std::printf("[conn %p] shutdown complete\n", static_cast<void*>(connection));
+    case co_wq::net::MsquicConnectionEventType::ShutdownComplete:
+        g_msquic_api.connection_close(connection);
+        std::printf("[conn %p] shutdown complete\n", connection.value);
         break;
-    case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
-        std::printf("[conn %p] peer stream started %p\n",
-                    static_cast<void*>(connection),
-                    static_cast<void*>(event->PEER_STREAM_STARTED.Stream));
+    case co_wq::net::MsquicConnectionEventType::PeerStreamStarted: {
+        std::printf("[conn %p] peer stream started %p\n", connection.value, event.stream.value);
         auto* ctx = new (std::nothrow) StreamContext();
         if (!ctx) {
-            return QUIC_STATUS_OUT_OF_MEMORY;
+            return kStatusNoMemory;
         }
-        g_msquic->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream,
-                                     reinterpret_cast<void*>(EchoStreamCallback),
-                                     ctx);
+        g_msquic_api.set_stream_callback(event.stream, EchoStreamCallback, ctx);
         break;
     }
-    case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
-        std::printf("[conn %p] shutdown by transport error=0x%x\n",
-                    static_cast<void*>(connection),
-                    event->SHUTDOWN_INITIATED_BY_TRANSPORT.Status);
+    case co_wq::net::MsquicConnectionEventType::ShutdownByTransport:
+        std::printf("[conn %p] shutdown by transport error=0x%x\n", connection.value, event.status);
         break;
-    case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+    case co_wq::net::MsquicConnectionEventType::ShutdownByPeer:
         std::printf("[conn %p] shutdown by peer error=0x%llx\n",
-                    static_cast<void*>(connection),
-                    static_cast<unsigned long long>(event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode));
+                    connection.value,
+                    static_cast<unsigned long long>(event.error_code));
         break;
     default:
         break;
     }
-    return QUIC_STATUS_SUCCESS;
+    return 0;
 }
 
-QUIC_STATUS QUIC_API EchoListenerCallback(HQUIC listener, void* context, QUIC_LISTENER_EVENT* event)
+co_wq::net::MsquicStatus EchoListenerCallback(co_wq::net::MsquicListenerHandle       listener,
+                                              void*                                  context,
+                                              const co_wq::net::MsquicListenerEvent& event)
 {
     (void)listener;
-    switch (event->Type) {
-    case QUIC_LISTENER_EVENT_NEW_CONNECTION:
-        std::printf("[listener] new connection %p\n", static_cast<void*>(event->NEW_CONNECTION.Connection));
-        g_msquic->SetCallbackHandler(event->NEW_CONNECTION.Connection,
-                                     reinterpret_cast<void*>(EchoConnectionCallback),
-                                     nullptr);
-        return g_msquic->ConnectionSetConfiguration(event->NEW_CONNECTION.Connection, static_cast<HQUIC>(context));
-    case QUIC_LISTENER_EVENT_STOP_COMPLETE:
+    switch (event.type) {
+    case co_wq::net::MsquicListenerEventType::NewConnection: {
+        std::printf("[listener] new connection %p\n", event.connection.value);
+        g_msquic_api.set_connection_callback(event.connection, EchoConnectionCallback, nullptr);
+        auto* listenerCtx = static_cast<ListenerContext*>(context);
+        if (listenerCtx) {
+            const auto status = g_msquic_api.connection_set_configuration(event.connection, listenerCtx->configuration);
+            if (quic_status_failed(status)) {
+                return status;
+            }
+        }
+        break;
+    }
+    case co_wq::net::MsquicListenerEventType::StopComplete:
         break;
     default:
         break;
     }
-    return QUIC_STATUS_SUCCESS;
+    return 0;
 }
 
 } // namespace
@@ -287,76 +296,97 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    g_msquic           = reinterpret_cast<const QUIC_API_TABLE*>(api.get());
-    QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+    g_msquic_api = std::move(api);
 
-    QUIC_REGISTRATION_CONFIG regConfig { "co_msquic_echo", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
-    HQUIC                    registration = nullptr;
-    status                                = g_msquic->RegistrationOpen(&regConfig, &registration);
+    co_wq::net::MsquicRegistrationHandle       registration {};
+    const co_wq::net::MsquicRegistrationConfig regConfig { "co_msquic_echo",
+                                                           co_wq::net::MsquicExecutionProfile::LowLatency };
+    auto                                       status = g_msquic_api.registration_open(regConfig, registration);
     if (quic_status_failed(status)) {
         std::fprintf(stderr, "RegistrationOpen failed: 0x%x\n", status);
+        g_msquic_api = co_wq::net::MsquicApi {};
+        co_wq::net::MsquicLoader::instance().unload();
         return 1;
     }
 
-    QUIC_SETTINGS settings {};
-    settings.IdleTimeoutMs             = 30000;
-    settings.IsSet.IdleTimeoutMs       = TRUE;
-    settings.PeerBidiStreamCount       = 16;
-    settings.IsSet.PeerBidiStreamCount = TRUE;
+    co_wq::net::MsquicSettings settings {};
+    settings.idle_timeout_ms_set        = true;
+    settings.idle_timeout_ms            = 30000;
+    settings.peer_bidi_stream_count_set = true;
+    settings.peer_bidi_stream_count     = 16;
 
-    QUIC_BUFFER alpnBuffer;
-    alpnBuffer.Length = static_cast<uint32_t>(std::strlen(kDefaultAlpn));
-    alpnBuffer.Buffer = reinterpret_cast<uint8_t*>(const_cast<char*>(kDefaultAlpn));
+    const co_wq::net::MsquicConstBuffer alpnBuffer { static_cast<std::uint32_t>(std::strlen(kDefaultAlpn)),
+                                                     reinterpret_cast<const std::uint8_t*>(kDefaultAlpn) };
 
-    HQUIC configuration = nullptr;
-    status              = g_msquic->ConfigurationOpen(registration,
-                                         &alpnBuffer,
-                                         1,
-                                         &settings,
-                                         sizeof(settings),
-                                         nullptr,
-                                         &configuration);
+    co_wq::net::MsquicConfigurationHandle configuration {};
+    status = g_msquic_api.configuration_open(registration, &alpnBuffer, 1, settings, configuration);
     if (quic_status_failed(status)) {
         std::fprintf(stderr, "ConfigurationOpen failed: 0x%x\n", status);
-        g_msquic->RegistrationClose(registration);
+        g_msquic_api.registration_close(registration);
+        g_msquic_api = co_wq::net::MsquicApi {};
+        co_wq::net::MsquicLoader::instance().unload();
         return 1;
     }
 
-    QUIC_CERTIFICATE_FILE certificateFile { keyFile.c_str(), certFile.c_str() };
+    co_wq::net::MsquicCredentialConfig credential {};
+    credential.certificate_file.private_key_file = keyFile;
+    credential.certificate_file.certificate_file = certFile;
 
-    QUIC_CREDENTIAL_CONFIG credConfig {};
-    credConfig.Type            = QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE;
-    credConfig.CertificateFile = &certificateFile;
-
-    status = g_msquic->ConfigurationLoadCredential(configuration, &credConfig);
+    status = g_msquic_api.configuration_load_credential(configuration, credential);
     if (quic_status_failed(status)) {
         std::fprintf(stderr, "ConfigurationLoadCredential failed: 0x%x\n", status);
-        g_msquic->ConfigurationClose(configuration);
-        g_msquic->RegistrationClose(registration);
+        g_msquic_api.configuration_close(configuration);
+        g_msquic_api.registration_close(registration);
+        g_msquic_api = co_wq::net::MsquicApi {};
+        co_wq::net::MsquicLoader::instance().unload();
         return 1;
     }
 
-    HQUIC listener = nullptr;
-    status         = g_msquic->ListenerOpen(registration, EchoListenerCallback, configuration, &listener);
+    co_wq::net::MsquicListenerHandle listener {};
+    ListenerContext                  listener_context { configuration };
+
+    status = g_msquic_api.listener_open(registration, EchoListenerCallback, &listener_context, listener);
     if (quic_status_failed(status)) {
         std::fprintf(stderr, "ListenerOpen failed: 0x%x\n", status);
-        g_msquic->ConfigurationClose(configuration);
-        g_msquic->RegistrationClose(registration);
+        g_msquic_api.configuration_close(configuration);
+        g_msquic_api.registration_close(registration);
+        g_msquic_api = co_wq::net::MsquicApi {};
+        co_wq::net::MsquicLoader::instance().unload();
         return 1;
     }
 
-    QUIC_ADDR address {};
-    QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
-    QuicAddrSetPort(&address, kDefaultPort);
+    bool listener_started = false;
 
-    status = g_msquic->ListenerStart(listener, &alpnBuffer, 1, &address);
+    status = g_msquic_api.listener_start_any(listener, &alpnBuffer, 1, kDefaultPort);
     if (quic_status_failed(status)) {
         std::fprintf(stderr, "ListenerStart failed: 0x%x\n", status);
-        g_msquic->ListenerClose(listener);
-        g_msquic->ConfigurationClose(configuration);
-        g_msquic->RegistrationClose(registration);
+        g_msquic_api.listener_close(listener);
+        g_msquic_api.configuration_close(configuration);
+        g_msquic_api.registration_close(registration);
+        g_msquic_api = co_wq::net::MsquicApi {};
+        co_wq::net::MsquicLoader::instance().unload();
         return 1;
     }
+
+    listener_started = true;
+
+    auto cleanup = [&](bool stop_listener) {
+        if (listener.value) {
+            if (stop_listener && listener_started) {
+                g_msquic_api.listener_stop(listener);
+            }
+            g_msquic_api.listener_close(listener);
+            listener = {};
+        }
+        if (configuration.value) {
+            g_msquic_api.configuration_close(configuration);
+            configuration = {};
+        }
+        if (registration.value) {
+            g_msquic_api.registration_close(registration);
+            registration = {};
+        }
+    };
 
     std::signal(SIGINT, SignalHandler);
     std::signal(SIGTERM, SignalHandler);
@@ -368,11 +398,9 @@ int main(int argc, char** argv)
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    g_msquic->ListenerStop(listener);
-    g_msquic->ListenerClose(listener);
-    g_msquic->ConfigurationClose(configuration);
-    g_msquic->RegistrationClose(registration);
+    cleanup(true);
 
+    g_msquic_api = co_wq::net::MsquicApi {};
     co_wq::net::MsquicLoader::instance().unload();
 
     return 0;

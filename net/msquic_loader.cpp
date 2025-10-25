@@ -5,9 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -16,6 +18,8 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
+
+#include "../msquic-install/include/msquic.h"
 
 namespace co_wq::net {
 
@@ -162,7 +166,263 @@ namespace {
     }
 #endif
 
+    inline HQUIC to_raw(MsquicRegistrationHandle handle)
+    {
+        return reinterpret_cast<HQUIC>(handle.value);
+    }
+
+    inline HQUIC to_raw(MsquicConfigurationHandle handle)
+    {
+        return reinterpret_cast<HQUIC>(handle.value);
+    }
+
+    inline HQUIC to_raw(MsquicListenerHandle handle)
+    {
+        return reinterpret_cast<HQUIC>(handle.value);
+    }
+
+    inline HQUIC to_raw(MsquicConnectionHandle handle)
+    {
+        return reinterpret_cast<HQUIC>(handle.value);
+    }
+
+    inline HQUIC to_raw(MsquicStreamHandle handle)
+    {
+        return reinterpret_cast<HQUIC>(handle.value);
+    }
+
+    inline MsquicRegistrationHandle to_registration(HQUIC handle)
+    {
+        return { reinterpret_cast<void*>(handle) };
+    }
+
+    inline MsquicConfigurationHandle to_configuration(HQUIC handle)
+    {
+        return { reinterpret_cast<void*>(handle) };
+    }
+
+    inline MsquicListenerHandle to_listener(HQUIC handle)
+    {
+        return { reinterpret_cast<void*>(handle) };
+    }
+
+    inline MsquicConnectionHandle to_connection(HQUIC handle)
+    {
+        return { reinterpret_cast<void*>(handle) };
+    }
+
+    inline MsquicStreamHandle to_stream(HQUIC handle)
+    {
+        return { reinterpret_cast<void*>(handle) };
+    }
+
 } // namespace
+
+struct MsquicApi::Impl {
+    const QUIC_API_TABLE* table = nullptr;
+    MsquicLoader*         owner = nullptr;
+
+    struct ListenerEntry {
+        MsquicListenerCallback callback     = nullptr;
+        void*                  user_context = nullptr;
+        Impl*                  self         = nullptr;
+    };
+
+    struct ConnectionEntry {
+        MsquicConnectionCallback callback     = nullptr;
+        void*                    user_context = nullptr;
+        Impl*                    self         = nullptr;
+    };
+
+    struct StreamEntry {
+        MsquicStreamCallback callback     = nullptr;
+        void*                user_context = nullptr;
+        Impl*                self         = nullptr;
+    };
+
+    std::mutex                                                listener_mutex;
+    std::unordered_map<HQUIC, std::unique_ptr<ListenerEntry>> listener_entries;
+
+    std::mutex                                                  connection_mutex;
+    std::unordered_map<HQUIC, std::unique_ptr<ConnectionEntry>> connection_entries;
+
+    std::mutex                                              stream_mutex;
+    std::unordered_map<HQUIC, std::unique_ptr<StreamEntry>> stream_entries;
+
+    Impl(const QUIC_API_TABLE* api_table, MsquicLoader& loader) : table(api_table), owner(&loader) { }
+
+    ~Impl()
+    {
+        if (owner && table) {
+            owner->release_api(table);
+        }
+    }
+
+    static QUIC_STATUS QUIC_API listener_trampoline(HQUIC listener, void* context, QUIC_LISTENER_EVENT* event)
+    {
+        auto* entry = static_cast<ListenerEntry*>(context);
+        if (!entry || !entry->callback) {
+            return QUIC_STATUS_SUCCESS;
+        }
+        return entry->self->dispatch_listener_event(listener, *entry, *event);
+    }
+
+    static QUIC_STATUS QUIC_API connection_trampoline(HQUIC connection, void* context, QUIC_CONNECTION_EVENT* event)
+    {
+        auto* entry = static_cast<ConnectionEntry*>(context);
+        if (!entry || !entry->callback) {
+            return QUIC_STATUS_SUCCESS;
+        }
+        return entry->self->dispatch_connection_event(connection, *entry, *event);
+    }
+
+    static QUIC_STATUS QUIC_API stream_trampoline(HQUIC stream, void* context, QUIC_STREAM_EVENT* event)
+    {
+        auto* entry = static_cast<StreamEntry*>(context);
+        if (!entry || !entry->callback) {
+            return QUIC_STATUS_SUCCESS;
+        }
+        return entry->self->dispatch_stream_event(stream, *entry, *event);
+    }
+
+    QUIC_STATUS dispatch_listener_event(HQUIC listener, ListenerEntry& entry, QUIC_LISTENER_EVENT& native_event)
+    {
+        MsquicListenerEvent evt;
+        switch (native_event.Type) {
+        case QUIC_LISTENER_EVENT_NEW_CONNECTION:
+            evt.type       = MsquicListenerEventType::NewConnection;
+            evt.connection = to_connection(native_event.NEW_CONNECTION.Connection);
+            break;
+        case QUIC_LISTENER_EVENT_STOP_COMPLETE:
+            evt.type = MsquicListenerEventType::StopComplete;
+            break;
+        default:
+            evt.type = MsquicListenerEventType::Unknown;
+            break;
+        }
+        const MsquicStatus status = entry.callback(to_listener(listener), entry.user_context, evt);
+        return static_cast<QUIC_STATUS>(status);
+    }
+
+    QUIC_STATUS dispatch_connection_event(HQUIC connection, ConnectionEntry& entry, QUIC_CONNECTION_EVENT& native_event)
+    {
+        MsquicConnectionEvent evt;
+        switch (native_event.Type) {
+        case QUIC_CONNECTION_EVENT_CONNECTED:
+            evt.type = MsquicConnectionEventType::Connected;
+            break;
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+            evt.type = MsquicConnectionEventType::ShutdownComplete;
+            break;
+        case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+            evt.type   = MsquicConnectionEventType::PeerStreamStarted;
+            evt.stream = to_stream(native_event.PEER_STREAM_STARTED.Stream);
+            break;
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+            evt.type   = MsquicConnectionEventType::ShutdownByTransport;
+            evt.status = native_event.SHUTDOWN_INITIATED_BY_TRANSPORT.Status;
+            break;
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+            evt.type       = MsquicConnectionEventType::ShutdownByPeer;
+            evt.error_code = native_event.SHUTDOWN_INITIATED_BY_PEER.ErrorCode;
+            break;
+        default:
+            evt.type = MsquicConnectionEventType::Unknown;
+            break;
+        }
+        const MsquicStatus status = entry.callback(to_connection(connection), entry.user_context, evt);
+        return static_cast<QUIC_STATUS>(status);
+    }
+
+    QUIC_STATUS dispatch_stream_event(HQUIC stream, StreamEntry& entry, QUIC_STREAM_EVENT& native_event)
+    {
+        MsquicStreamEvent evt;
+        switch (native_event.Type) {
+        case QUIC_STREAM_EVENT_RECEIVE: {
+            evt.type        = MsquicStreamEventType::Receive;
+            evt.receive.fin = (native_event.RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+            evt.receive.buffers.clear();
+            evt.receive.buffers.reserve(native_event.RECEIVE.BufferCount);
+            for (uint32_t i = 0; i < native_event.RECEIVE.BufferCount; ++i) {
+                const auto& buf = native_event.RECEIVE.Buffers[i];
+                evt.receive.buffers.push_back({ buf.Buffer, buf.Length });
+            }
+            break;
+        }
+        case QUIC_STREAM_EVENT_SEND_COMPLETE:
+            evt.type = MsquicStreamEventType::SendComplete;
+            break;
+        case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+            evt.type = MsquicStreamEventType::ShutdownComplete;
+            break;
+        default:
+            evt.type = MsquicStreamEventType::Unknown;
+            break;
+        }
+        const MsquicStatus status = entry.callback(to_stream(stream), entry.user_context, evt);
+        return static_cast<QUIC_STATUS>(status);
+    }
+
+    ListenerEntry* ensure_listener_entry(HQUIC listener)
+    {
+        std::lock_guard<std::mutex> lock(listener_mutex);
+        auto                        it = listener_entries.find(listener);
+        if (it != listener_entries.end()) {
+            return it->second.get();
+        }
+        auto  entry = std::make_unique<ListenerEntry>();
+        auto* raw   = entry.get();
+        raw->self   = this;
+        listener_entries.emplace(listener, std::move(entry));
+        return raw;
+    }
+
+    ConnectionEntry* ensure_connection_entry(HQUIC connection)
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex);
+        auto                        it = connection_entries.find(connection);
+        if (it != connection_entries.end()) {
+            return it->second.get();
+        }
+        auto  entry = std::make_unique<ConnectionEntry>();
+        auto* raw   = entry.get();
+        raw->self   = this;
+        connection_entries.emplace(connection, std::move(entry));
+        return raw;
+    }
+
+    StreamEntry* ensure_stream_entry(HQUIC stream)
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex);
+        auto                        it = stream_entries.find(stream);
+        if (it != stream_entries.end()) {
+            return it->second.get();
+        }
+        auto  entry = std::make_unique<StreamEntry>();
+        auto* raw   = entry.get();
+        raw->self   = this;
+        stream_entries.emplace(stream, std::move(entry));
+        return raw;
+    }
+
+    void remove_listener_entry(HQUIC listener)
+    {
+        std::lock_guard<std::mutex> lock(listener_mutex);
+        listener_entries.erase(listener);
+    }
+
+    void remove_connection_entry(HQUIC connection)
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex);
+        connection_entries.erase(connection);
+    }
+
+    void remove_stream_entry(HQUIC stream)
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex);
+        stream_entries.erase(stream);
+    }
+};
 
 MsquicLoader& MsquicLoader::instance()
 {
@@ -189,7 +449,9 @@ MsquicApi MsquicLoader::acquire(const std::vector<std::string>& search_paths)
             last_error_ = "MsQuicOpenVersion/MsQuicOpen2 symbol not available";
             return {};
         }
-        const QUIC_STATUS status = open_version_(2u, &api);
+        const void*        raw_api = nullptr;
+        const MsquicStatus status  = open_version_(2u, &raw_api);
+        api                        = reinterpret_cast<const QUIC_API_TABLE*>(raw_api);
         if (quic_status_failed(status) || api == nullptr) {
             std::ostringstream oss;
             oss << "MsQuicOpenVersion failed with status 0x" << std::hex << status;
@@ -198,7 +460,7 @@ MsquicApi MsquicLoader::acquire(const std::vector<std::string>& search_paths)
         }
         ++active_apis_;
     }
-    return MsquicApi(api, *this);
+    return MsquicApi(new MsquicApi::Impl(api, *this));
 }
 
 void MsquicLoader::unload()
@@ -274,7 +536,7 @@ bool MsquicLoader::ensure_loaded_locked(const std::vector<std::string>& search_p
     return false;
 }
 
-void MsquicLoader::release_api(const QUIC_API_TABLE* api)
+void MsquicLoader::release_api(const void* api)
 {
     if (!api) {
         return;
@@ -288,11 +550,12 @@ void MsquicLoader::release_api(const QUIC_API_TABLE* api)
     }
 }
 
-MsquicApi::MsquicApi(const QUIC_API_TABLE* api, MsquicLoader& owner) : api_(api), owner_(&owner) { }
+MsquicApi::MsquicApi(Impl* impl) : impl_(impl) { }
 
 MsquicApi::MsquicApi(MsquicApi&& other) noexcept
 {
-    *this = std::move(other);
+    impl_       = other.impl_;
+    other.impl_ = nullptr;
 }
 
 MsquicApi& MsquicApi::operator=(MsquicApi&& other) noexcept
@@ -301,10 +564,8 @@ MsquicApi& MsquicApi::operator=(MsquicApi&& other) noexcept
         return *this;
     }
     reset();
-    api_         = other.api_;
-    owner_       = other.owner_;
-    other.api_   = nullptr;
-    other.owner_ = nullptr;
+    impl_       = other.impl_;
+    other.impl_ = nullptr;
     return *this;
 }
 
@@ -315,11 +576,268 @@ MsquicApi::~MsquicApi()
 
 void MsquicApi::reset() noexcept
 {
-    if (owner_ && api_) {
-        owner_->release_api(api_);
+    delete impl_;
+    impl_ = nullptr;
+}
+
+MsquicStatus MsquicApi::registration_open(const MsquicRegistrationConfig& config, MsquicRegistrationHandle& handle)
+{
+    if (!impl_ || !impl_->table) {
+        return 1;
     }
-    api_   = nullptr;
-    owner_ = nullptr;
+    QUIC_REGISTRATION_CONFIG native_config { config.app_name,
+                                             static_cast<QUIC_EXECUTION_PROFILE>(config.execution_profile) };
+    HQUIC                    registration = nullptr;
+    const MsquicStatus       status       = impl_->table->RegistrationOpen(&native_config, &registration);
+    if (quic_status_failed(status)) {
+        return status;
+    }
+    handle = to_registration(registration);
+    return status;
+}
+
+void MsquicApi::registration_close(MsquicRegistrationHandle handle) noexcept
+{
+    if (!impl_ || !impl_->table || !handle.value) {
+        return;
+    }
+    impl_->table->RegistrationClose(to_raw(handle));
+}
+
+MsquicStatus MsquicApi::configuration_open(MsquicRegistrationHandle   registration,
+                                           const MsquicConstBuffer*   alpns,
+                                           std::uint32_t              alpn_count,
+                                           const MsquicSettings&      settings,
+                                           MsquicConfigurationHandle& configuration)
+{
+    if (!impl_ || !impl_->table || !registration.value) {
+        return 1;
+    }
+
+    std::vector<QUIC_BUFFER> native_alpns(alpn_count);
+    for (std::uint32_t i = 0; i < alpn_count; ++i) {
+        native_alpns[i].Length = alpns[i].length;
+        native_alpns[i].Buffer = const_cast<std::uint8_t*>(alpns[i].data);
+    }
+
+    QUIC_SETTINGS native_settings {};
+    if (settings.idle_timeout_ms_set) {
+        native_settings.IsSet.IdleTimeoutMs = 1;
+        native_settings.IdleTimeoutMs       = settings.idle_timeout_ms;
+    }
+    if (settings.peer_bidi_stream_count_set) {
+        native_settings.IsSet.PeerBidiStreamCount = 1;
+        native_settings.PeerBidiStreamCount       = settings.peer_bidi_stream_count;
+    }
+
+    HQUIC              native_configuration = nullptr;
+    const MsquicStatus status               = impl_->table->ConfigurationOpen(to_raw(registration),
+                                                                native_alpns.empty() ? nullptr : native_alpns.data(),
+                                                                alpn_count,
+                                                                &native_settings,
+                                                                sizeof(native_settings),
+                                                                nullptr,
+                                                                &native_configuration);
+    if (quic_status_failed(status)) {
+        return status;
+    }
+    configuration = to_configuration(native_configuration);
+    return status;
+}
+
+void MsquicApi::configuration_close(MsquicConfigurationHandle configuration) noexcept
+{
+    if (!impl_ || !impl_->table || !configuration.value) {
+        return;
+    }
+    impl_->table->ConfigurationClose(to_raw(configuration));
+}
+
+MsquicStatus MsquicApi::configuration_load_credential(MsquicConfigurationHandle     configuration,
+                                                      const MsquicCredentialConfig& config)
+{
+    if (!impl_ || !impl_->table || !configuration.value) {
+        return 1;
+    }
+
+    QUIC_CERTIFICATE_FILE file_info { config.certificate_file.private_key_file.c_str(),
+                                      config.certificate_file.certificate_file.c_str() };
+
+    QUIC_CREDENTIAL_CONFIG native_config {};
+    native_config.Type            = static_cast<QUIC_CREDENTIAL_TYPE>(config.type);
+    native_config.Flags           = QUIC_CREDENTIAL_FLAG_NONE;
+    native_config.CertificateFile = &file_info;
+
+    return impl_->table->ConfigurationLoadCredential(to_raw(configuration), &native_config);
+}
+
+MsquicStatus MsquicApi::listener_open(MsquicRegistrationHandle registration,
+                                      MsquicListenerCallback   callback,
+                                      void*                    listener_context,
+                                      MsquicListenerHandle&    listener)
+{
+    if (!impl_ || !impl_->table || !registration.value || !callback) {
+        return 1;
+    }
+
+    auto entry          = std::make_unique<Impl::ListenerEntry>();
+    entry->callback     = callback;
+    entry->user_context = listener_context;
+    entry->self         = impl_;
+
+    HQUIC              native_listener = nullptr;
+    const MsquicStatus status          = impl_->table->ListenerOpen(
+        to_raw(registration),
+        reinterpret_cast<QUIC_LISTENER_CALLBACK_HANDLER>(Impl::listener_trampoline),
+        entry.get(),
+        &native_listener);
+    if (quic_status_failed(status)) {
+        return status;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->listener_mutex);
+        impl_->listener_entries.emplace(native_listener, std::move(entry));
+    }
+
+    listener = to_listener(native_listener);
+    return status;
+}
+
+void MsquicApi::listener_close(MsquicListenerHandle listener) noexcept
+{
+    if (!impl_ || !impl_->table || !listener.value) {
+        return;
+    }
+    impl_->remove_listener_entry(to_raw(listener));
+    impl_->table->ListenerClose(to_raw(listener));
+}
+
+MsquicStatus MsquicApi::listener_start_any(MsquicListenerHandle     listener,
+                                           const MsquicConstBuffer* alpns,
+                                           std::uint32_t            alpn_count,
+                                           std::uint16_t            port)
+{
+    if (!impl_ || !impl_->table || !listener.value) {
+        return 1;
+    }
+
+    std::vector<QUIC_BUFFER> native_alpns(alpn_count);
+    for (std::uint32_t i = 0; i < alpn_count; ++i) {
+        native_alpns[i].Length = alpns[i].length;
+        native_alpns[i].Buffer = const_cast<std::uint8_t*>(alpns[i].data);
+    }
+
+    QUIC_ADDR address {};
+    QuicAddrSetFamily(&address, QUIC_ADDRESS_FAMILY_UNSPEC);
+    QuicAddrSetPort(&address, port);
+
+    return impl_->table->ListenerStart(to_raw(listener),
+                                       native_alpns.empty() ? nullptr : native_alpns.data(),
+                                       alpn_count,
+                                       &address);
+}
+
+void MsquicApi::listener_stop(MsquicListenerHandle listener) noexcept
+{
+    if (!impl_ || !impl_->table || !listener.value) {
+        return;
+    }
+    impl_->table->ListenerStop(to_raw(listener));
+}
+
+MsquicStatus MsquicApi::connection_set_configuration(MsquicConnectionHandle    connection,
+                                                     MsquicConfigurationHandle configuration)
+{
+    if (!impl_ || !impl_->table || !connection.value || !configuration.value) {
+        return 1;
+    }
+    return impl_->table->ConnectionSetConfiguration(to_raw(connection), to_raw(configuration));
+}
+
+void MsquicApi::connection_close(MsquicConnectionHandle connection) noexcept
+{
+    if (!impl_ || !impl_->table || !connection.value) {
+        return;
+    }
+    impl_->remove_connection_entry(to_raw(connection));
+    impl_->table->ConnectionClose(to_raw(connection));
+}
+
+MsquicStatus MsquicApi::stream_send(MsquicStreamHandle  stream,
+                                    const MsquicBuffer* buffers,
+                                    std::uint32_t       buffer_count,
+                                    MsquicSendFlags     flags,
+                                    void*               client_context)
+{
+    if (!impl_ || !impl_->table || !stream.value) {
+        return 1;
+    }
+
+    static_assert(sizeof(MsquicBuffer) == sizeof(QUIC_BUFFER), "MsquicBuffer size mismatch");
+    static_assert(alignof(MsquicBuffer) == alignof(QUIC_BUFFER), "MsquicBuffer alignment mismatch");
+
+    return impl_->table->StreamSend(to_raw(stream),
+                                    buffer_count == 0 ? nullptr : reinterpret_cast<const QUIC_BUFFER*>(buffers),
+                                    buffer_count,
+                                    static_cast<QUIC_SEND_FLAGS>(flags),
+                                    client_context);
+}
+
+MsquicStatus
+MsquicApi::stream_shutdown(MsquicStreamHandle stream, MsquicStreamShutdownFlags flags, std::uint64_t error_code)
+{
+    if (!impl_ || !impl_->table || !stream.value) {
+        return 1;
+    }
+    return impl_->table->StreamShutdown(to_raw(stream), static_cast<QUIC_STREAM_SHUTDOWN_FLAGS>(flags), error_code);
+}
+
+void MsquicApi::stream_close(MsquicStreamHandle stream) noexcept
+{
+    if (!impl_ || !impl_->table || !stream.value) {
+        return;
+    }
+    impl_->remove_stream_entry(to_raw(stream));
+    impl_->table->StreamClose(to_raw(stream));
+}
+
+void MsquicApi::set_stream_callback(MsquicStreamHandle stream, MsquicStreamCallback callback, void* context)
+{
+    if (!impl_ || !impl_->table || !stream.value) {
+        return;
+    }
+    auto* entry         = impl_->ensure_stream_entry(to_raw(stream));
+    entry->callback     = callback;
+    entry->user_context = context;
+    entry->self         = impl_;
+    impl_->table->SetCallbackHandler(to_raw(stream), reinterpret_cast<void*>(Impl::stream_trampoline), entry);
+}
+
+void MsquicApi::set_connection_callback(MsquicConnectionHandle   connection,
+                                        MsquicConnectionCallback callback,
+                                        void*                    context)
+{
+    if (!impl_ || !impl_->table || !connection.value) {
+        return;
+    }
+    auto* entry         = impl_->ensure_connection_entry(to_raw(connection));
+    entry->callback     = callback;
+    entry->user_context = context;
+    entry->self         = impl_;
+    impl_->table->SetCallbackHandler(to_raw(connection), reinterpret_cast<void*>(Impl::connection_trampoline), entry);
+}
+
+void MsquicApi::set_listener_callback(MsquicListenerHandle listener, MsquicListenerCallback callback, void* context)
+{
+    if (!impl_ || !impl_->table || !listener.value) {
+        return;
+    }
+    auto* entry         = impl_->ensure_listener_entry(to_raw(listener));
+    entry->callback     = callback;
+    entry->user_context = context;
+    entry->self         = impl_;
+    impl_->table->SetCallbackHandler(to_raw(listener), reinterpret_cast<void*>(Impl::listener_trampoline), entry);
 }
 
 } // namespace co_wq::net
