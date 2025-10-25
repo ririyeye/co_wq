@@ -3,6 +3,7 @@ build
 compile_commands.json
 .xmake
 install
+msquic-install
 *.map
 .vscode/settings.json
 *.bin
