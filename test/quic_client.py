@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import datetime
+import math
 import os
 import random
 import ssl
@@ -57,6 +58,7 @@ class EchoClient(QuicConnectionProtocol):
         client_id: int,
         schedule: List[ScheduledPayload],
         finished: asyncio.Future,
+        receive_limit_factor: Optional[float],
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -66,6 +68,10 @@ class EchoClient(QuicConnectionProtocol):
         self._stream_id: Optional[int] = None
         self._buffer = bytearray()
         self._expected_total = sum(len(item.data) for item in self._schedule)
+        self._receive_limit_factor = receive_limit_factor
+        self._receive_limit: Optional[int] = None
+        if receive_limit_factor is not None:
+            self._receive_limit = math.floor(self._expected_total * receive_limit_factor)
         self._prefix = f"[client-{self._client_id}]"
         self._send_task: Optional[asyncio.Task] = None
         self._last_progress = time.monotonic()
@@ -102,6 +108,8 @@ class EchoClient(QuicConnectionProtocol):
                     self._send_scheduled_messages()
                 )
         elif isinstance(event, StreamDataReceived):
+            if self._finished.done():
+                return
             self._record_progress()
             if event.stream_id != self._stream_id:
                 return
@@ -111,6 +119,17 @@ class EchoClient(QuicConnectionProtocol):
             print(
                 f"{timestamp()} {self._prefix} <- chunk bytes={len(event.data)} end={event.end_stream} total={len(self._buffer)}/{self._expected_total}"
             )
+            if self._receive_limit is not None and len(self._buffer) > self._receive_limit:
+                error_msg = (
+                    f"received bytes {len(self._buffer)} exceed limit {self._receive_limit}"
+                )
+                print(f"{timestamp()} {self._prefix} validation failed: {error_msg}")
+                self._record_error(error_msg)
+                if not self._finished.done():
+                    self._finished.set_exception(ValueError(error_msg))
+                self._quic.close(error_code=0)
+                self.transmit()
+                return
             if event.end_stream and not self._finished.done():
                 if len(self._buffer) != self._expected_total:
                     error_msg = f"echo size mismatch expected={self._expected_total} got={len(self._buffer)}"
@@ -237,6 +256,7 @@ async def run_single_client(client_id: int, args: argparse.Namespace) -> ClientR
             client_id=client_id,
             schedule=schedule,
             finished=finished,
+            receive_limit_factor=args.receive_limit,
             **factory_kwargs,
         )
 
@@ -475,11 +495,22 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Number of concurrent connections to launch (default: 10).",
     )
+    parser.add_argument(
+        "--receive-limit",
+        type=float,
+        default=2.0,
+        help=(
+            "Factor for maximum allowed echoed bytes relative to expected size. "
+            "Example: 2 means abort if received data exceeds twice the expected size."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.receive_limit is not None and args.receive_limit <= 0:
+        args.receive_limit = None
     try:
         asyncio.run(run_parallel_clients(args))
     except KeyboardInterrupt:  # pragma: no cover

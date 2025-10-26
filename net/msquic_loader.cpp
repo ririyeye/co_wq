@@ -1,6 +1,7 @@
 #include "msquic_loader.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,28 @@ struct MsquicLibraryHandle {
     void* handle { nullptr };
 };
 #endif
+
+namespace {
+
+    std::atomic<int> g_msquic_debug_flag { -1 };
+
+} // namespace
+
+bool msquic_debug_enabled() noexcept
+{
+    int value = g_msquic_debug_flag.load(std::memory_order_acquire);
+    if (value < 0) {
+        const char* env = std::getenv("CO_WQ_MSQUIC_DEBUG");
+        value           = (env && env[0] != '\0') ? 1 : 0;
+        g_msquic_debug_flag.store(value, std::memory_order_release);
+    }
+    return value > 0;
+}
+
+void set_msquic_debug_enabled(bool enabled) noexcept
+{
+    g_msquic_debug_flag.store(enabled ? 1 : 0, std::memory_order_release);
+}
 
 namespace {
 
@@ -339,8 +362,11 @@ struct MsquicApi::Impl {
         MsquicStreamEvent evt;
         switch (native_event.Type) {
         case QUIC_STREAM_EVENT_RECEIVE: {
-            evt.type        = MsquicStreamEventType::Receive;
-            evt.receive.fin = (native_event.RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+            evt.type                    = MsquicStreamEventType::Receive;
+            evt.receive.fin             = (native_event.RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+            evt.receive.flags           = native_event.RECEIVE.Flags;
+            evt.receive.absolute_offset = native_event.RECEIVE.AbsoluteOffset;
+            evt.receive.total_length    = native_event.RECEIVE.TotalBufferLength;
             evt.receive.buffers.clear();
             evt.receive.buffers.reserve(native_event.RECEIVE.BufferCount);
             for (uint32_t i = 0; i < native_event.RECEIVE.BufferCount; ++i) {
@@ -350,13 +376,38 @@ struct MsquicApi::Impl {
             break;
         }
         case QUIC_STREAM_EVENT_SEND_COMPLETE:
-            evt.type = MsquicStreamEventType::SendComplete;
+            evt.type                         = MsquicStreamEventType::SendComplete;
+            evt.send_complete.client_context = native_event.SEND_COMPLETE.ClientContext;
+            evt.send_complete.canceled       = native_event.SEND_COMPLETE.Canceled != FALSE;
+            break;
+        case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+            evt.type = MsquicStreamEventType::PeerSendShutdown;
+            break;
+        case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+            evt.type                         = MsquicStreamEventType::PeerSendAborted;
+            evt.peer_send_aborted.error_code = native_event.PEER_SEND_ABORTED.ErrorCode;
+            break;
+        case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
+            evt.type                            = MsquicStreamEventType::PeerReceiveAborted;
+            evt.peer_receive_aborted.error_code = native_event.PEER_RECEIVE_ABORTED.ErrorCode;
+            break;
+        case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+            evt.type                            = MsquicStreamEventType::SendShutdownComplete;
+            evt.send_shutdown_complete.graceful = native_event.SEND_SHUTDOWN_COMPLETE.Graceful != FALSE;
             break;
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
-            evt.type = MsquicStreamEventType::ShutdownComplete;
+            evt.type                                    = MsquicStreamEventType::ShutdownComplete;
+            evt.shutdown_complete.connection_shutdown   = native_event.SHUTDOWN_COMPLETE.ConnectionShutdown != FALSE;
+            evt.shutdown_complete.app_close_in_progress = native_event.SHUTDOWN_COMPLETE.AppCloseInProgress != FALSE;
+            evt.shutdown_complete.connection_closed_remotely = native_event.SHUTDOWN_COMPLETE.ConnectionClosedRemotely
+                != FALSE;
             break;
         default:
             evt.type = MsquicStreamEventType::Unknown;
+            if (msquic_debug_enabled()) {
+                std::printf("[msquic-loader] unhandled stream event type=%u\n", native_event.Type);
+                std::fflush(stdout);
+            }
             break;
         }
         const MsquicStatus status = entry.callback(to_stream(stream), entry.user_context, evt);
@@ -491,7 +542,7 @@ bool MsquicLoader::ensure_loaded_locked(const std::vector<std::string>& search_p
     const auto candidates = build_candidate_paths(search_paths);
 
     for (const auto& candidate : candidates) {
-        const bool debug_logging = std::getenv("CO_WQ_MSQUIC_DEBUG") != nullptr;
+        const bool debug_logging = msquic_debug_enabled();
         if (debug_logging) {
             std::fprintf(stderr, "[msquic-loader] candidate: %s\n", candidate.c_str());
         }
@@ -800,6 +851,22 @@ void MsquicApi::stream_close(MsquicStreamHandle stream) noexcept
     }
     impl_->remove_stream_entry(to_raw(stream));
     impl_->table->StreamClose(to_raw(stream));
+}
+
+void MsquicApi::stream_receive_complete(MsquicStreamHandle stream, std::uint64_t length) noexcept
+{
+    if (!impl_ || !impl_->table || !stream.value) {
+        return;
+    }
+    impl_->table->StreamReceiveComplete(to_raw(stream), length);
+}
+
+void MsquicApi::stream_receive_set_enabled(MsquicStreamHandle stream, bool enabled) noexcept
+{
+    if (!impl_ || !impl_->table || !stream.value) {
+        return;
+    }
+    impl_->table->StreamReceiveSetEnabled(to_raw(stream), static_cast<BOOLEAN>(enabled ? 1 : 0));
 }
 
 void MsquicApi::set_stream_callback(MsquicStreamHandle stream, MsquicStreamCallback callback, void* context)

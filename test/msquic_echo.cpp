@@ -285,7 +285,7 @@ int main(int argc, char** argv)
     certFile = ResolveCertificatePath(certFile, { "server.cert", "server.crt" });
     keyFile  = ResolveCertificatePath(keyFile, { "server.key" });
 
-    if (std::getenv("CO_WQ_MSQUIC_DEBUG")) {
+    if (co_wq::net::msquic_debug_enabled()) {
         std::printf("[msquic-cert] using certificate: %s\n", certFile.c_str());
         std::printf("[msquic-cert] using key: %s\n", keyFile.c_str());
     }

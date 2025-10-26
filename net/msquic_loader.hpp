@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -8,6 +9,9 @@
 namespace co_wq::net {
 
 using MsquicStatus = std::uint32_t;
+
+bool msquic_debug_enabled() noexcept;
+void set_msquic_debug_enabled(bool enabled) noexcept;
 
 struct MsquicLibraryHandle;
 
@@ -41,6 +45,17 @@ struct MsquicStreamHandle {
     void* value { nullptr };
 };
 
+struct MsquicStreamSendCompleteEvent {
+    void* client_context { nullptr };
+    bool  canceled { false };
+};
+
+struct MsquicStreamShutdownCompleteEvent {
+    bool connection_shutdown { false };
+    bool app_close_in_progress { false };
+    bool connection_closed_remotely { false };
+};
+
 enum class MsquicExecutionProfile : std::uint32_t {
     LowLatency    = 0,
     MaxThroughput = 1,
@@ -71,8 +86,10 @@ struct MsquicConstBuffer {
 };
 
 enum class MsquicSendFlags : std::uint32_t {
-    None = 0x0000,
-    Fin  = 0x0004,
+    None      = 0x0000,
+    Allow0Rtt = 0x0001,
+    Start     = 0x0002,
+    Fin       = 0x0004,
 };
 
 inline MsquicSendFlags operator|(MsquicSendFlags lhs, MsquicSendFlags rhs) noexcept
@@ -86,8 +103,10 @@ inline MsquicSendFlags operator&(MsquicSendFlags lhs, MsquicSendFlags rhs) noexc
 }
 
 enum class MsquicStreamShutdownFlags : std::uint32_t {
-    None      = 0x0000,
-    AbortSend = 0x0002,
+    None         = 0x0000,
+    Graceful     = 0x0001,
+    AbortSend    = 0x0002,
+    AbortReceive = 0x0004,
 };
 
 struct MsquicCertificateFileConfig {
@@ -111,20 +130,54 @@ struct MsquicReceiveBuffer {
 
 struct MsquicStreamReceiveEvent {
     std::vector<MsquicReceiveBuffer> buffers;
-    bool                             fin = false;
+    std::uint64_t                    absolute_offset = 0;
+    std::uint64_t                    total_length    = 0;
+    std::uint32_t                    flags           = 0;
+    bool                             fin             = false;
+};
+
+struct MsquicStreamPeerSendAbortedEvent {
+    std::uint64_t error_code = 0;
+};
+
+struct MsquicStreamPeerReceiveAbortedEvent {
+    std::uint64_t error_code = 0;
+};
+
+struct MsquicStreamSendShutdownCompleteEvent {
+    bool graceful = false;
 };
 
 enum class MsquicStreamEventType {
     Receive,
     SendComplete,
+    PeerSendShutdown,
+    PeerSendAborted,
+    PeerReceiveAborted,
+    SendShutdownComplete,
     ShutdownComplete,
     Unknown,
 };
 
 struct MsquicStreamEvent {
-    MsquicStreamEventType    type = MsquicStreamEventType::Unknown;
-    MsquicStreamReceiveEvent receive;
+    MsquicStreamEventType                 type = MsquicStreamEventType::Unknown;
+    MsquicStreamReceiveEvent              receive;
+    MsquicStreamSendCompleteEvent         send_complete;
+    MsquicStreamPeerSendAbortedEvent      peer_send_aborted;
+    MsquicStreamPeerReceiveAbortedEvent   peer_receive_aborted;
+    MsquicStreamSendShutdownCompleteEvent send_shutdown_complete;
+    MsquicStreamShutdownCompleteEvent     shutdown_complete;
 };
+
+inline MsquicStreamShutdownFlags operator|(MsquicStreamShutdownFlags lhs, MsquicStreamShutdownFlags rhs) noexcept
+{
+    return static_cast<MsquicStreamShutdownFlags>(static_cast<std::uint32_t>(lhs) | static_cast<std::uint32_t>(rhs));
+}
+
+inline MsquicStreamShutdownFlags operator&(MsquicStreamShutdownFlags lhs, MsquicStreamShutdownFlags rhs) noexcept
+{
+    return static_cast<MsquicStreamShutdownFlags>(static_cast<std::uint32_t>(lhs) & static_cast<std::uint32_t>(rhs));
+}
 
 using MsquicStreamCallback = MsquicStatus (*)(MsquicStreamHandle, void*, const MsquicStreamEvent&);
 
@@ -235,6 +288,8 @@ public:
                              void*               client_context);
     MsquicStatus stream_shutdown(MsquicStreamHandle, MsquicStreamShutdownFlags, std::uint64_t error_code);
     void         stream_close(MsquicStreamHandle) noexcept;
+    void         stream_receive_complete(MsquicStreamHandle, std::uint64_t length) noexcept;
+    void         stream_receive_set_enabled(MsquicStreamHandle, bool enabled) noexcept;
 
     void set_stream_callback(MsquicStreamHandle, MsquicStreamCallback, void* context);
     void set_connection_callback(MsquicConnectionHandle, MsquicConnectionCallback, void* context);

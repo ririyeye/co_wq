@@ -105,6 +105,14 @@ if has_config("USING_SSL") then
     target_end()
 end
 
+if has_config("USING_MSQUIC") then
+    target("co_quic_echo")
+    set_kind("binary")
+    add_deps("co_syswork_common")
+    add_files("co_quic_echo.cpp")
+    target_end()
+end
+
 if has_config("USING_MSQUIC") and has_config("USING_MSQUIC_TEST") then
     target("msquic_echo")
     set_kind("binary")
