@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -14,7 +16,12 @@
 #include <vector>
 
 #if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <wincrypt.h>
 #include <windows.h>
+
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -112,8 +119,14 @@ namespace {
 
         auto add_nearby_defaults = [&add_candidate](std::filesystem::path base) {
             for (int depth = 0; depth < 6 && !base.empty(); ++depth) {
+#if defined(_WIN32)
+                add_candidate((base / "msquic-install" / "bin" / "msquic.dll").string());
+                add_candidate((base / "install" / "bin" / "msquic.dll").string());
+                add_candidate((base / "msquic.dll").string());
+#else
                 add_candidate((base / "msquic-install" / "lib" / "libmsquic.so").string());
                 add_candidate((base / "install" / "lib" / "libmsquic.so").string());
+#endif
                 base = base.parent_path();
             }
         };
@@ -122,7 +135,11 @@ namespace {
 
         const auto exe_dir = resolve_executable_dir();
         add_nearby_defaults(exe_dir);
+#if defined(_WIN32)
+        add_candidate((exe_dir / "msquic.dll").string());
+#else
         add_candidate((exe_dir / "libmsquic.so").string());
+#endif
 
 #if defined(_WIN32)
         add_candidate("msquic.dll");
@@ -249,6 +266,22 @@ namespace {
     {
         return { reinterpret_cast<void*>(handle) };
     }
+
+#if defined(_WIN32)
+    std::wstring utf8_to_wstring(const std::string& value)
+    {
+        if (value.empty()) {
+            return {};
+        }
+        const int required = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0);
+        if (required <= 0) {
+            return {};
+        }
+        std::wstring buffer(static_cast<std::size_t>(required), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), buffer.data(), required);
+        return buffer;
+    }
+#endif
 
 } // namespace
 
@@ -516,7 +549,7 @@ MsquicApi MsquicLoader::acquire(const std::vector<std::string>& search_paths)
         api                        = reinterpret_cast<const QUIC_API_TABLE*>(raw_api);
         if (quic_status_failed(status) || api == nullptr) {
             std::ostringstream oss;
-            oss << "MsQuicOpenVersion failed with status 0x" << std::hex << status;
+            oss << "MsQuicOpenVersion failed with status 0x" << std::hex << static_cast<std::uint32_t>(status);
             last_error_ = oss.str();
             return {};
         }
@@ -722,15 +755,80 @@ MsquicStatus MsquicApi::configuration_load_credential(MsquicConfigurationHandle 
         return 1;
     }
 
-    QUIC_CERTIFICATE_FILE file_info { config.certificate_file.private_key_file.c_str(),
-                                      config.certificate_file.certificate_file.c_str() };
-
     QUIC_CREDENTIAL_CONFIG native_config {};
-    native_config.Type            = static_cast<QUIC_CREDENTIAL_TYPE>(config.type);
-    native_config.Flags           = QUIC_CREDENTIAL_FLAG_NONE;
-    native_config.CertificateFile = &file_info;
+    native_config.Type  = static_cast<QUIC_CREDENTIAL_TYPE>(config.type);
+    native_config.Flags = QUIC_CREDENTIAL_FLAG_NONE;
 
-    return impl_->table->ConfigurationLoadCredential(to_raw(configuration), &native_config);
+#if defined(_WIN32)
+    if (config.type == MsquicCredentialConfig::Type::CertificateFile
+        || config.type == MsquicCredentialConfig::Type::CertificatePkcs12) {
+        native_config.Flags |= QUIC_CREDENTIAL_FLAG_USE_PORTABLE_CERTIFICATES;
+    }
+#endif
+
+    std::vector<std::uint8_t> pkcs12_data;
+
+    switch (config.type) {
+    case MsquicCredentialConfig::Type::CertificateFile: {
+        QUIC_CERTIFICATE_FILE file_info { config.certificate_file.private_key_file.c_str(),
+                                          config.certificate_file.certificate_file.c_str() };
+        native_config.CertificateFile = &file_info;
+        return impl_->table->ConfigurationLoadCredential(to_raw(configuration), &native_config);
+    }
+    case MsquicCredentialConfig::Type::CertificatePkcs12: {
+        if (config.pkcs12.file.empty()) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+
+        std::ifstream file(config.pkcs12.file, std::ios::binary);
+        if (!file) {
+            return QUIC_STATUS_FILE_NOT_FOUND;
+        }
+        pkcs12_data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        if (pkcs12_data.empty()) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+
+#if defined(_WIN32)
+        CRYPT_DATA_BLOB blob {};
+        blob.cbData = static_cast<DWORD>(pkcs12_data.size());
+        blob.pbData = pkcs12_data.empty() ? nullptr : reinterpret_cast<BYTE*>(pkcs12_data.data());
+
+        std::wstring password_w = utf8_to_wstring(config.pkcs12.password);
+        HCERTSTORE   store      = PFXImportCertStore(&blob,
+                                              password_w.empty() ? nullptr : password_w.c_str(),
+                                              PKCS12_IMPORT_SILENT | CRYPT_EXPORTABLE);
+        if (!store) {
+            return static_cast<MsquicStatus>(HRESULT_FROM_WIN32(GetLastError()));
+        }
+
+        PCCERT_CONTEXT context = CertEnumCertificatesInStore(store, nullptr);
+        if (!context) {
+            MsquicStatus err = static_cast<MsquicStatus>(HRESULT_FROM_WIN32(GetLastError()));
+            CertCloseStore(store, 0);
+            return err;
+        }
+
+        native_config.Type               = QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT;
+        native_config.CertificateContext = reinterpret_cast<QUIC_CERTIFICATE*>(const_cast<CERT_CONTEXT*>(context));
+
+        const MsquicStatus status = impl_->table->ConfigurationLoadCredential(to_raw(configuration), &native_config);
+
+        CertFreeCertificateContext(context);
+        CertCloseStore(store, 0);
+        return status;
+#else
+        QUIC_CERTIFICATE_PKCS12 pkcs12_info { pkcs12_data.data(),
+                                              static_cast<std::uint32_t>(pkcs12_data.size()),
+                                              config.pkcs12.password.empty() ? nullptr
+                                                                             : config.pkcs12.password.c_str() };
+        native_config.CertificatePkcs12 = &pkcs12_info;
+        return impl_->table->ConfigurationLoadCredential(to_raw(configuration), &native_config);
+#endif
+    }
+    }
+
+    return QUIC_STATUS_INVALID_PARAMETER;
 }
 
 MsquicStatus MsquicApi::listener_open(MsquicRegistrationHandle registration,

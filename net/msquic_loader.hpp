@@ -8,22 +8,34 @@
 
 namespace co_wq::net {
 
-using MsquicStatus = std::uint32_t;
+using MsquicStatus = std::int32_t;
 
 bool msquic_debug_enabled() noexcept;
 void set_msquic_debug_enabled(bool enabled) noexcept;
 
 struct MsquicLibraryHandle;
 
+#if defined(_WIN32)
 inline bool quic_status_failed(MsquicStatus status) noexcept
 {
-    return static_cast<std::int32_t>(status) > 0;
+    return status < 0;
 }
 
 inline bool quic_status_succeeded(MsquicStatus status) noexcept
 {
-    return !quic_status_failed(status);
+    return status >= 0;
 }
+#else
+inline bool quic_status_failed(MsquicStatus status) noexcept
+{
+    return status > 0;
+}
+
+inline bool quic_status_succeeded(MsquicStatus status) noexcept
+{
+    return status <= 0;
+}
+#endif
 
 struct MsquicRegistrationHandle {
     void* value { nullptr };
@@ -114,13 +126,20 @@ struct MsquicCertificateFileConfig {
     std::string certificate_file;
 };
 
+struct MsquicCertificatePkcs12Config {
+    std::string file;
+    std::string password;
+};
+
 struct MsquicCredentialConfig {
     enum class Type : std::uint32_t {
-        CertificateFile = 4,
+        CertificateFile   = 4,
+        CertificatePkcs12 = 6,
     };
 
-    Type                        type = Type::CertificateFile;
-    MsquicCertificateFileConfig certificate_file;
+    Type                          type = Type::CertificateFile;
+    MsquicCertificateFileConfig   certificate_file;
+    MsquicCertificatePkcs12Config pkcs12;
 };
 
 struct MsquicReceiveBuffer {

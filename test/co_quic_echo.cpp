@@ -134,7 +134,13 @@ std::string resolve_key_path(const std::string& candidate)
 std::string resolve_cert_path(const std::string& candidate)
 {
     return resolve_certificate_path(candidate,
-                                    { "server.cert", "server.crt", "certs/server.crt", "install/certs/server.crt" });
+                                    { "server.cert",
+                                      "server.crt",
+                                      "server.pfx",
+                                      "certs/server.crt",
+                                      "certs/server.pfx",
+                                      "install/certs/server.crt",
+                                      "install/certs/server.pfx" });
 }
 
 std::vector<std::string> parse_alpn_tokens(const std::string& spec)
@@ -377,14 +383,67 @@ int main(int argc, char** argv)
         CO_WQ_LOG_ERROR("[quic] certificate file not found: %s", cert_path.c_str());
         return 1;
     }
-    if (!std::filesystem::exists(key_path)) {
+
+    bool        use_pkcs12 = false;
+    std::string pfx_password;
+#if defined(_WIN32)
+    if (const char* env_pwd = std::getenv("CO_WQ_PFX_PASSWORD")) {
+        pfx_password = env_pwd;
+    }
+
+    auto to_lower_ext = [](std::string ext) {
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return ext;
+    };
+
+    auto try_pkcs12 = [&](const std::filesystem::path& candidate) {
+        if (!candidate.empty() && std::filesystem::exists(candidate)) {
+            cert_path  = candidate.string();
+            use_pkcs12 = true;
+        }
+    };
+
+    const std::filesystem::path cert_resolved { cert_path };
+    const std::string           cert_ext = to_lower_ext(cert_resolved.extension().string());
+
+    if (cert_ext == ".pfx" || cert_ext == ".p12") {
+        use_pkcs12 = true;
+    }
+
+    if (!use_pkcs12) {
+        auto candidate = cert_resolved;
+        candidate.replace_extension(".pfx");
+        try_pkcs12(candidate);
+    }
+
+    if (!use_pkcs12) {
+        auto candidate = cert_resolved;
+        candidate.replace_extension(".p12");
+        try_pkcs12(candidate);
+    }
+
+    if (!use_pkcs12) {
+        if (auto fallback = resolve_cert_path("server.pfx"); !fallback.empty()) {
+            use_pkcs12 = true;
+            cert_path  = fallback;
+        }
+    }
+#endif
+
+    if (!use_pkcs12 && !std::filesystem::exists(key_path)) {
         CO_WQ_LOG_ERROR("[quic] key file not found: %s", key_path.c_str());
         return 1;
     }
 
     if (msquic_debug) {
         CO_WQ_LOG_INFO("[quic] using certificate: %s", cert_path.c_str());
-        CO_WQ_LOG_INFO("[quic] using key: %s", key_path.c_str());
+        if (use_pkcs12) {
+            CO_WQ_LOG_INFO("[quic] using PKCS#12 bundle (password %s)", pfx_password.empty() ? "<empty>" : "<hidden>");
+        } else {
+            CO_WQ_LOG_INFO("[quic] using key: %s", key_path.c_str());
+        }
         for (const auto& token : alpn_tokens)
             CO_WQ_LOG_INFO("[quic] using ALPN: %s", token.c_str());
     }
@@ -418,23 +477,36 @@ int main(int argc, char** argv)
     }
 
     net::MsquicCredentialConfig cred {};
-    cred.type                              = net::MsquicCredentialConfig::Type::CertificateFile;
-    cred.certificate_file.certificate_file = cert_path;
-    cred.certificate_file.private_key_file = key_path;
+
+    if (use_pkcs12) {
+        cred.type            = net::MsquicCredentialConfig::Type::CertificatePkcs12;
+        cred.pkcs12.file     = cert_path;
+        cred.pkcs12.password = pfx_password;
+    } else {
+        cred.type                              = net::MsquicCredentialConfig::Type::CertificateFile;
+        cred.certificate_file.certificate_file = cert_path;
+        cred.certificate_file.private_key_file = key_path;
+    }
 
     auto status = ctx->load_credential(cred);
     if (net::quic_status_failed(status)) {
-        CO_WQ_LOG_ERROR("[quic] load credential failed status=0x%x cert=%s key=%s",
-                        status,
-                        cred.certificate_file.certificate_file.c_str(),
-                        cred.certificate_file.private_key_file.c_str());
+        if (use_pkcs12) {
+            CO_WQ_LOG_ERROR("[quic] load credential failed status=0x%x pkcs12=%s",
+                            static_cast<unsigned int>(status),
+                            cred.pkcs12.file.c_str());
+        } else {
+            CO_WQ_LOG_ERROR("[quic] load credential failed status=0x%x cert=%s key=%s",
+                            static_cast<unsigned int>(status),
+                            cred.certificate_file.certificate_file.c_str(),
+                            cred.certificate_file.private_key_file.c_str());
+        }
         return 1;
     }
 
     net::quic_listener<SpinLock> listener(exec, ctx);
     status = listener.start(kDefaultPort, alpn_buffers.data(), static_cast<std::uint32_t>(alpn_buffers.size()));
     if (net::quic_status_failed(status)) {
-        CO_WQ_LOG_ERROR("[quic] listener start failed status=0x%x", status);
+        CO_WQ_LOG_ERROR("[quic] listener start failed status=0x%x", static_cast<unsigned int>(status));
         return 1;
     }
 

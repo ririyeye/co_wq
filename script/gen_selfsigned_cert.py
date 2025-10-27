@@ -11,6 +11,7 @@ try:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
     from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 except ImportError as exc:  # pragma: no cover - dependency guard
     raise SystemExit(
@@ -37,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("certs"),
         help="Output directory for server.key/server.crt",
+    )
+    parser.add_argument(
+        "--pfx-password",
+        default="",
+        help="Password for generated server.pfx (empty for no password)",
     )
     return parser
 
@@ -65,7 +71,7 @@ def build_subject_alt_name(common_name: str) -> x509.SubjectAlternativeName | No
     return x509.SubjectAlternativeName([entry])
 
 
-def generate_certificate(args: argparse.Namespace) -> tuple[bytes, bytes]:
+def generate_certificate(args: argparse.Namespace) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = build_subject(args)
     now = datetime.now(timezone.utc)
@@ -93,13 +99,7 @@ def generate_certificate(args: argparse.Namespace) -> tuple[bytes, bytes]:
         builder = builder.add_extension(san, critical=False)
     certificate = builder.sign(private_key=private_key, algorithm=hashes.SHA256())
 
-    key_bytes = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    cert_bytes = certificate.public_bytes(serialization.Encoding.PEM)
-    return key_bytes, cert_bytes
+    return private_key, certificate
 
 
 def main() -> int:
@@ -112,14 +112,38 @@ def main() -> int:
     key_path = outdir / "server.key"
     crt_path = outdir / "server.crt"
 
-    key_bytes, cert_bytes = generate_certificate(args)
+    private_key, certificate = generate_certificate(args)
+
+    key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_bytes = certificate.public_bytes(serialization.Encoding.PEM)
 
     key_path.write_bytes(key_bytes)
     crt_path.write_bytes(cert_bytes)
 
+    pfx_path = outdir / "server.pfx"
+    password_bytes = args.pfx_password.encode("utf-8") if args.pfx_password else None
+    encryption = (
+        serialization.BestAvailableEncryption(password_bytes)
+        if password_bytes
+        else serialization.NoEncryption()
+    )
+    pfx_bytes = pkcs12.serialize_key_and_certificates(
+        name=args.common_name.encode("utf-8"),
+        key=private_key,
+        cert=certificate,
+        cas=None,
+        encryption_algorithm=encryption,
+    )
+    pfx_path.write_bytes(pfx_bytes)
+
     print("生成成功:")
     print(f"  私钥: {key_path}")
     print(f"  证书: {crt_path}")
+    print(f"  PKCS#12: {pfx_path}")
     return 0
 
 

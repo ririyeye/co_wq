@@ -1,6 +1,8 @@
 #include "msquic_loader.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -189,7 +191,7 @@ EchoStreamCallback(co_wq::net::MsquicStreamHandle stream, void* context, const c
                 std::printf("[stream %p] echo send length=%u status=0x%x\n",
                             stream.value,
                             streamCtx->send_buffer.length,
-                            status);
+                            static_cast<unsigned int>(status));
                 if (quic_status_failed(status)) {
                     streamCtx->send_pending = false;
                     return status;
@@ -244,7 +246,9 @@ co_wq::net::MsquicStatus EchoConnectionCallback(co_wq::net::MsquicConnectionHand
         break;
     }
     case co_wq::net::MsquicConnectionEventType::ShutdownByTransport:
-        std::printf("[conn %p] shutdown by transport error=0x%x\n", connection.value, event.status);
+        std::printf("[conn %p] shutdown by transport error=0x%x\n",
+                    connection.value,
+                    static_cast<unsigned int>(event.status));
         break;
     case co_wq::net::MsquicConnectionEventType::ShutdownByPeer:
         std::printf("[conn %p] shutdown by peer error=0x%llx\n",
@@ -270,6 +274,8 @@ co_wq::net::MsquicStatus EchoListenerCallback(co_wq::net::MsquicListenerHandle  
         if (listenerCtx) {
             const auto status = g_msquic_api.connection_set_configuration(event.connection, listenerCtx->configuration);
             if (quic_status_failed(status)) {
+                std::printf("[listener] connection_set_configuration failed status=0x%x\n",
+                            static_cast<unsigned int>(status));
                 return status;
             }
         }
@@ -304,12 +310,23 @@ int main(int argc, char** argv)
         }
     }
 
-    certFile = ResolveCertificatePath(certFile, { "server.cert", "server.crt" });
+    certFile = ResolveCertificatePath(certFile, { "server.cert", "server.crt", "server.pfx" });
     keyFile  = ResolveCertificatePath(keyFile, { "server.key" });
 
     if (co_wq::net::msquic_debug_enabled()) {
         std::printf("[msquic-cert] using certificate: %s\n", certFile.c_str());
-        std::printf("[msquic-cert] using key: %s\n", keyFile.c_str());
+        const auto ext_lower = [&]() {
+            std::string ext = std::filesystem::path(certFile).extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            return ext;
+        }();
+        if (ext_lower == ".pfx" || ext_lower == ".p12") {
+            std::printf("[msquic-cert] using PKCS#12 bundle\n");
+        } else {
+            std::printf("[msquic-cert] using key: %s\n", keyFile.c_str());
+        }
     }
 
     auto api = co_wq::net::MsquicLoader::instance().acquire();
@@ -325,7 +342,7 @@ int main(int argc, char** argv)
                                                            co_wq::net::MsquicExecutionProfile::LowLatency };
     auto                                       status = g_msquic_api.registration_open(regConfig, registration);
     if (quic_status_failed(status)) {
-        std::fprintf(stderr, "RegistrationOpen failed: 0x%x\n", status);
+        std::fprintf(stderr, "RegistrationOpen failed: 0x%x\n", static_cast<unsigned int>(status));
         g_msquic_api = co_wq::net::MsquicApi {};
         co_wq::net::MsquicLoader::instance().unload();
         return 1;
@@ -343,7 +360,7 @@ int main(int argc, char** argv)
     co_wq::net::MsquicConfigurationHandle configuration {};
     status = g_msquic_api.configuration_open(registration, &alpnBuffer, 1, settings, configuration);
     if (quic_status_failed(status)) {
-        std::fprintf(stderr, "ConfigurationOpen failed: 0x%x\n", status);
+        std::fprintf(stderr, "ConfigurationOpen failed: 0x%x\n", static_cast<unsigned int>(status));
         g_msquic_api.registration_close(registration);
         g_msquic_api = co_wq::net::MsquicApi {};
         co_wq::net::MsquicLoader::instance().unload();
@@ -351,12 +368,65 @@ int main(int argc, char** argv)
     }
 
     co_wq::net::MsquicCredentialConfig credential {};
-    credential.certificate_file.private_key_file = keyFile;
-    credential.certificate_file.certificate_file = certFile;
+
+#if defined(_WIN32)
+    auto to_lower_ext = [](std::string ext) {
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return ext;
+    };
+
+    bool                        configured_pkcs12 = false;
+    std::string                 pfx_password      = GetEnvironmentString("CO_WQ_PFX_PASSWORD");
+    const std::filesystem::path cert_path_resolved { certFile };
+    const std::string           cert_ext = to_lower_ext(cert_path_resolved.extension().string());
+
+    auto try_set_pkcs12 = [&](const std::filesystem::path& pkcs12_path) {
+        if (!pkcs12_path.empty() && std::filesystem::exists(pkcs12_path)) {
+            credential.type            = co_wq::net::MsquicCredentialConfig::Type::CertificatePkcs12;
+            credential.pkcs12.file     = pkcs12_path.string();
+            credential.pkcs12.password = pfx_password;
+            configured_pkcs12          = true;
+        }
+    };
+
+    if (cert_ext == ".pfx" || cert_ext == ".p12") {
+        try_set_pkcs12(cert_path_resolved);
+    }
+
+    if (!configured_pkcs12) {
+        auto candidate = cert_path_resolved;
+        candidate.replace_extension(".pfx");
+        try_set_pkcs12(candidate);
+    }
+
+    if (!configured_pkcs12) {
+        auto candidate = cert_path_resolved;
+        candidate.replace_extension(".p12");
+        try_set_pkcs12(candidate);
+    }
+
+    if (!configured_pkcs12) {
+        const std::string default_pfx = ResolveCertificatePath("server.pfx", { "server.pfx" });
+        if (!default_pfx.empty()) {
+            try_set_pkcs12(default_pfx);
+        }
+    }
+
+    if (!configured_pkcs12) {
+        credential.type = co_wq::net::MsquicCredentialConfig::Type::CertificateFile;
+    }
+#endif
+
+    if (credential.type == co_wq::net::MsquicCredentialConfig::Type::CertificateFile) {
+        credential.certificate_file.private_key_file = keyFile;
+        credential.certificate_file.certificate_file = certFile;
+    }
 
     status = g_msquic_api.configuration_load_credential(configuration, credential);
     if (quic_status_failed(status)) {
-        std::fprintf(stderr, "ConfigurationLoadCredential failed: 0x%x\n", status);
+        std::fprintf(stderr, "ConfigurationLoadCredential failed: 0x%x\n", static_cast<unsigned int>(status));
         g_msquic_api.configuration_close(configuration);
         g_msquic_api.registration_close(registration);
         g_msquic_api = co_wq::net::MsquicApi {};
@@ -369,7 +439,7 @@ int main(int argc, char** argv)
 
     status = g_msquic_api.listener_open(registration, EchoListenerCallback, &listener_context, listener);
     if (quic_status_failed(status)) {
-        std::fprintf(stderr, "ListenerOpen failed: 0x%x\n", status);
+        std::fprintf(stderr, "ListenerOpen failed: 0x%x\n", static_cast<unsigned int>(status));
         g_msquic_api.configuration_close(configuration);
         g_msquic_api.registration_close(registration);
         g_msquic_api = co_wq::net::MsquicApi {};
@@ -381,7 +451,7 @@ int main(int argc, char** argv)
 
     status = g_msquic_api.listener_start_any(listener, &alpnBuffer, 1, kDefaultPort);
     if (quic_status_failed(status)) {
-        std::fprintf(stderr, "ListenerStart failed: 0x%x\n", status);
+        std::fprintf(stderr, "ListenerStart failed: 0x%x\n", static_cast<unsigned int>(status));
         g_msquic_api.listener_close(listener);
         g_msquic_api.configuration_close(configuration);
         g_msquic_api.registration_close(registration);
