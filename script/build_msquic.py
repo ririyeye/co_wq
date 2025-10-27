@@ -34,8 +34,6 @@ def main() -> int:
         str(msquic_dir),
         "-B",
         str(build_dir),
-        "-G",
-        cmake_generator,
         "-DCMAKE_BUILD_TYPE=" + cmake_build_type,
         "-DCMAKE_INSTALL_PREFIX=" + str(install_dir),
         "-DQUIC_BUILD_SHARED=ON",

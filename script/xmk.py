@@ -72,13 +72,25 @@ def ensure_msquic_installation() -> None:
     if not lib_dir.is_dir():
         raise FileNotFoundError("msquic-install/lib 不存在")
 
-    has_shared_lib = any(
-        candidate.is_file()
-        for pattern in ("libmsquic.so", "libmsquic.so.*", "msquic.dll", "libmsquic.dylib")
-        for candidate in lib_dir.glob(pattern)
+    bin_dir = install_root / "bin"
+
+    shared_lib_patterns = (
+        "libmsquic.so",
+        "libmsquic.so.*",
+        "libmsquic.dylib",
     )
-    if not has_shared_lib:
-        raise FileNotFoundError("msquic-install/lib 下未找到 libmsquic 动态库")
+    dll_patterns = ("msquic.dll",)
+
+    def _has_matching_file(directory: Path, patterns: tuple[str, ...]) -> bool:
+        if not directory.is_dir():
+            return False
+        return any(candidate.is_file() for pattern in patterns for candidate in directory.glob(pattern))
+
+    has_shared_lib = _has_matching_file(lib_dir, shared_lib_patterns)
+    has_windows_dll = _has_matching_file(lib_dir, dll_patterns) or _has_matching_file(bin_dir, dll_patterns)
+
+    if not (has_shared_lib or has_windows_dll):
+        raise FileNotFoundError("msquic-install/lib 或 msquic-install/bin 下未找到 libmsquic 动态库")
 
     include_dir = install_root / "include"
     if not include_dir.is_dir():

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <initializer_list>
 #include <string>
@@ -34,6 +35,23 @@ struct StreamContext {
 struct ListenerContext {
     co_wq::net::MsquicConfigurationHandle configuration {};
 };
+
+std::string GetEnvironmentString(const char* name)
+{
+#if defined(_WIN32)
+    size_t buffer_length = 0;
+    char*  buffer        = nullptr;
+    if (_dupenv_s(&buffer, &buffer_length, name) != 0 || !buffer) {
+        return {};
+    }
+    std::string value(buffer, buffer_length == 0 ? 0 : buffer_length - 1);
+    std::free(buffer);
+    return value;
+#else
+    const char* env = std::getenv(name);
+    return env ? std::string(env) : std::string();
+#endif
+}
 
 std::string ResolveCertificatePath(const std::string& candidate, std::initializer_list<const char*> fallbacks)
 {
@@ -78,7 +96,7 @@ std::string ResolveCertificatePath(const std::string& candidate, std::initialize
         current = current.parent_path();
     }
 
-    if (const char* env_cert_dir = std::getenv("CO_WQ_CERT_DIR")) {
+    if (auto env_cert_dir = GetEnvironmentString("CO_WQ_CERT_DIR"); !env_cert_dir.empty()) {
         add_dir(fs::path(env_cert_dir));
     }
 
@@ -120,7 +138,11 @@ void PrintTimestamp()
     std::time_t now = std::time(nullptr);
     std::tm     tmInfo {};
 
+#if defined(_WIN32)
+    if (localtime_s(&tmInfo, &now) == 0) {
+#else
     if (localtime_r(&now, &tmInfo) != nullptr) {
+#endif
         char buffer[64];
         if (std::strftime(buffer, sizeof(buffer), "[%Y-%m-%d %H:%M:%S]", &tmInfo) > 0) {
             std::printf("%s", buffer);

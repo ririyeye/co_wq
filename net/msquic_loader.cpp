@@ -36,19 +36,13 @@ struct MsquicLibraryHandle {
 
 namespace {
 
-    std::atomic<int> g_msquic_debug_flag { -1 };
+    std::atomic<int> g_msquic_debug_flag { 0 };
 
 } // namespace
 
 bool msquic_debug_enabled() noexcept
 {
-    int value = g_msquic_debug_flag.load(std::memory_order_acquire);
-    if (value < 0) {
-        const char* env = std::getenv("CO_WQ_MSQUIC_DEBUG");
-        value           = (env && env[0] != '\0') ? 1 : 0;
-        g_msquic_debug_flag.store(value, std::memory_order_release);
-    }
-    return value > 0;
+    return g_msquic_debug_flag.load(std::memory_order_acquire) > 0;
 }
 
 void set_msquic_debug_enabled(bool enabled) noexcept
@@ -78,6 +72,23 @@ namespace {
 #endif
     }
 
+    std::string get_environment_string(const char* name)
+    {
+#if defined(_WIN32)
+        size_t buffer_length = 0;
+        char*  buffer        = nullptr;
+        if (_dupenv_s(&buffer, &buffer_length, name) != 0 || !buffer) {
+            return {};
+        }
+        std::string value(buffer, buffer_length == 0 ? 0 : buffer_length - 1);
+        std::free(buffer);
+        return value;
+#else
+        const char* env = std::getenv(name);
+        return env ? std::string(env) : std::string();
+#endif
+    }
+
     std::vector<std::string> build_candidate_paths(const std::vector<std::string>& user_paths)
     {
         std::vector<std::string> candidates;
@@ -95,7 +106,7 @@ namespace {
             add_candidate(path);
         }
 
-        if (const char* env_path = std::getenv("MSQUIC_LIB_PATH")) {
+        if (auto env_path = get_environment_string("MSQUIC_LIB_PATH"); !env_path.empty()) {
             add_candidate(env_path);
         }
 
