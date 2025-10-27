@@ -9,6 +9,7 @@
 - **丰富 Awaiter**：信号量、定时器、串行化 IO、TCP/UDP/UDS 套接字等 awaiter 开箱即用。
 - **跨平台网络栈**：Linux 采用 `epoll`，Windows 通过 Wine+MSVC 配置使用 IOCP 封装，网络头
   文件统一收敛至 `net/` 根目录，所有示例统一使用 `os::fd_t` 管理文件描述符。
+- **QUIC 支持**：对接 MsQuic 引擎，提供 `net/quic.hpp` 协程封装与 echo 示例，覆盖握手、收发与调试日志。
 - **工具完善**：提供 `script/` 下的 xmake 构建脚本，自动生成 `compile_commands.json` 便于 IDE 使用。
 
 ## 目录总览
@@ -30,6 +31,7 @@
 ### 依赖
 - C++20 编译器（GCC 12+/Clang 15+/MSVC 19.36+）
 - [xmake](https://xmake.io/) 2.7+
+- MsQuic 动态库：执行 `python3 script/build_msquic.py` 可将官方实现编译到仓库内的 `msquic-install/`
 
 ### 跨平台构建（Python CLI）
 推荐使用 `script/xmk.py` 统一完成配置、构建与安装：
@@ -248,6 +250,20 @@ xmake run echo --both --host 127.0.0.1 --port 12345
 - `post_to()` 将协程投递到主工作队列；
 - `net::udp_socket` 的 `send_to/recv_from` awaiter；
 - 跨平台信号处理、统计信息输出。
+
+### QUIC Echo 示例
+
+确认构建配置启用了 `USING_MSQUIC`（运行 `python3 script/xmk.py build` 时默认会开启，或自行 `xmake f ... --USING_MSQUIC=y`），并在首次体验前执行 `python3 script/build_msquic.py` 生成 `msquic-install/`，即可启动基于 MsQuic 的 echo 服务器：
+
+```bash
+xmake run co_quic_echo --cert certs/server.crt --key certs/server.key --alpn "co-wq/echo"
+```
+
+- 默认监听 UDP 端口 `6121`，`--alpn` 支持自定义多个 token；
+- `--msquic-debug` 会同步打开 MsQuic 调试开关并将日志写入 `logs/quic_echo.log`，同级目录会生成详细的 `quic_session.log`；
+- 证书路径可通过 `CO_WQ_CERT_DIR` 指定搜索目录，示例同样支持相对路径查找。
+
+配套的 Python 客户端 `test/quic_client.py` 会把标准输出重定向到 `logs/quic_client.log`，便于对照抓包或服务器日志。
 
 ### HTTP JSON 测试
 
