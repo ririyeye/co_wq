@@ -7,6 +7,8 @@ import random
 import ssl
 import sys
 import time
+import atexit
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -25,6 +27,53 @@ except ImportError as exc:  # pragma: no cover
         file=sys.stderr,
     )
     raise SystemExit(1) from exc
+
+
+def _init_default_logging() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    log_dir = repo_root / "logs"
+    log_path = log_dir / "quic_client.log"
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        now = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]")
+        sys.stderr.write(
+            f"{now} [quic-client] failed to initialize log file {log_path}: {exc}\n"
+        )
+        return
+
+    class _TeeStream:
+        def __init__(self, original_stream, shadow_stream):
+            self._original = original_stream
+            self._shadow = shadow_stream
+
+        def write(self, data):
+            self._original.write(data)
+            self._shadow.write(data)
+
+        def flush(self):
+            self._original.flush()
+            self._shadow.flush()
+
+        def isatty(self):
+            return self._original.isatty()
+
+        @property
+        def encoding(self):
+            return self._original.encoding
+
+        @property
+        def errors(self):
+            return getattr(self._original, "errors", None)
+
+    sys.stdout = _TeeStream(sys.stdout, log_file)
+    sys.stderr = _TeeStream(sys.stderr, log_file)
+    atexit.register(log_file.close)
+
+
+_init_default_logging()
 
 
 def timestamp() -> str:

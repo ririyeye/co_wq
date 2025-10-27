@@ -223,19 +223,14 @@ public:
 
             if (enable_receive && enable_api && enable_handle.value) {
                 enable_api->stream_receive_set_enabled(enable_handle, true);
-                std::fprintf(stderr, "[quic_socket] receive re-enabled\n");
-                if (msquic_debug_enabled()) {
-                    std::printf("[quic_socket] receive re-enabled\n");
-                    std::fflush(stdout);
-                }
+                CO_WQ_LOG_DEBUG("[quic_socket] receive re-enabled");
             }
 
             if (copied > 0 && msquic_debug_enabled()) {
-                std::printf("[quic_socket] drain copied=%zu queue=%zu offset=%zu\n",
-                            copied,
-                            queue_snapshot,
-                            offset_snapshot);
-                std::fflush(stdout);
+                CO_WQ_LOG_DEBUG("[quic_socket] drain copied=%zu queue=%zu offset=%zu",
+                                copied,
+                                queue_snapshot,
+                                offset_snapshot);
             }
 
             if (copied > 0) {
@@ -326,10 +321,9 @@ public:
                     }
                     owner._send_pending_flags = send_flags;
                     if (msquic_debug_enabled()) {
-                        std::printf("[quic_socket] stream_send schedule chunk=%zu flags=0x%x\n",
-                                    chunk,
-                                    static_cast<unsigned>(send_flags));
-                        std::fflush(stdout);
+                        CO_WQ_LOG_DEBUG("[quic_socket] stream_send schedule chunk=%zu flags=0x%x",
+                                        chunk,
+                                        static_cast<unsigned>(send_flags));
                     }
                 } else {
                     if (!owner._send_completed)
@@ -345,8 +339,10 @@ public:
                         return 0;
                     }
                     if (msquic_debug_enabled()) {
-                        std::printf("[quic_socket] send advance sent=%zu/%zu fin=%d\n", sent, length, fin_sent ? 1 : 0);
-                        std::fflush(stdout);
+                        CO_WQ_LOG_DEBUG("[quic_socket] send advance sent=%zu/%zu fin=%d",
+                                        sent,
+                                        length,
+                                        fin_sent ? 1 : 0);
                     }
                     if (fin_sent)
                         owner._tx_fin = true;
@@ -433,10 +429,9 @@ public:
         if (_ctx && _ctx->api && handle.value) {
             auto flag = do_graceful ? MsquicStreamShutdownFlags::Graceful : MsquicStreamShutdownFlags::AbortSend;
             if (msquic_debug_enabled()) {
-                std::printf("[quic_socket] stream shutdown flag=0x%x error=%llu\n",
-                            static_cast<unsigned>(flag),
-                            static_cast<unsigned long long>(error_code));
-                std::fflush(stdout);
+                CO_WQ_LOG_DEBUG("[quic_socket] stream shutdown flag=0x%x error=%llu",
+                                static_cast<unsigned>(flag),
+                                static_cast<unsigned long long>(error_code));
             }
             _ctx->api->stream_shutdown(handle, flag, error_code);
         }
@@ -470,8 +465,7 @@ public:
         if (_ctx && _ctx->api && handle.value) {
             if (should_abort) {
                 if (msquic_debug_enabled()) {
-                    std::printf("[quic_socket] stream abort on close\n");
-                    std::fflush(stdout);
+                    CO_WQ_LOG_DEBUG("[quic_socket] stream abort on close");
                 }
                 _ctx->api->stream_shutdown(handle,
                                            MsquicStreamShutdownFlags::AbortSend
@@ -479,8 +473,7 @@ public:
                                            0);
             }
             if (msquic_debug_enabled()) {
-                std::printf("[quic_socket] stream close handle\n");
-                std::fflush(stdout);
+                CO_WQ_LOG_DEBUG("[quic_socket] stream close handle");
             }
             _ctx->api->stream_close(handle);
         }
@@ -635,34 +628,28 @@ private:
                 api_disable    = _ctx->api;
             }
         }
-        std::fprintf(stderr,
-                     "[quic_socket] receive event off=%llu total=%llu fin=%d flags=0x%x buffers=%zu queue=%zu "
-                     "skip=%llu appended=%zu\n",
-                     static_cast<unsigned long long>(ev.absolute_offset),
-                     static_cast<unsigned long long>(event_length),
-                     ev.fin ? 1 : 0,
-                     static_cast<unsigned>(ev.flags),
-                     ev.buffers.size(),
-                     queue_size,
-                     static_cast<unsigned long long>(skip),
-                     newly_appended);
-        if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] receive event off=%llu total=%llu fin=%d queue=%zu skip=%llu appended=%zu\n",
+        CO_WQ_LOG_DEBUG("[quic_socket] receive event off=%llu total=%llu fin=%d flags=0x%x buffers=%zu queue=%zu "
+                        "skip=%llu appended=%zu",
                         static_cast<unsigned long long>(ev.absolute_offset),
                         static_cast<unsigned long long>(event_length),
                         ev.fin ? 1 : 0,
+                        static_cast<unsigned>(ev.flags),
+                        ev.buffers.size(),
                         queue_size,
                         static_cast<unsigned long long>(skip),
                         newly_appended);
-            std::fflush(stdout);
+        if (msquic_debug_enabled()) {
+            CO_WQ_LOG_DEBUG("[quic_socket] receive event off=%llu total=%llu fin=%d queue=%zu skip=%llu appended=%zu",
+                            static_cast<unsigned long long>(ev.absolute_offset),
+                            static_cast<unsigned long long>(event_length),
+                            ev.fin ? 1 : 0,
+                            queue_size,
+                            static_cast<unsigned long long>(skip),
+                            newly_appended);
         }
         if (api_disable && handle_disable.value) {
             api_disable->stream_receive_set_enabled(handle_disable, false);
-            std::fprintf(stderr, "[quic_socket] receive disabled\n");
-            if (msquic_debug_enabled()) {
-                std::printf("[quic_socket] receive disabled\n");
-                std::fflush(stdout);
-            }
+            CO_WQ_LOG_DEBUG("[quic_socket] receive disabled");
         }
         if (newly_appended > 0 || ev.fin)
             notify_recv_ready();
@@ -682,12 +669,11 @@ private:
             pending_len     = _send_pending_len;
         }
         if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] send complete canceled=%d err=%zd inflight=%d pending_len=%zu\n",
-                        ev.canceled ? 1 : 0,
-                        error_snapshot,
-                        inflight ? 1 : 0,
-                        pending_len);
-            std::fflush(stdout);
+            CO_WQ_LOG_DEBUG("[quic_socket] send complete canceled=%d err=%zd inflight=%d pending_len=%zu",
+                            ev.canceled ? 1 : 0,
+                            error_snapshot,
+                            inflight ? 1 : 0,
+                            pending_len);
         }
         notify_send_ready();
     }
@@ -702,11 +688,7 @@ private:
                 notify    = true;
             }
         }
-        std::fprintf(stderr, "[quic_socket] peer send shutdown\n");
-        if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] peer send shutdown\n");
-            std::fflush(stdout);
-        }
+        CO_WQ_LOG_DEBUG("[quic_socket] peer send shutdown");
         if (notify)
             notify_recv_ready();
     }
@@ -720,13 +702,7 @@ private:
             _recv_fin   = true;
             notify      = true;
         }
-        std::fprintf(stderr,
-                     "[quic_socket] peer send aborted error=%llu\n",
-                     static_cast<unsigned long long>(ev.error_code));
-        if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] peer send aborted error=%llu\n", static_cast<unsigned long long>(ev.error_code));
-            std::fflush(stdout);
-        }
+        CO_WQ_LOG_DEBUG("[quic_socket] peer send aborted error=%llu", static_cast<unsigned long long>(ev.error_code));
         if (notify)
             notify_recv_ready();
     }
@@ -747,9 +723,8 @@ private:
             notify = true;
         }
         if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] peer receive aborted error=%llu\n",
-                        static_cast<unsigned long long>(ev.error_code));
-            std::fflush(stdout);
+            CO_WQ_LOG_DEBUG("[quic_socket] peer receive aborted error=%llu",
+                            static_cast<unsigned long long>(ev.error_code));
         }
         if (notify)
             notify_send_ready();
@@ -764,8 +739,7 @@ private:
             notify  = true;
         }
         if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] send shutdown complete graceful=%d\n", ev.graceful ? 1 : 0);
-            std::fflush(stdout);
+            CO_WQ_LOG_DEBUG("[quic_socket] send shutdown complete graceful=%d", ev.graceful ? 1 : 0);
         }
         if (notify)
             notify_send_ready();
@@ -789,11 +763,7 @@ private:
             }
             _close_pending = false;
         }
-        std::fprintf(stderr, "[quic_socket] shutdown complete\n");
-        if (msquic_debug_enabled()) {
-            std::printf("[quic_socket] shutdown complete\n");
-            std::fflush(stdout);
-        }
+        CO_WQ_LOG_DEBUG("[quic_socket] shutdown complete");
         notify_recv_ready();
         notify_send_ready();
         notify_handshake_ready();
@@ -821,11 +791,10 @@ private:
             }
         }
         if (total > 0) {
-            std::fprintf(stderr,
-                         "[quic_socket] copy total=%zu queue=%zu offset=%zu\n",
-                         total,
-                         _recv_queue.size(),
-                         _recv_offset);
+            CO_WQ_LOG_DEBUG("[quic_socket] copy total=%zu queue=%zu offset=%zu",
+                            total,
+                            _recv_queue.size(),
+                            _recv_offset);
         }
         return total;
     }

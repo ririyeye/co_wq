@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 using namespace co_wq;
 
 namespace {
@@ -25,17 +27,39 @@ namespace {
 constexpr const char*   kDefaultAlpnList = "http/1.0,co-wq/echo";
 constexpr std::uint16_t kDefaultPort     = 6121;
 
-std::atomic_bool g_stop { false };
+std::atomic_bool     g_stop { false };
+std::atomic_uint64_t g_next_session_id { 1 };
 
-std::mutex g_log_mutex;
+std::mutex            g_log_mutex;
+std::filesystem::path g_session_log_path;
 
-void append_log(const std::string& message)
+void append_log(uint64_t session_id, const std::string& message)
 {
+    if (g_session_log_path.empty())
+        return;
+    std::filesystem::path       target = g_session_log_path;
     std::lock_guard<std::mutex> guard(g_log_mutex);
-    std::ofstream               log("quic_session.log", std::ios::app);
+    std::ofstream               log(target, std::ios::app);
     if (!log.is_open())
         return;
-    log << message << '\n';
+    log << "[session " << session_id << "] " << message << '\n';
+}
+
+std::filesystem::path find_project_root(std::filesystem::path current)
+{
+    if (current.empty())
+        return {};
+    current = current.lexically_normal();
+    std::error_code ec;
+    while (!current.empty()) {
+        if (std::filesystem::exists(current / "xmake.lua", ec) || std::filesystem::exists(current / ".git", ec))
+            return current;
+        auto parent = current.parent_path();
+        if (parent == current)
+            break;
+        current = std::move(parent);
+    }
+    return {};
 }
 
 std::string resolve_certificate_path(const std::string& candidate, std::initializer_list<const char*> fallbacks)
@@ -146,30 +170,36 @@ std::vector<net::MsquicConstBuffer> build_alpn_buffers(const std::vector<std::st
     return buffers;
 }
 
-template <typename SocketPtr> static Task<void, Work_Promise<SpinLock, void>> quic_echo_session(SocketPtr socket)
+template <typename SocketPtr>
+static Task<void, Work_Promise<SpinLock, void>> quic_echo_session(SocketPtr socket, uint64_t session_id)
 {
     auto guard = std::move(socket);
     if (!guard)
         co_return;
 
+    const std::string session_label = "[quic#" + std::to_string(session_id) + "]";
+    CO_WQ_LOG_DEBUG("%s stream=%p handshake starting", session_label.c_str(), static_cast<const void*>(guard.get()));
+
     int handshake_rc = co_await guard->handshake();
     if (handshake_rc != 0) {
-        std::printf("[session] handshake failed: %d\n", handshake_rc);
+        CO_WQ_LOG_ERROR("%s handshake failed rc=%d", session_label.c_str(), handshake_rc);
         guard->close();
         co_return;
     }
+    CO_WQ_LOG_INFO("%s handshake completed", session_label.c_str());
 
     std::array<char, 2048> buffer {};
     while (!g_stop.load(std::memory_order_acquire)) {
         ssize_t n = co_await guard->recv(buffer.data(), buffer.size());
         if (n <= 0) {
-            std::printf("[session] recv completed n=%zd\n", n);
             if (n < 0)
-                std::printf("[session] recv error: %zd\n", n);
+                CO_WQ_LOG_WARN("%s recv error=%zd", session_label.c_str(), n);
+            else
+                CO_WQ_LOG_INFO("%s recv completed n=%zd", session_label.c_str(), n);
             break;
         }
-        append_log("recv=" + std::to_string(n));
-        std::printf("[session] received %zd bytes\n", n);
+        append_log(session_id, "recv=" + std::to_string(n));
+        CO_WQ_LOG_INFO("%s recv bytes=%zd", session_label.c_str(), n);
         auto to_hex = [](const char* data, std::size_t len) {
             static const char* digits = "0123456789abcdef";
             std::string        s;
@@ -182,21 +212,20 @@ template <typename SocketPtr> static Task<void, Work_Promise<SpinLock, void>> qu
             return s;
         };
         std::string preview = to_hex(buffer.data(), static_cast<std::size_t>(std::min<std::size_t>(n, 16)));
-        std::fprintf(stderr, "[session] recv=%zd preview=%s\\n", n, preview.c_str());
+        CO_WQ_LOG_DEBUG("%s recv preview=%s", session_label.c_str(), preview.c_str());
         ssize_t m = co_await guard->send_all(buffer.data(), static_cast<size_t>(n));
         if (m <= 0) {
             if (m < 0)
-                std::printf("[session] send error: %zd\n", m);
+                CO_WQ_LOG_WARN("%s send error=%zd", session_label.c_str(), m);
             break;
         }
-        append_log("send=" + std::to_string(m));
-        std::printf("[session] echoed %zd bytes\n", m);
-        std::fprintf(stderr, "[session] send=%zd\\n", m);
+        append_log(session_id, "send=" + std::to_string(m));
+        CO_WQ_LOG_INFO("%s send bytes=%zd", session_label.c_str(), m);
     }
     guard->shutdown_tx();
-    std::printf("[session] shutdown_tx requested\n");
+    CO_WQ_LOG_INFO("%s shutdown_tx requested", session_label.c_str());
     guard->close();
-    std::printf("[session] session closed\n");
+    CO_WQ_LOG_INFO("%s session closed", session_label.c_str());
     co_return;
 }
 
@@ -209,7 +238,11 @@ template <typename Listener> static Task<void, Work_Promise<SpinLock, void>> qui
                 break;
             continue;
         }
-        auto task = quic_echo_session(std::move(socket));
+        uint64_t session_id = g_next_session_id.fetch_add(1, std::memory_order_relaxed);
+        CO_WQ_LOG_INFO("[quic] accepted stream session=%llu socket=%p",
+                       static_cast<unsigned long long>(session_id),
+                       static_cast<const void*>(socket.get()));
+        auto task = quic_echo_session(std::move(socket), session_id);
         post_to(task, get_sys_workqueue());
     }
     co_return;
@@ -229,10 +262,22 @@ int main(int argc, char** argv)
 
     auto& exec = get_sys_workqueue();
 
-    std::string cert_path    = "server.crt";
-    std::string key_path     = "server.key";
-    std::string alpn_spec    = kDefaultAlpnList;
-    bool        msquic_debug = false;
+    std::string               cert_path           = "server.crt";
+    std::string               key_path            = "server.key";
+    std::string               alpn_spec           = kDefaultAlpnList;
+    bool                      msquic_debug        = false;
+    spdlog::level::level_enum requested_log_level = spdlog::level::info;
+
+    std::filesystem::path project_root;
+    std::filesystem::path cwd_path;
+    {
+        std::error_code cwd_ec;
+        cwd_path = std::filesystem::current_path(cwd_ec);
+        if (cwd_ec)
+            cwd_path.clear();
+        if (!cwd_path.empty())
+            project_root = find_project_root(cwd_path);
+    }
 
     for (int i = 1; i < argc; ++i) {
         if ((std::strcmp(argv[i], "-cert") == 0 || std::strcmp(argv[i], "--cert") == 0) && i + 1 < argc) {
@@ -242,20 +287,73 @@ int main(int argc, char** argv)
         } else if ((std::strcmp(argv[i], "-alpn") == 0 || std::strcmp(argv[i], "--alpn") == 0) && i + 1 < argc) {
             alpn_spec = argv[++i];
         } else if ((std::strcmp(argv[i], "--msquic-debug") == 0 || std::strcmp(argv[i], "--debug") == 0)) {
-            msquic_debug = true;
+            msquic_debug        = true;
+            requested_log_level = spdlog::level::debug;
         } else if ((std::strcmp(argv[i], "--no-msquic-debug") == 0 || std::strcmp(argv[i], "--no-debug") == 0)) {
-            msquic_debug = false;
+            msquic_debug        = false;
+            requested_log_level = spdlog::level::info;
         } else if ((std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0)) {
             std::printf(
                 "Usage: co_quic_echo [-cert file] [-key file] [-alpn string] [--msquic-debug] [--no-msquic-debug]\n");
             return 0;
         } else {
-            std::fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            CO_WQ_LOG_ERROR("[quic] unknown option: %s", argv[i]);
             return 1;
         }
     }
 
     net::set_msquic_debug_enabled(msquic_debug);
+
+    bool        log_configured = false;
+    std::string log_file_path;
+    try {
+        std::filesystem::path log_path = "logs/quic_echo.log";
+        std::filesystem::path resolved = log_path;
+        if (!resolved.is_absolute()) {
+            if (!project_root.empty())
+                resolved = project_root / resolved;
+            else if (!cwd_path.empty())
+                resolved = cwd_path / resolved;
+        }
+        resolved = resolved.lexically_normal();
+
+        if (!resolved.empty()) {
+            auto parent = resolved.parent_path();
+            if (!parent.empty()) {
+                std::error_code dir_ec;
+                std::filesystem::create_directories(parent, dir_ec);
+                if (dir_ec) {
+                    std::fprintf(stderr,
+                                 "[quic] failed to create log directory %s: %s\n",
+                                 parent.string().c_str(),
+                                 dir_ec.message().c_str());
+                }
+            }
+        }
+
+        co_wq::log::configure_file_logging(resolved.string(), false, true);
+        log_configured = true;
+        log_file_path  = resolved.string();
+
+        auto session_path = resolved;
+        session_path.replace_filename("quic_session.log");
+        session_path = session_path.lexically_normal();
+
+        if (requested_log_level <= spdlog::level::debug) {
+            g_session_log_path = session_path;
+        } else {
+            g_session_log_path.clear();
+            std::error_code remove_ec;
+            std::filesystem::remove(session_path, remove_ec);
+        }
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[quic] failed to initialize log file: %s\n", ex.what());
+    }
+
+    co_wq::log::set_level(requested_log_level);
+    if (log_configured) {
+        CO_WQ_LOG_INFO("[quic] logging to %s", log_file_path.c_str());
+    }
 
     auto alpn_tokens  = parse_alpn_tokens(alpn_spec);
     auto ensure_token = [&alpn_tokens](const std::string& token) {
@@ -276,24 +374,24 @@ int main(int argc, char** argv)
     key_path  = resolve_key_path(key_path);
 
     if (!std::filesystem::exists(cert_path)) {
-        std::fprintf(stderr, "[quic_echo] certificate file not found: %s\n", cert_path.c_str());
+        CO_WQ_LOG_ERROR("[quic] certificate file not found: %s", cert_path.c_str());
         return 1;
     }
     if (!std::filesystem::exists(key_path)) {
-        std::fprintf(stderr, "[quic_echo] key file not found: %s\n", key_path.c_str());
+        CO_WQ_LOG_ERROR("[quic] key file not found: %s", key_path.c_str());
         return 1;
     }
 
     if (msquic_debug) {
-        std::printf("[quic_echo] using certificate: %s\n", cert_path.c_str());
-        std::printf("[quic_echo] using key: %s\n", key_path.c_str());
+        CO_WQ_LOG_INFO("[quic] using certificate: %s", cert_path.c_str());
+        CO_WQ_LOG_INFO("[quic] using key: %s", key_path.c_str());
         for (const auto& token : alpn_tokens)
-            std::printf("[quic_echo] using ALPN: %s\n", token.c_str());
+            CO_WQ_LOG_INFO("[quic] using ALPN: %s", token.c_str());
     }
 
     auto api = net::MsquicLoader::instance().acquire();
     if (!api) {
-        std::fprintf(stderr, "[quic_echo] MsQuic not available\n");
+        CO_WQ_LOG_ERROR("[quic] MsQuic not available");
         return 1;
     }
     auto api_ptr = std::make_shared<net::MsquicApi>(std::move(api));
@@ -315,7 +413,7 @@ int main(int argc, char** argv)
                                         alpn_buffers.data(),
                                         static_cast<std::uint32_t>(alpn_buffers.size()));
     } catch (const std::exception& ex) {
-        std::fprintf(stderr, "[quic_echo] context create failed: %s\n", ex.what());
+        CO_WQ_LOG_ERROR("[quic] context create failed: %s", ex.what());
         return 1;
     }
 
@@ -326,22 +424,21 @@ int main(int argc, char** argv)
 
     auto status = ctx->load_credential(cred);
     if (net::quic_status_failed(status)) {
-        std::fprintf(stderr,
-                     "[quic_echo] load credential failed status=0x%x cert=%s key=%s\n",
-                     status,
-                     cred.certificate_file.certificate_file.c_str(),
-                     cred.certificate_file.private_key_file.c_str());
+        CO_WQ_LOG_ERROR("[quic] load credential failed status=0x%x cert=%s key=%s",
+                        status,
+                        cred.certificate_file.certificate_file.c_str(),
+                        cred.certificate_file.private_key_file.c_str());
         return 1;
     }
 
     net::quic_listener<SpinLock> listener(exec, ctx);
     status = listener.start(kDefaultPort, alpn_buffers.data(), static_cast<std::uint32_t>(alpn_buffers.size()));
     if (net::quic_status_failed(status)) {
-        std::fprintf(stderr, "[quic_echo] listener start failed status=0x%x\n", status);
+        CO_WQ_LOG_ERROR("[quic] listener start failed status=0x%x", status);
         return 1;
     }
 
-    std::printf("[quic_echo] listening on UDP port %u\n", kDefaultPort);
+    CO_WQ_LOG_INFO("[quic] listening on UDP port %u", static_cast<unsigned>(kDefaultPort));
 
     auto accept_task = quic_accept_loop(listener);
     post_to(accept_task, exec);
@@ -349,7 +446,7 @@ int main(int argc, char** argv)
     sys_wait_until(g_stop);
 
     listener.stop();
-    std::printf("[quic_echo] shutting down\n");
+    CO_WQ_LOG_INFO("[quic] shutting down");
 
     return 0;
 }
