@@ -44,6 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Password for generated server.pfx (empty for no password)",
     )
+    parser.add_argument(
+        "--san",
+        action="append",
+        help=(
+            "Subject Alternative Name entries (can be specified multiple times); "
+            "if omitted, falls back to using --common-name as a single SAN"
+        ),
+    )
     return parser
 
 
@@ -61,14 +69,36 @@ def build_subject(args: argparse.Namespace) -> x509.Name:
     return x509.Name(attributes)
 
 
-def build_subject_alt_name(common_name: str) -> x509.SubjectAlternativeName | None:
-    if not common_name:
-        return None
+def _to_san_entry(value: str) -> x509.GeneralName:
+    """Convert a string into an IP or DNS SAN entry."""
     try:
-        entry = x509.IPAddress(ipaddress.ip_address(common_name))
+        return x509.IPAddress(ipaddress.ip_address(value))
     except ValueError:
-        entry = x509.DNSName(common_name)
-    return x509.SubjectAlternativeName([entry])
+        return x509.DNSName(value)
+
+
+def build_subject_alt_name(args: argparse.Namespace) -> x509.SubjectAlternativeName | None:
+    """Build SAN from --san list; fallback to CN if no --san provided.
+
+    This allows dual-stack (IPv4/IPv6) and multi-host certificates while
+    keeping the common-name as a reasonable default.
+    """
+    entries: list[x509.GeneralName] = []
+
+    # Prefer explicit --san values when provided
+    san_values: list[str] | None = getattr(args, "san", None)
+    if san_values:
+        for item in san_values:
+            if not item:
+                continue
+            entries.append(_to_san_entry(item))
+    elif args.common_name:
+        # Backward-compatible behaviour: fall back to CN
+        entries.append(_to_san_entry(args.common_name))
+
+    if not entries:
+        return None
+    return x509.SubjectAlternativeName(entries)
 
 
 def generate_certificate(args: argparse.Namespace) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
@@ -92,9 +122,9 @@ def generate_certificate(args: argparse.Namespace) -> tuple[rsa.RSAPrivateKey, x
             x509.SubjectKeyIdentifier.from_public_key(private_key.public_key()),
             critical=False,
         )
-    )
+        )
 
-    san = build_subject_alt_name(args.common_name)
+    san = build_subject_alt_name(args)
     if san is not None:
         builder = builder.add_extension(san, critical=False)
     certificate = builder.sign(private_key=private_key, algorithm=hashes.SHA256())
